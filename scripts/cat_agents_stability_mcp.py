@@ -100,7 +100,7 @@ def parse_json_output(result: dict[str, Any], fallback: Any) -> Any:
 
 
 def stability_cli_args(action: str, args: dict[str, Any]) -> list[str]:
-    allowed = {"status", "snapshot", "policy", "lanes", "findings", "actions", "events", "runbook", "doctor", "repair", "once"}
+    allowed = {"status", "snapshot", "policy", "lanes", "desired-state", "drift", "findings", "actions", "events", "runbook", "doctor", "repair", "once"}
     if action not in allowed:
         raise ValueError(f"unsupported stability action: {action}")
     cmd = [action]
@@ -158,6 +158,14 @@ def runbook(args: dict[str, Any]) -> dict[str, Any]:
     return stability_call({**args, "action": "runbook"})
 
 
+def desired_state(args: dict[str, Any]) -> dict[str, Any]:
+    return stability_call({**args, "action": "desired-state"})
+
+
+def drift_check(args: dict[str, Any]) -> dict[str, Any]:
+    return stability_call({**args, "action": "drift"})
+
+
 def doctor(args: dict[str, Any]) -> dict[str, Any]:
     return stability_call({**args, "action": "doctor", "no_action": True})
 
@@ -212,6 +220,14 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "stability_runbook": {
         "description": "Return generated cat-agents-stability runbook guidance.",
+        "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
+    },
+    "stability_desired_state": {
+        "description": "Return the current cat-agents-stability desired-state registry.",
+        "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
+    },
+    "stability_drift_check": {
+        "description": "Run a read-only drift check against the cat-agents-stability desired-state registry.",
         "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
     },
     "stability_doctor_dry_run": {
@@ -273,6 +289,10 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
                 payload = actions(arguments)
             elif name == "stability_runbook":
                 payload = runbook(arguments)
+            elif name == "stability_desired_state":
+                payload = desired_state(arguments)
+            elif name == "stability_drift_check":
+                payload = drift_check(arguments)
             elif name == "stability_doctor_dry_run":
                 payload = doctor(arguments)
             elif name == "stability_server_snapshot":

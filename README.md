@@ -11,6 +11,7 @@ cat-agents-stabilityd/
   bin/                         # Python stabilityd and CLI
   index.js                     # OpenClaw plugin tool wrapper
   scripts/cat_agents_stability_mcp.py
+  policies/                    # Desired state and lane policy inputs
   systemd/                     # External daemon bootstrap units
   docs/                        # Governance docs and deployment matrix
   adapters/                    # Adapter contract docs
@@ -23,6 +24,17 @@ cat-agents-stabilityd/
 - External daemon: `cat-agents-stabilityd.service` keeps observing when Gateway is degraded or down.
 - Local Codex MCP: exposes read and dry-run tools to the local Codex control panel.
 - Hermers adapter package: defines the governance contract for Hermers profile/IM/runtime probes without moving workflow state into Hermers.
+
+## Desired State
+
+`policies/desired-state.json` is the package-level desired-state registry for install surfaces, Codex MCP registration, workflow boundary rules, runtime ownership, temporary route-shell allowances, and future Hermers IM cutover targets.
+
+Use read-only drift checks before changing deployment state:
+
+```bash
+bin/cat-agents-stability desired-state
+bin/cat-agents-stability drift
+```
 
 ## Boundary With trading-agents-workflow
 
@@ -40,4 +52,5 @@ Allowed repair path examples:
 ```bash
 npm run check
 npm run smoke:mcp
+npm run smoke:drift
 ```

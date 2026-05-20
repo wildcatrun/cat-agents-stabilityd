@@ -14,6 +14,7 @@ Capabilities:
 
 - read remote stability status, findings, lanes, actions, runbook
 - run `doctor` in no-action mode
+- run desired-state drift checks
 - inspect package status
 - fetch server package snapshot
 
@@ -42,6 +43,7 @@ Tool:
 Default behavior:
 
 - read actions are allowed
+- `desired-state` and `drift` are read-only
 - `doctor`, `once`, and `repair` default to no-action/dry-run unless `allowMutatingActions=true`
 
 ## systemd
@@ -67,6 +69,7 @@ Install surface:
 
 - `hermers/README.md`
 - future Hermers plugin/adapter package
+- `policies/desired-state.json` target state after explicit Hermers IM cutover
 
 Capabilities:
 
@@ -80,4 +83,3 @@ Restrictions:
 - does not own workflow state
 - does not create a parallel IM audit system
 - does not replace `trading-agents-workflow` message_flow contract
-

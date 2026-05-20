@@ -1,7 +1,7 @@
 {
   "id": "cat-agents-stability",
   "name": "Cat Agents Stability",
-  "description": "Companion governance plugin for trading-agents-workflow. Exposes stability status, findings, lanes, runbook, and guarded repair/doctor actions while keeping workflow state changes behind explicit workflow APIs.",
+  "description": "Companion governance plugin for trading-agents-workflow. Exposes stability status, desired-state drift, findings, lanes, runbook, and guarded repair/doctor actions while keeping workflow state changes behind explicit workflow APIs.",
   "version": "0.1.0",
   "contracts": {
     "tools": [

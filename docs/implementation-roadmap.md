@@ -8,6 +8,7 @@ As of this package baseline, `cat-agents-stability` has four install surfaces:
 - OpenClaw plugin wrapper: `index.js` plus `openclaw.plugin.json`
 - External daemon/CLI: `bin/cat-agents-stability` and `bin/cat_agents_stabilityd.py`
 - Hermers contract docs: `hermers/README.md`
+- Desired-state registry: `policies/desired-state.json`
 
 The package is intentionally a companion to `trading-agents-workflow`, not a container for it.
 
@@ -19,6 +20,7 @@ Status: implemented.
 - Local Codex MCP can list tools and query remote status.
 - OpenClaw plugin wrapper exposes read actions and guarded no-action diagnostics.
 - Server candidate checkout exists separately from the live daemon directory.
+- Desired-state and read-only drift checks are available through CLI, OpenClaw tool action, and Codex MCP.
 
 Exit criteria:
 
@@ -30,15 +32,15 @@ Exit criteria:
 
 ## Phase 2: OpenClaw Plugin Activation
 
-Not yet active by default.
+Configured as a Gateway plugin path; live availability still depends on the Gateway loaded state.
 
 Activation steps require current-state confirmation and rollback path:
 
 1. Confirm current Gateway plugin paths and `cat-agents-stabilityd.service` status.
 2. Back up `/home/flashcat/.openclaw/openclaw.json`.
-3. Add `/home/flashcat/cat-agents-stabilityd.git-checkout` to OpenClaw plugin load paths or plugin entries.
+3. Confirm `/home/flashcat/cat-agents-stabilityd.git-checkout` is present in OpenClaw plugin load paths or plugin entries.
 4. Run `openclaw config validate`.
-5. Restart Gateway during a cron-safe window.
+5. If the running Gateway has not loaded the path yet, restart Gateway during a cron-safe window.
 6. Verify `cat_agents_stability` tool is registered and read actions work.
 
 Rollback:
@@ -49,9 +51,9 @@ Rollback:
 
 ## Phase 3: Live Daemon Git Cutover
 
-Not yet active.
+Baseline active through symlinked path.
 
-The current systemd daemon still points at `/home/flashcat/cat-agents-stabilityd`.
+The current systemd daemon points at `/home/flashcat/cat-agents-stabilityd`; on the development server this path is expected to resolve to `/home/flashcat/cat-agents-stabilityd.git-checkout`.
 
 Cutover options:
 
@@ -81,7 +83,7 @@ Hermers direct IM migration is explicitly out of scope for this roadmap until se
 
 ## Phase 5: Desired State Registry
 
-Planned.
+Status: baseline implemented.
 
 Add a versioned desired-state file describing:
 
@@ -92,5 +94,6 @@ Add a versioned desired-state file describing:
 - Telegram consumer ownership
 - return policies
 
-The stability plugin should report drift, not silently mutate high-impact state.
+Current enforcement phase is `pre-hermers-im-cutover`: Hermers ACP runtime records are required, temporary OpenClaw route-shell records are observed but not yet treated as drift, and the dormant legacy workspace target is recorded for the separately authorized Hermers IM migration.
 
+The stability plugin reports drift and does not silently mutate high-impact state.

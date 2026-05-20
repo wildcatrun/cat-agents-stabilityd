@@ -1,0 +1,194 @@
+{
+  "schemaVersion": 1,
+  "version": "2026-05-20T15:00:00+08:00",
+  "enforcementPhase": "pre-hermers-im-cutover",
+  "purpose": "Single desired-state registry for cat-agents-stability as the companion governance package for trading-agents-workflow.",
+  "packageSurfaces": {
+    "requiredFiles": [
+      ".codex-plugin/plugin.json",
+      ".mcp.json",
+      "openclaw.plugin.json",
+      "index.js",
+      "bin/cat-agents-stability",
+      "bin/cat_agents_stabilityd.py",
+      "scripts/cat_agents_stability_mcp.py",
+      "systemd/cat-agents-stabilityd.service",
+      "policies/desired-state.json",
+      "docs/desired-state-registry.md",
+      "docs/plugin-architecture.md",
+      "docs/deployment-matrix.md",
+      "docs/implementation-roadmap.md",
+      "hermers/README.md"
+    ]
+  },
+  "localCodex": {
+    "role": "control-panel-observation-and-guarded-operations",
+    "requiredMcpServers": [
+      "trading-agents-workflow",
+      "cat-agents-stability"
+    ],
+    "forbiddenRoles": [
+      "workflow-runtime",
+      "agent-return-inbox",
+      "parallel-scheduler"
+    ]
+  },
+  "workflowBoundary": {
+    "companionTo": "trading-agents-workflow",
+    "allowedWorkflowWrites": [
+      "workflow.dispatch.reconcile",
+      "workflow.message_flow.reconcile",
+      "incident.state",
+      "explicit Human Gate approved action"
+    ],
+    "forbiddenWorkflowWrites": [
+      "direct mixed_meeting_dispatches mutation",
+      "direct message_flows mutation",
+      "direct runtime_runs mutation",
+      "direct control_loop_jobs mutation"
+    ]
+  },
+  "runtimeRegistry": {
+    "requiredRecords": [
+      {
+        "agentId": "main",
+        "runtime": "openclaw",
+        "status": "active",
+        "endpointRef": "openclaw-agent:main"
+      },
+      {
+        "agentId": "cat_claw",
+        "runtime": "openclaw",
+        "status": "active",
+        "endpointRef": "openclaw-agent:cat_claw"
+      },
+      {
+        "agentId": "cat_tail",
+        "runtime": "openclaw",
+        "status": "active",
+        "endpointRef": "openclaw-agent:cat_tail"
+      },
+      {
+        "agentId": "cat_voice",
+        "runtime": "openclaw",
+        "status": "active",
+        "endpointRef": "openclaw-agent:cat_voice"
+      },
+      {
+        "agentId": "cat_swordclaw",
+        "runtime": "openclaw",
+        "status": "active",
+        "endpointRef": "openclaw-agent:cat_swordclaw"
+      },
+      {
+        "agentId": "cat_shieldclaw",
+        "runtime": "openclaw",
+        "status": "active",
+        "endpointRef": "openclaw-agent:cat_shieldclaw"
+      },
+      {
+        "agentId": "cat_gunclaw",
+        "runtime": "openclaw",
+        "status": "active",
+        "endpointRef": "openclaw-agent:cat_gunclaw"
+      },
+      {
+        "agentId": "cat_body",
+        "runtime": "hermes_acp",
+        "status": "active",
+        "endpointRef": "hermes-profile:catbody"
+      },
+      {
+        "agentId": "cat_ears",
+        "runtime": "hermes_acp",
+        "status": "active",
+        "endpointRef": "hermes-profile:catears"
+      },
+      {
+        "agentId": "cat_eyes",
+        "runtime": "hermes_acp",
+        "status": "active",
+        "endpointRef": "hermes-profile:cateyes"
+      },
+      {
+        "agentId": "cat_heart",
+        "runtime": "hermes_acp",
+        "status": "active",
+        "endpointRef": "hermes-profile:catheart"
+      },
+      {
+        "agentId": "cat_nose",
+        "runtime": "hermes_acp",
+        "status": "active",
+        "endpointRef": "hermes-profile:catnose"
+      },
+      {
+        "agentId": "cat_penclaw",
+        "runtime": "hermes_acp",
+        "status": "active",
+        "endpointRef": "hermes-profile:catpenclaw"
+      }
+    ],
+    "temporaryAllowedRecords": [
+      {
+        "agentId": "cat_body",
+        "runtime": "openclaw_route_shell",
+        "status": "active",
+        "endpointRef": "openclaw-agent:cat_body",
+        "allowedUntil": "explicit Hermers IM cutover"
+      },
+      {
+        "agentId": "cat_ears",
+        "runtime": "openclaw_route_shell",
+        "status": "active",
+        "endpointRef": "openclaw-agent:cat_ears",
+        "allowedUntil": "explicit Hermers IM cutover"
+      },
+      {
+        "agentId": "cat_eyes",
+        "runtime": "openclaw_route_shell",
+        "status": "active",
+        "endpointRef": "openclaw-agent:cat_eyes",
+        "allowedUntil": "explicit Hermers IM cutover"
+      },
+      {
+        "agentId": "cat_heart",
+        "runtime": "openclaw_route_shell",
+        "status": "active",
+        "endpointRef": "openclaw-agent:cat_heart",
+        "allowedUntil": "explicit Hermers IM cutover"
+      },
+      {
+        "agentId": "cat_nose",
+        "runtime": "openclaw_route_shell",
+        "status": "active",
+        "endpointRef": "openclaw-agent:cat_nose",
+        "allowedUntil": "explicit Hermers IM cutover"
+      },
+      {
+        "agentId": "cat_penclaw",
+        "runtime": "openclaw_route_shell",
+        "status": "active",
+        "endpointRef": "openclaw-agent:cat_penclaw",
+        "allowedUntil": "explicit Hermers IM cutover"
+      }
+    ],
+    "forbiddenAgentIds": [
+      "catclaw"
+    ],
+    "targetAfterHermersImCutover": {
+      "openclawMigratedAgentIdentity": "dormant_legacy_workspace",
+      "routeShellAllowed": false,
+      "imIngressAdapter": "disabled",
+      "workflowIngressAdapter": "disabled",
+      "returnPolicy": "silent",
+      "requiresExplicitMigrationTask": true
+    }
+  },
+  "riskPolicy": {
+    "p3": "read-only checks and findings",
+    "p2": "idempotent reconcile or incident record through public workflow actions",
+    "p1": "cron, adapter, or config mutation; requires explicit authorization or Human Gate",
+    "p0": "Gateway restart, runtime migration, production-server action, or trading-impacting action; requires explicit authorization and rollback path"
+  }
+}

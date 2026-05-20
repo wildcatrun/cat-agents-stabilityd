@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 const PLUGIN_ID = "cat-agents-stability";
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
 
-const READ_ACTIONS = new Set(["status", "snapshot", "policy", "lanes", "findings", "actions", "events", "runbook"]);
+const READ_ACTIONS = new Set(["status", "snapshot", "policy", "lanes", "desired-state", "drift", "findings", "actions", "events", "runbook"]);
 const GUARDED_ACTIONS = new Set(["doctor", "repair", "once"]);
 
 function jsonText(value) {
@@ -100,7 +100,7 @@ const toolParameters = {
   properties: {
     action: {
       type: "string",
-      enum: ["status", "snapshot", "policy", "lanes", "findings", "actions", "events", "runbook", "doctor", "repair", "once"]
+      enum: ["status", "snapshot", "policy", "lanes", "desired-state", "drift", "findings", "actions", "events", "runbook", "doctor", "repair", "once"]
     },
     limit: { type: "number" },
     noAction: { type: "boolean" },
@@ -129,7 +129,7 @@ export default definePluginEntry({
   register(api) {
     api.registerTool({
       name: "cat_agents_stability",
-      description: "Read cat-agents stability status, findings, lane policy, runbook, and guarded doctor/repair actions.",
+      description: "Read cat-agents stability status, desired-state drift, findings, lane policy, runbook, and guarded doctor/repair actions.",
       parameters: toolParameters,
       execute: async (_id, params) => jsonText(await runStability(api, stabilityArgs(api, params || {})))
     });

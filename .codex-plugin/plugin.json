@@ -1,7 +1,7 @@
 {
   "name": "cat-agents-stability",
   "version": "0.1.0",
-  "description": "Codex control-plane access for cat-system stability status, findings, lanes, runbooks, and guarded low-risk diagnostics.",
+  "description": "Codex control-plane access for cat-system stability status, desired-state drift, findings, lanes, runbooks, and guarded low-risk diagnostics.",
   "author": {
     "name": "Flashcat",
     "email": "flashcat@localhost"
@@ -17,8 +17,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Cat Agents Stability",
-    "shortDescription": "Inspect cat-system stability findings and runbooks.",
-    "longDescription": "Provides local Codex with a governed MCP entrypoint for cat-agents-stability status, findings, lane policy, actions, runbooks, remote server snapshots, and guarded diagnostics.",
+    "shortDescription": "Inspect cat-system stability drift, findings, and runbooks.",
+    "longDescription": "Provides local Codex with a governed MCP entrypoint for cat-agents-stability status, desired-state drift, findings, lane policy, actions, runbooks, remote server snapshots, and guarded diagnostics.",
     "developerName": "Flashcat",
     "category": "Developer Tools",
     "capabilities": [
@@ -27,6 +27,7 @@
     ],
     "defaultPrompt": [
       "Check cat-system stability status.",
+      "Run a read-only stability desired-state drift check.",
       "List current stability findings.",
       "Show stability lanes and runbook."
     ],

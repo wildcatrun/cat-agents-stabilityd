@@ -48,6 +48,7 @@ Hermers agents framework
 
 - probes and snapshots
 - policy lanes and soft-pressure decisions
+- desired-state registry and drift findings
 - findings and action log
 - runbook generation
 - drift checks against desired state
@@ -72,6 +73,10 @@ The stability package may write its own state:
 - `/home/flashcat/.openclaw/stability/actions.jsonl`
 - `/home/flashcat/.openclaw/stability/state.db`
 
+The desired-state source of truth lives in the package:
+
+- `policies/desired-state.json`
+
 Workflow writes must go through `trading-agents-workflow` public actions.
 
 ## Action Risk Levels
@@ -80,4 +85,3 @@ Workflow writes must go through `trading-agents-workflow` public actions.
 - P2: idempotent reconcile, incident record, stale temp cleanup.
 - P1: cron disable/enable, adapter switch, config mutation. Requires explicit authorization or Human Gate.
 - P0: Gateway restart, runtime migration, production-server or trading-impacting changes. Requires explicit authorization and rollback path.
-

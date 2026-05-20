@@ -43,6 +43,7 @@ LOG_DIR = OPENCLAW / "logs"
 CRON_DIR = OPENCLAW / "cron"
 AGENTS_DIR = OPENCLAW / "agents"
 TELEGRAM_DIR = OPENCLAW / "telegram"
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 LATEST_PATH = STABILITY_DIR / "latest.json"
 POLICY_PATH = STABILITY_DIR / "policy.json"
@@ -53,6 +54,10 @@ LOCK_PATH = STABILITY_DIR / "stabilityd.lock"
 LOG_PATH = STABILITY_DIR / "stabilityd.log"
 CONTROL_PLANE_BACKPRESSURE_PATH = STABILITY_DIR / "control-plane-backpressure.json"
 LANE_POLICY_PATH = STABILITY_DIR / "lane-policy.json"
+DESIRED_STATE_PATH = Path(
+    os.environ.get("CAT_AGENTS_STABILITY_DESIRED_STATE", str(PACKAGE_ROOT / "policies" / "desired-state.json"))
+)
+CODEX_CONFIG_PATH = Path(os.environ.get("CAT_AGENTS_STABILITY_CODEX_CONFIG", "/Users/Flashcat/.codex/config.toml"))
 
 LEGACY_WATCHDOG_HEALTH = CRON_DIR / "health" / "gateway-watchdog.json"
 CRON_AUDIT_PATH = CRON_DIR / "health" / "cron-audit-latest.json"
@@ -429,6 +434,263 @@ def max_severity(findings: Iterable[Dict[str, Any]]) -> str:
     return highest
 
 
+def load_desired_state() -> Dict[str, Any]:
+    state = load_json(DESIRED_STATE_PATH, {}) or {}
+    if not isinstance(state, dict):
+        return {}
+    return state
+
+
+def desired_state_required_files(state: Dict[str, Any]) -> List[str]:
+    surfaces = state.get("packageSurfaces") if isinstance(state.get("packageSurfaces"), dict) else {}
+    files = surfaces.get("requiredFiles") if isinstance(surfaces.get("requiredFiles"), list) else []
+    return [str(item) for item in files if str(item).strip()]
+
+
+def workflow_runtime_registry_records() -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"dbFile": str(WORKFLOW_DB), "exists": WORKFLOW_DB.exists(), "records": []}
+    if not WORKFLOW_DB.exists():
+        return payload
+    try:
+        conn = sqlite3.connect(str(WORKFLOW_DB))
+        conn.row_factory = sqlite3.Row
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='runtime_agents'"
+        ).fetchone()
+        if not table:
+            payload["error"] = "runtime_agents table not found"
+            conn.close()
+            return payload
+        rows = conn.execute(
+            """
+            SELECT agent_id, runtime, display_name, role, status, endpoint_ref, updated_at
+            FROM runtime_agents
+            ORDER BY agent_id, runtime
+            """
+        ).fetchall()
+        payload["records"] = [dict(row) for row in rows]
+        conn.close()
+    except Exception as exc:
+        payload["error"] = f"{type(exc).__name__}: {exc}"
+    return payload
+
+
+def record_matches_expected(record: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    if str(record.get("agent_id") or "") != str(expected.get("agentId") or ""):
+        return False
+    if str(record.get("runtime") or "") != str(expected.get("runtime") or ""):
+        return False
+    allowed_statuses = expected.get("allowedStatuses")
+    if not isinstance(allowed_statuses, list):
+        status = expected.get("status")
+        allowed_statuses = [status] if status else []
+    if allowed_statuses and str(record.get("status") or "") not in {str(item) for item in allowed_statuses}:
+        return False
+    endpoint_ref = expected.get("endpointRef")
+    if endpoint_ref and str(record.get("endpoint_ref") or "") != str(endpoint_ref):
+        return False
+    return True
+
+
+def codex_mcp_config_check(state: Dict[str, Any]) -> Dict[str, Any]:
+    codex = state.get("localCodex") if isinstance(state.get("localCodex"), dict) else {}
+    required = codex.get("requiredMcpServers") if isinstance(codex.get("requiredMcpServers"), list) else []
+    payload: Dict[str, Any] = {
+        "configPath": str(CODEX_CONFIG_PATH),
+        "exists": CODEX_CONFIG_PATH.exists(),
+        "requiredMcpServers": required,
+        "missing": [],
+        "skipped": False,
+    }
+    if not required:
+        return payload
+    if not CODEX_CONFIG_PATH.exists():
+        payload["skipped"] = True
+        payload["reason"] = "codex config not present on this host"
+        return payload
+    try:
+        text = CODEX_CONFIG_PATH.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        payload["error"] = f"{type(exc).__name__}: {exc}"
+        return payload
+    missing = []
+    for name in required:
+        plain = f"[mcp_servers.{name}]"
+        quoted = f"[mcp_servers.\"{name}\"]"
+        if plain not in text and quoted not in text:
+            missing.append(name)
+    payload["missing"] = missing
+    return payload
+
+
+def desired_state_drift() -> Dict[str, Any]:
+    state = load_desired_state()
+    drifts: List[Dict[str, Any]] = []
+    observations: List[Dict[str, Any]] = []
+    if not state:
+        drifts.append(
+            {
+                "key": "desired_state_missing",
+                "severity": "warning",
+                "component": "desired-state",
+                "message": "Desired state registry is missing or invalid",
+                "path": str(DESIRED_STATE_PATH),
+            }
+        )
+        return {
+            "checkedAt": ts(),
+            "desiredStatePath": str(DESIRED_STATE_PATH),
+            "exists": DESIRED_STATE_PATH.exists(),
+            "ok": False,
+            "severity": max_severity(drifts),
+            "driftCount": len(drifts),
+            "observationCount": 0,
+            "drifts": drifts,
+            "observations": observations,
+        }
+
+    required_files = desired_state_required_files(state)
+    missing_files = [item for item in required_files if not (PACKAGE_ROOT / item).exists()]
+    if missing_files:
+        drifts.append(
+            {
+                "key": "package_required_files_missing",
+                "severity": "warning",
+                "component": "desired-state",
+                "message": "Required cat-agents-stability package files are missing",
+                "missingFiles": missing_files,
+            }
+        )
+
+    codex_check = codex_mcp_config_check(state)
+    if codex_check.get("missing"):
+        drifts.append(
+            {
+                "key": "local_codex_mcp_missing",
+                "severity": "warning",
+                "component": "desired-state",
+                "message": "Local Codex config is missing required MCP server registrations",
+                "missingMcpServers": codex_check.get("missing"),
+                "configPath": codex_check.get("configPath"),
+            }
+        )
+    elif codex_check.get("skipped"):
+        observations.append(
+            {
+                "key": "local_codex_config_not_on_host",
+                "component": "desired-state",
+                "message": "Local Codex MCP config check skipped on this host",
+                "configPath": codex_check.get("configPath"),
+            }
+        )
+
+    registry_state = state.get("runtimeRegistry") if isinstance(state.get("runtimeRegistry"), dict) else {}
+    required_records = registry_state.get("requiredRecords") if isinstance(registry_state.get("requiredRecords"), list) else []
+    forbidden_agent_ids = {
+        str(item)
+        for item in registry_state.get("forbiddenAgentIds", [])
+        if str(item).strip()
+    }
+    temporary_records = registry_state.get("temporaryAllowedRecords") if isinstance(registry_state.get("temporaryAllowedRecords"), list) else []
+    registry = workflow_runtime_registry_records()
+    records = registry.get("records") if isinstance(registry.get("records"), list) else []
+    if registry.get("error"):
+        drifts.append(
+            {
+                "key": "runtime_registry_probe_failed",
+                "severity": "warning",
+                "component": "desired-state",
+                "message": "Runtime registry drift probe failed",
+                "error": registry.get("error"),
+                "dbFile": registry.get("dbFile"),
+            }
+        )
+    elif not registry.get("exists"):
+        observations.append(
+            {
+                "key": "runtime_registry_db_missing_on_host",
+                "component": "desired-state",
+                "message": "Runtime registry database is not present on this host",
+                "dbFile": registry.get("dbFile"),
+            }
+        )
+    else:
+        for expected in required_records:
+            if not isinstance(expected, dict):
+                continue
+            if not any(record_matches_expected(record, expected) for record in records):
+                drifts.append(
+                    {
+                        "key": "runtime_registry_required_record_missing",
+                        "severity": str(expected.get("severity") or "warning"),
+                        "component": "desired-state",
+                        "message": "Required runtime_agents record is missing or has unexpected status",
+                        "expected": expected,
+                    }
+                )
+        for record in records:
+            if str(record.get("agent_id") or "") in forbidden_agent_ids:
+                drifts.append(
+                    {
+                        "key": "runtime_registry_forbidden_agent_present",
+                        "severity": "high",
+                        "component": "desired-state",
+                        "message": "Forbidden runtime agent id is present in runtime_agents",
+                        "record": record,
+                    }
+                )
+        for expected in temporary_records:
+            if not isinstance(expected, dict):
+                continue
+            matches = [record for record in records if record_matches_expected(record, expected)]
+            if matches:
+                observations.append(
+                    {
+                        "key": "runtime_registry_temporary_record_present",
+                        "component": "desired-state",
+                        "message": "Temporary allowed runtime registry record is still present",
+                        "expected": expected,
+                        "matches": matches[:3],
+                    }
+                )
+
+    target = registry_state.get("targetAfterHermersImCutover") if isinstance(registry_state.get("targetAfterHermersImCutover"), dict) else {}
+    if target:
+        observations.append(
+            {
+                "key": "future_hermers_im_cutover_target_declared",
+                "component": "desired-state",
+                "message": "Hermers IM cutover target is declared but not enforced in the current phase",
+                "target": target,
+            }
+        )
+
+    return {
+        "checkedAt": ts(),
+        "desiredStatePath": str(DESIRED_STATE_PATH),
+        "exists": DESIRED_STATE_PATH.exists(),
+        "schemaVersion": state.get("schemaVersion"),
+        "version": state.get("version"),
+        "enforcementPhase": state.get("enforcementPhase"),
+        "ok": not drifts,
+        "severity": max_severity(drifts),
+        "driftCount": len(drifts),
+        "observationCount": len(observations),
+        "drifts": drifts,
+        "observations": observations,
+        "checks": {
+            "packageRoot": str(PACKAGE_ROOT),
+            "requiredFileCount": len(required_files),
+            "codexMcp": codex_check,
+            "runtimeRegistry": {
+                "dbFile": registry.get("dbFile"),
+                "exists": registry.get("exists"),
+                "recordCount": len(records),
+            },
+        },
+    }
+
+
 def tcp_ok(port: int) -> bool:
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=3):
@@ -690,7 +952,7 @@ def hermers_workflow_summary() -> Dict[str, Any]:
             """
             SELECT COALESCE(NULLIF(failure_type,''), 'unknown') AS failure_type, COUNT(*) AS count
             FROM runtime_runs
-            WHERE runtime='hermers'
+            WHERE runtime IN ('hermes_acp', 'hermes', 'hermers')
               AND status='failed'
               AND COALESCE(completed_at, started_at) >= ?
             GROUP BY COALESCE(NULLIF(failure_type,''), 'unknown')
@@ -704,7 +966,7 @@ def hermers_workflow_summary() -> Dict[str, Any]:
                    COALESCE(NULLIF(failure_type,''), 'unknown') AS failure_type,
                    started_at, completed_at, substr(COALESCE(error, ''), 1, 240) AS error
             FROM runtime_runs
-            WHERE runtime='hermers'
+            WHERE runtime IN ('hermes_acp', 'hermes', 'hermers')
               AND status='failed'
               AND COALESCE(completed_at, started_at) >= ?
             ORDER BY COALESCE(completed_at, started_at) DESC
@@ -716,7 +978,7 @@ def hermers_workflow_summary() -> Dict[str, Any]:
             """
             SELECT dispatch_id, meeting_id, agent_id, updated_at, sent_at
             FROM mixed_meeting_dispatches
-            WHERE runtime='hermers'
+            WHERE runtime IN ('hermes_acp', 'hermes', 'hermers')
               AND status='sent'
               AND updated_at < ?
             ORDER BY updated_at
@@ -2962,6 +3224,16 @@ def collect_snapshot(conn: sqlite3.Connection) -> Tuple[Dict[str, Any], List[Dic
     snapshot["hermers"] = hermers_collect(findings)
     snapshot["resource"] = resource_collect(findings)
     snapshot["config"] = config_collect(findings)
+    snapshot["desiredState"] = desired_state_drift()
+    for drift in snapshot["desiredState"].get("drifts") or []:
+        add_finding(
+            findings,
+            str(drift.get("key") or "desired_state_drift"),
+            str(drift.get("severity") or "warning"),
+            "desired-state",
+            str(drift.get("message") or "Desired state drift detected"),
+            evidence={k: v for k, v in drift.items() if k not in {"key", "severity", "component", "message"}},
+        )
     snapshot["trends"] = update_runtime_trends(conn, snapshot, findings)
     findings.sort(key=lambda item: (-SEVERITY_RANK.get(str(item.get("severity")), 0), str(item.get("component")), str(item.get("key"))))
     snapshot["findings"] = findings
@@ -3105,6 +3377,7 @@ def runbook() -> Dict[str, Any]:
         "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability status",
         "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability lanes",
         "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability findings",
+        "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability drift",
         "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability actions --limit 20",
         "tail -n 100 /home/flashcat/.openclaw/stability/events.jsonl",
     ]
@@ -3138,6 +3411,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("snapshot")
     sub.add_parser("policy")
     sub.add_parser("lanes")
+    sub.add_parser("desired-state")
+    sub.add_parser("drift")
     sub.add_parser("findings")
     actions_p = sub.add_parser("actions")
     actions_p.add_argument("--limit", type=int, default=20)
@@ -3176,6 +3451,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if cmd == "lanes":
         lanes = load_json(LANE_POLICY_PATH, {}) or (load_json(POLICY_PATH, {}) or {}).get("lanes") or {}
         return print_json(lanes)
+    if cmd == "desired-state":
+        return print_json(load_desired_state())
+    if cmd == "drift":
+        return print_json(desired_state_drift())
     if cmd == "findings":
         latest = load_json(LATEST_PATH, {}) or {}
         return print_json(latest.get("findings") or [])
