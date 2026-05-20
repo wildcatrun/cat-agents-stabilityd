@@ -698,6 +698,20 @@ def hermers_workflow_summary() -> Dict[str, Any]:
             """,
             (cutoff_iso,),
         ).fetchall()
+        failure_sample = conn.execute(
+            """
+            SELECT runtime_run_id, dispatch_id, workflow_id, agent_id, adapter,
+                   COALESCE(NULLIF(failure_type,''), 'unknown') AS failure_type,
+                   started_at, completed_at, substr(COALESCE(error, ''), 1, 240) AS error
+            FROM runtime_runs
+            WHERE runtime='hermers'
+              AND status='failed'
+              AND COALESCE(completed_at, started_at) >= ?
+            ORDER BY COALESCE(completed_at, started_at) DESC
+            LIMIT 10
+            """,
+            (cutoff_iso,),
+        ).fetchall()
         stale_sent = conn.execute(
             """
             SELECT dispatch_id, meeting_id, agent_id, updated_at, sent_at
@@ -711,6 +725,7 @@ def hermers_workflow_summary() -> Dict[str, Any]:
             (stale_cutoff_iso,),
         ).fetchall()
         summary["recentFailures"] = [dict(row) for row in failures]
+        summary["recentFailureSample"] = [dict(row) for row in failure_sample]
         summary["recentFailureCount"] = sum(int(row["count"] or 0) for row in failures)
         summary["staleSentCount"] = len(stale_sent)
         summary["staleSentSample"] = [dict(row) for row in stale_sent[:10]]
@@ -770,7 +785,27 @@ def hermers_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     if long_workers:
         add_finding(findings, "hermers_acp_long_running_workers", "warning", "hermers", "Hermers ACP workers exceeded the long-running threshold", count=len(long_workers), sample=long_workers[:10])
     if recent_failure_count >= HERMERS_FAILURE_BURST_THRESHOLD:
-        add_finding(findings, "hermers_runtime_failure_burst", "high", "hermers", "Hermers runtime failures exceeded burst threshold", count=recent_failure_count, failures=workflow.get("recentFailures") or [])
+        add_finding(
+            findings,
+            "hermers_runtime_failure_burst",
+            "high",
+            "hermers",
+            "Hermers runtime failures exceeded burst threshold",
+            count=recent_failure_count,
+            failures=workflow.get("recentFailures") or [],
+            sample=workflow.get("recentFailureSample") or [],
+        )
+    elif recent_failure_count > 0:
+        add_finding(
+            findings,
+            "hermers_runtime_recent_failures",
+            "warning",
+            "hermers",
+            "Hermers runtime reported recent failed runs below burst threshold",
+            count=recent_failure_count,
+            failures=workflow.get("recentFailures") or [],
+            sample=workflow.get("recentFailureSample") or [],
+        )
     if stale_sent_count > 0:
         add_finding(findings, "hermers_stale_sent_dispatches", "high", "hermers", "Hermers dispatches are stuck in sent state without terminal runtime receipt", count=stale_sent_count, sample=workflow.get("staleSentSample") or [])
     if workflow.get("error"):

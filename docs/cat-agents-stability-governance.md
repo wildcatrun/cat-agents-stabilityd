@@ -108,6 +108,7 @@ Required governance controls:
 - Keep route-shell as an ingress and audit shell only. It may acknowledge receipt with `trace_id`, but it cannot satisfy formal agent-result semantics.
 - For `workflow_ingress_adapter=acp`, fail closed when ACP is unavailable. CLI can run only when registry explicitly selects the CLI adapter or a separately governed fallback is approved.
 - Keep cron intent and heartbeat governance in `trading-agents-workflow` unless a specific Hermers-local cron is explicitly registered as profile-internal. Profile-local cron output must still flow through workflow/messageflow receipts before it is treated as system truth.
+- Read `trading-agents-workflow` runtime receipts as a Hermers readiness signal: a single recent `runtime_runs.status=failed` becomes a Hermers observation with sample dispatch evidence, while repeated failures crossing the burst threshold become Hermers pressure.
 - Use process-group lifecycle control for ACP workers. Timeout must terminate the whole worker group and then verify that no orphan ACP child remains.
 - Use three-layer health:
   - liveness: service/process/PID/cgroup exists
