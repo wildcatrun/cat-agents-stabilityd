@@ -9,6 +9,7 @@ As of this package baseline, `cat-agents-stability` has four install surfaces:
 - External daemon/CLI: `bin/cat-agents-stability` and `bin/cat_agents_stabilityd.py`
 - Hermers contract docs: `hermers/README.md`
 - Desired-state registry: `policies/desired-state.json`
+- Workflow evidence handoff: `governance-logs/stability-evidence-latest.{json,md}` in `trading-agents-workflow`
 
 The package is intentionally a companion to `trading-agents-workflow`, not a container for it.
 
@@ -21,6 +22,7 @@ Status: implemented.
 - OpenClaw plugin wrapper exposes read actions and guarded no-action diagnostics.
 - Server candidate checkout exists separately from the live daemon directory.
 - Desired-state and read-only drift checks are available through CLI, OpenClaw tool action, and Codex MCP.
+- Stability evidence is written into `trading-agents-workflow/governance-logs/` for cat-brain heartbeat consumption.
 
 Exit criteria:
 

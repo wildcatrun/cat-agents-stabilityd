@@ -34,7 +34,10 @@ Use read-only drift checks before changing deployment state:
 ```bash
 bin/cat-agents-stability desired-state
 bin/cat-agents-stability drift
+bin/cat-agents-stability workflow-evidence
 ```
+
+`workflow-evidence` writes `stability-evidence-latest.json` and `stability-evidence-latest.md` into `trading-agents-workflow/governance-logs/` so cat-brain `main` can consume stability facts during heartbeat governance.
 
 ## Boundary With trading-agents-workflow
 

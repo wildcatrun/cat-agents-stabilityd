@@ -15,6 +15,7 @@ Capabilities:
 - read remote stability status, findings, lanes, actions, runbook
 - run `doctor` in no-action mode
 - run desired-state drift checks
+- generate workflow governance evidence for cat-brain consumption
 - inspect package status
 - fetch server package snapshot
 
@@ -44,6 +45,7 @@ Default behavior:
 
 - read actions are allowed
 - `desired-state` and `drift` are read-only
+- `workflow-evidence` writes a governed evidence artifact under `trading-agents-workflow/governance-logs/`
 - `doctor`, `once`, and `repair` default to no-action/dry-run unless `allowMutatingActions=true`
 
 ## systemd

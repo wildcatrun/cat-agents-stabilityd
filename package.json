@@ -21,8 +21,9 @@
     "openclaw": ">=2026.5.7"
   },
   "scripts": {
-    "check": "node --check index.js && python3 -m py_compile bin/cat_agents_stabilityd.py scripts/cat_agents_stability_mcp.py",
+    "check": "node --check index.js && python3 -m py_compile bin/cat_agents_stabilityd.py scripts/cat_agents_stability_mcp.py hermers/hermers_stability_probe.py",
     "smoke:mcp": "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}' '{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}' | python3 scripts/cat_agents_stability_mcp.py",
-    "smoke:drift": "bin/cat-agents-stability drift"
+    "smoke:drift": "bin/cat-agents-stability drift",
+    "smoke:hermers": "python3 hermers/hermers_stability_probe.py"
   }
 }

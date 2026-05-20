@@ -100,7 +100,7 @@ def parse_json_output(result: dict[str, Any], fallback: Any) -> Any:
 
 
 def stability_cli_args(action: str, args: dict[str, Any]) -> list[str]:
-    allowed = {"status", "snapshot", "policy", "lanes", "desired-state", "drift", "findings", "actions", "events", "runbook", "doctor", "repair", "once"}
+    allowed = {"status", "snapshot", "policy", "lanes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook", "doctor", "repair", "once"}
     if action not in allowed:
         raise ValueError(f"unsupported stability action: {action}")
     cmd = [action]
@@ -164,6 +164,10 @@ def desired_state(args: dict[str, Any]) -> dict[str, Any]:
 
 def drift_check(args: dict[str, Any]) -> dict[str, Any]:
     return stability_call({**args, "action": "drift"})
+
+
+def workflow_evidence(args: dict[str, Any]) -> dict[str, Any]:
+    return stability_call({**args, "action": "workflow-evidence"})
 
 
 def doctor(args: dict[str, Any]) -> dict[str, Any]:
@@ -230,6 +234,10 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": "Run a read-only drift check against the cat-agents-stability desired-state registry.",
         "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
     },
+    "stability_workflow_evidence": {
+        "description": "Generate the cat-agents-stability evidence package consumed by trading-agents-workflow governance logs and cat-brain heartbeat.",
+        "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
+    },
     "stability_doctor_dry_run": {
         "description": "Run cat-agents-stability doctor in no-action mode.",
         "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}, "timeout": {"type": "number"}}, "additionalProperties": False},
@@ -293,6 +301,8 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
                 payload = desired_state(arguments)
             elif name == "stability_drift_check":
                 payload = drift_check(arguments)
+            elif name == "stability_workflow_evidence":
+                payload = workflow_evidence(arguments)
             elif name == "stability_doctor_dry_run":
                 payload = doctor(arguments)
             elif name == "stability_server_snapshot":

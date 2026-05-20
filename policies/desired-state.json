@@ -18,7 +18,8 @@
       "docs/plugin-architecture.md",
       "docs/deployment-matrix.md",
       "docs/implementation-roadmap.md",
-      "hermers/README.md"
+      "hermers/README.md",
+      "hermers/hermers_stability_probe.py"
     ]
   },
   "localCodex": {

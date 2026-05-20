@@ -35,8 +35,24 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 HOME = Path(os.environ.get("OPENCLAW_HOME_DIR", "/home/flashcat"))
 OPENCLAW = HOME / ".openclaw"
 HERMES_HOME = HOME / ".hermes"
-WORKFLOW_ROOT = HOME / "multi-agent-hedge-fund-framework" / "trading-agents-workflow"
+
+
+def default_workflow_root() -> Path:
+    configured = os.environ.get("CAT_AGENTS_WORKFLOW_ROOT")
+    if configured:
+        return Path(configured)
+    primary = HOME / "multi-agent-hedge-fund-framework" / "trading-agents-workflow"
+    mac_primary = Path("/Users/Flashcat/multi-agent-hedge-fund-framework/trading-agents-workflow")
+    if primary.exists():
+        return primary
+    if mac_primary.exists():
+        return mac_primary
+    return primary
+
+
+WORKFLOW_ROOT = default_workflow_root()
 WORKFLOW_DB = Path(os.environ.get("CAT_AGENTS_WORKFLOW_DB", str(WORKFLOW_ROOT / "tracking.db")))
+WORKFLOW_GOVERNANCE_LOG_DIR = WORKFLOW_ROOT / "governance-logs"
 SCRIPTS = HOME / "scripts"
 STABILITY_DIR = OPENCLAW / "stability"
 LOG_DIR = OPENCLAW / "logs"
@@ -54,6 +70,8 @@ LOCK_PATH = STABILITY_DIR / "stabilityd.lock"
 LOG_PATH = STABILITY_DIR / "stabilityd.log"
 CONTROL_PLANE_BACKPRESSURE_PATH = STABILITY_DIR / "control-plane-backpressure.json"
 LANE_POLICY_PATH = STABILITY_DIR / "lane-policy.json"
+WORKFLOW_STABILITY_EVIDENCE_JSON = WORKFLOW_GOVERNANCE_LOG_DIR / "stability-evidence-latest.json"
+WORKFLOW_STABILITY_EVIDENCE_MD = WORKFLOW_GOVERNANCE_LOG_DIR / "stability-evidence-latest.md"
 DESIRED_STATE_PATH = Path(
     os.environ.get("CAT_AGENTS_STABILITY_DESIRED_STATE", str(PACKAGE_ROOT / "policies" / "desired-state.json"))
 )
@@ -721,6 +739,111 @@ def desired_state_drift() -> Dict[str, Any]:
             },
         },
     }
+
+
+def build_workflow_stability_evidence(snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    latest = snapshot if isinstance(snapshot, dict) else (load_json(LATEST_PATH, {}) or {})
+    policy = latest.get("policy") if isinstance(latest.get("policy"), dict) else (load_json(POLICY_PATH, {}) or {})
+    lanes = policy.get("lanes") if isinstance(policy.get("lanes"), dict) else (load_json(LANE_POLICY_PATH, {}) or {})
+    desired = latest.get("desiredState") if isinstance(latest.get("desiredState"), dict) else desired_state_drift()
+    findings = latest.get("findings") if isinstance(latest.get("findings"), list) else []
+    actions = latest.get("actions") if isinstance(latest.get("actions"), list) else []
+    return {
+        "schemaVersion": 1,
+        "generatedAt": ts(),
+        "source": "cat-agents-stabilityd",
+        "workflowRoot": str(WORKFLOW_ROOT),
+        "stability": {
+            "checkedAt": latest.get("checkedAt"),
+            "completedAt": latest.get("completedAt"),
+            "severity": latest.get("severity"),
+            "mode": policy.get("mode"),
+            "findingCount": len(findings),
+            "actionCount": len(actions),
+        },
+        "policy": {
+            "mode": policy.get("mode"),
+            "severity": policy.get("severity"),
+            "reasons": policy.get("reasons") or [],
+            "canRestartGateway": bool(policy.get("canRestartGateway")),
+            "shouldPauseNonCriticalCron": bool(policy.get("shouldPauseNonCriticalCron")),
+            "deferControlPlaneHeavyReports": bool(policy.get("deferControlPlaneHeavyReports")),
+        },
+        "lanes": lanes,
+        "desiredState": {
+            "ok": desired.get("ok"),
+            "severity": desired.get("severity"),
+            "driftCount": desired.get("driftCount"),
+            "observationCount": desired.get("observationCount"),
+            "enforcementPhase": desired.get("enforcementPhase"),
+            "drifts": desired.get("drifts") or [],
+            "observations": desired.get("observations") or [],
+        },
+        "topFindings": findings[:20],
+        "recentActions": actions[:20],
+        "catBrainConsumption": {
+            "agentId": "main",
+            "heartbeatUse": "Read this evidence before 30min semantic governance checks and before deciding whether to ask cat_claw for Human Gate submission.",
+            "doNotUseFor": "This evidence does not authorize Gateway restart, runtime migration, trading actions, or Human Gate completion by itself.",
+        },
+    }
+
+
+def render_workflow_stability_evidence_md(evidence: Dict[str, Any]) -> str:
+    stability = evidence.get("stability") or {}
+    desired = evidence.get("desiredState") or {}
+    policy = evidence.get("policy") or {}
+    findings = evidence.get("topFindings") or []
+    observations = desired.get("observations") or []
+    lines = [
+        "# Cat Agents Stability Evidence",
+        "",
+        f"- generatedAt: {evidence.get('generatedAt')}",
+        f"- checkedAt: {stability.get('checkedAt')}",
+        f"- severity: {stability.get('severity')}",
+        f"- mode: {stability.get('mode')}",
+        f"- findingCount: {stability.get('findingCount')}",
+        f"- desiredState.ok: {desired.get('ok')}",
+        f"- desiredState.driftCount: {desired.get('driftCount')}",
+        f"- desiredState.observationCount: {desired.get('observationCount')}",
+        f"- policy.reasons: {', '.join(policy.get('reasons') or []) or 'none'}",
+        "",
+        "## Top Findings",
+    ]
+    if findings:
+        for item in findings[:20]:
+            lines.append(f"- [{item.get('severity')}] {item.get('component')}::{item.get('key')} - {item.get('message')}")
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Desired-State Observations"])
+    if observations:
+        for item in observations[:20]:
+            lines.append(f"- {item.get('key')}: {item.get('message')}")
+    else:
+        lines.append("- none")
+    lines.extend([
+        "",
+        "## Cat-Brain Use",
+        "- 猫之脑 main 应在 30min semantic governance checks 中读取本证据。",
+        "- 本证据只提供治理事实，不自动授权 Gateway restart、runtime migration、交易动作或 Human Gate 完成。",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def write_workflow_stability_evidence(snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    evidence = build_workflow_stability_evidence(snapshot)
+    if not WORKFLOW_ROOT.exists():
+        evidence["written"] = False
+        evidence["reason"] = "workflow root missing"
+        return evidence
+    WORKFLOW_GOVERNANCE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(WORKFLOW_STABILITY_EVIDENCE_JSON, evidence)
+    WORKFLOW_STABILITY_EVIDENCE_MD.write_text(render_workflow_stability_evidence_md(evidence), encoding="utf-8")
+    evidence["written"] = True
+    evidence["jsonPath"] = str(WORKFLOW_STABILITY_EVIDENCE_JSON)
+    evidence["markdownPath"] = str(WORKFLOW_STABILITY_EVIDENCE_MD)
+    return evidence
 
 
 def tcp_ok(port: int) -> bool:
@@ -3289,6 +3412,7 @@ def run_once(conn: sqlite3.Connection, no_action: bool = False) -> Dict[str, Any
     write_json_atomic(LATEST_PATH, snapshot)
     write_json_atomic(LANE_POLICY_PATH, policy.get("lanes") or {})
     write_json_atomic(CONTROL_PLANE_BACKPRESSURE_PATH, snapshot["controlPlane"])
+    snapshot["workflowEvidence"] = write_workflow_stability_evidence(snapshot)
     write_legacy_watchdog_health(snapshot, policy)
     for finding in findings:
         if SEVERITY_RANK.get(str(finding.get("severity")), 0) >= SEVERITY_RANK["high"]:
@@ -3446,6 +3570,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("desired-state")
     sub.add_parser("drift")
     sub.add_parser("findings")
+    evidence_p = sub.add_parser("workflow-evidence")
+    evidence_p.add_argument("--no-write", action="store_true")
     actions_p = sub.add_parser("actions")
     actions_p.add_argument("--limit", type=int, default=20)
     sub.add_parser("events")
@@ -3490,6 +3616,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if cmd == "findings":
         latest = load_json(LATEST_PATH, {}) or {}
         return print_json(latest.get("findings") or [])
+    if cmd == "workflow-evidence":
+        evidence = build_workflow_stability_evidence()
+        if not args.no_write:
+            evidence = write_workflow_stability_evidence()
+        return print_json(evidence)
     if cmd == "actions":
         return print_json(tail_jsonl(ACTIONS_JSONL, limit=args.limit))
     if cmd == "events":
