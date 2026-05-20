@@ -478,7 +478,11 @@ def workflow_runtime_registry_records() -> Dict[str, Any]:
 def record_matches_expected(record: Dict[str, Any], expected: Dict[str, Any]) -> bool:
     if str(record.get("agent_id") or "") != str(expected.get("agentId") or ""):
         return False
-    if str(record.get("runtime") or "") != str(expected.get("runtime") or ""):
+    allowed_runtimes = expected.get("allowedRuntimes")
+    if not isinstance(allowed_runtimes, list):
+        runtime = expected.get("runtime")
+        allowed_runtimes = [runtime] if runtime else []
+    if allowed_runtimes and str(record.get("runtime") or "") not in {str(item) for item in allowed_runtimes}:
         return False
     allowed_statuses = expected.get("allowedStatuses")
     if not isinstance(allowed_statuses, list):
@@ -486,8 +490,11 @@ def record_matches_expected(record: Dict[str, Any], expected: Dict[str, Any]) ->
         allowed_statuses = [status] if status else []
     if allowed_statuses and str(record.get("status") or "") not in {str(item) for item in allowed_statuses}:
         return False
-    endpoint_ref = expected.get("endpointRef")
-    if endpoint_ref and str(record.get("endpoint_ref") or "") != str(endpoint_ref):
+    allowed_endpoint_refs = expected.get("allowedEndpointRefs")
+    if not isinstance(allowed_endpoint_refs, list):
+        endpoint_ref = expected.get("endpointRef")
+        allowed_endpoint_refs = [endpoint_ref] if endpoint_ref else []
+    if allowed_endpoint_refs and str(record.get("endpoint_ref") or "") not in {str(item) for item in allowed_endpoint_refs}:
         return False
     return True
 
@@ -618,7 +625,8 @@ def desired_state_drift() -> Dict[str, Any]:
         for expected in required_records:
             if not isinstance(expected, dict):
                 continue
-            if not any(record_matches_expected(record, expected) for record in records):
+            matches = [record for record in records if record_matches_expected(record, expected)]
+            if not matches:
                 drifts.append(
                     {
                         "key": "runtime_registry_required_record_missing",
@@ -628,6 +636,30 @@ def desired_state_drift() -> Dict[str, Any]:
                         "expected": expected,
                     }
                 )
+                continue
+            preferred_runtime = expected.get("preferredRuntime") or expected.get("runtime")
+            preferred_endpoint_ref = expected.get("preferredEndpointRef") or expected.get("endpointRef")
+            for match in matches:
+                if preferred_runtime and str(match.get("runtime") or "") != str(preferred_runtime):
+                    observations.append(
+                        {
+                            "key": "runtime_registry_preferred_runtime_not_reached",
+                            "component": "desired-state",
+                            "message": "Runtime registry record matches a migration-phase alias instead of the preferred runtime",
+                            "preferredRuntime": preferred_runtime,
+                            "record": match,
+                        }
+                    )
+                if preferred_endpoint_ref and str(match.get("endpoint_ref") or "") != str(preferred_endpoint_ref):
+                    observations.append(
+                        {
+                            "key": "runtime_registry_preferred_endpoint_not_reached",
+                            "component": "desired-state",
+                            "message": "Runtime registry record matches a migration-phase endpoint alias instead of the preferred endpoint",
+                            "preferredEndpointRef": preferred_endpoint_ref,
+                            "record": match,
+                        }
+                    )
         for record in records:
             if str(record.get("agent_id") or "") in forbidden_agent_ids:
                 drifts.append(

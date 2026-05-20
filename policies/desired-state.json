@@ -95,38 +95,104 @@
       {
         "agentId": "cat_body",
         "runtime": "hermes_acp",
+        "preferredRuntime": "hermes_acp",
+        "allowedRuntimes": [
+          "hermes_acp",
+          "hermers",
+          "hermes"
+        ],
         "status": "active",
-        "endpointRef": "hermes-profile:catbody"
+        "endpointRef": "hermes-profile:catbody",
+        "preferredEndpointRef": "hermes-profile:catbody",
+        "allowedEndpointRefs": [
+          "hermes-profile:catbody",
+          "hermers-profile:catbody"
+        ]
       },
       {
         "agentId": "cat_ears",
         "runtime": "hermes_acp",
+        "preferredRuntime": "hermes_acp",
+        "allowedRuntimes": [
+          "hermes_acp",
+          "hermers",
+          "hermes"
+        ],
         "status": "active",
-        "endpointRef": "hermes-profile:catears"
+        "endpointRef": "hermes-profile:catears",
+        "preferredEndpointRef": "hermes-profile:catears",
+        "allowedEndpointRefs": [
+          "hermes-profile:catears",
+          "hermers-profile:catears"
+        ]
       },
       {
         "agentId": "cat_eyes",
         "runtime": "hermes_acp",
+        "preferredRuntime": "hermes_acp",
+        "allowedRuntimes": [
+          "hermes_acp",
+          "hermers",
+          "hermes"
+        ],
         "status": "active",
-        "endpointRef": "hermes-profile:cateyes"
+        "endpointRef": "hermes-profile:cateyes",
+        "preferredEndpointRef": "hermes-profile:cateyes",
+        "allowedEndpointRefs": [
+          "hermes-profile:cateyes",
+          "hermers-profile:cateyes"
+        ]
       },
       {
         "agentId": "cat_heart",
         "runtime": "hermes_acp",
+        "preferredRuntime": "hermes_acp",
+        "allowedRuntimes": [
+          "hermes_acp",
+          "hermers",
+          "hermes"
+        ],
         "status": "active",
-        "endpointRef": "hermes-profile:catheart"
+        "endpointRef": "hermes-profile:catheart",
+        "preferredEndpointRef": "hermes-profile:catheart",
+        "allowedEndpointRefs": [
+          "hermes-profile:catheart",
+          "hermers-profile:catheart"
+        ]
       },
       {
         "agentId": "cat_nose",
         "runtime": "hermes_acp",
+        "preferredRuntime": "hermes_acp",
+        "allowedRuntimes": [
+          "hermes_acp",
+          "hermers",
+          "hermes"
+        ],
         "status": "active",
-        "endpointRef": "hermes-profile:catnose"
+        "endpointRef": "hermes-profile:catnose",
+        "preferredEndpointRef": "hermes-profile:catnose",
+        "allowedEndpointRefs": [
+          "hermes-profile:catnose",
+          "hermers-profile:catnose"
+        ]
       },
       {
         "agentId": "cat_penclaw",
         "runtime": "hermes_acp",
+        "preferredRuntime": "hermes_acp",
+        "allowedRuntimes": [
+          "hermes_acp",
+          "hermers",
+          "hermes"
+        ],
         "status": "active",
-        "endpointRef": "hermes-profile:catpenclaw"
+        "endpointRef": "hermes-profile:catpenclaw",
+        "preferredEndpointRef": "hermes-profile:catpenclaw",
+        "allowedEndpointRefs": [
+          "hermes-profile:catpenclaw",
+          "hermers-profile:catpenclaw"
+        ]
       }
     ],
     "temporaryAllowedRecords": [

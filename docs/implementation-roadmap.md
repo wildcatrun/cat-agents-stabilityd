@@ -94,6 +94,6 @@ Add a versioned desired-state file describing:
 - Telegram consumer ownership
 - return policies
 
-Current enforcement phase is `pre-hermers-im-cutover`: Hermers ACP runtime records are required, temporary OpenClaw route-shell records are observed but not yet treated as drift, and the dormant legacy workspace target is recorded for the separately authorized Hermers IM migration.
+Current enforcement phase is `pre-hermers-im-cutover`: Hermers ACP runtime records are required, `hermers`/`hermers-profile:*` registry aliases are accepted as migration-compatible observations, temporary OpenClaw route-shell records are observed but not yet treated as drift, and the dormant legacy workspace target is recorded for the separately authorized Hermers IM migration.
 
 The stability plugin reports drift and does not silently mutate high-impact state.

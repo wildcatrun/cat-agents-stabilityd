@@ -10,6 +10,8 @@ The current enforcement phase is `pre-hermers-im-cutover`.
 
 That means the six Hermers ACP agents must be active in `runtime_agents` as `hermes_acp`, while their OpenClaw `openclaw_route_shell` records are treated as temporary observations, not hard drift. The future target is still recorded: after an explicit Hermers IM cutover, those OpenClaw identities should become dormant legacy workspaces with IM/workflow ingress disabled.
 
+During the migration window, live registries that still use `runtime=hermers` or `hermers-profile:*` endpoint aliases are accepted as compatible records and reported as observations against the preferred `hermes_acp` / `hermes-profile:*` spelling. This keeps stability smoke checks non-noisy while preserving the convergence target.
+
 ## Drift Command
 
 ```bash
