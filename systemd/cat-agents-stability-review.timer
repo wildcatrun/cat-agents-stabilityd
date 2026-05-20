@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Cat Agents Stability Review once on 2026-05-01 19:53 CST
+
+[Timer]
+OnCalendar=2026-05-01 19:53:00
+Persistent=true
+Unit=cat-agents-stability-review.service
+
+[Install]
+WantedBy=timers.target
+

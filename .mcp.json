@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "cat-agents-stability": {
+      "command": "python3",
+      "args": [
+        "./scripts/cat_agents_stability_mcp.py"
+      ],
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 240,
+      "enabled": true
+    }
+  }
+}

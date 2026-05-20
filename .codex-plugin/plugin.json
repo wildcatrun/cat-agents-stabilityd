@@ -1,0 +1,35 @@
+{
+  "name": "cat-agents-stability",
+  "version": "0.1.0",
+  "description": "Codex control-plane access for cat-system stability status, findings, lanes, runbooks, and guarded low-risk diagnostics.",
+  "author": {
+    "name": "Flashcat",
+    "email": "flashcat@localhost"
+  },
+  "license": "UNLICENSED",
+  "keywords": [
+    "trading-agents",
+    "stability",
+    "codex",
+    "mcp",
+    "governance"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Cat Agents Stability",
+    "shortDescription": "Inspect cat-system stability findings and runbooks.",
+    "longDescription": "Provides local Codex with a governed MCP entrypoint for cat-agents-stability status, findings, lane policy, actions, runbooks, remote server snapshots, and guarded diagnostics.",
+    "developerName": "Flashcat",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "MCP"
+    ],
+    "defaultPrompt": [
+      "Check cat-system stability status.",
+      "List current stability findings.",
+      "Show stability lanes and runbook."
+    ],
+    "brandColor": "#0F766E"
+  }
+}

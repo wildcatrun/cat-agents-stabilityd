@@ -1,0 +1,3166 @@
+#!/usr/bin/env python3
+"""Cat agents stability control plane.
+
+This daemon replaces independent watchdog/guard/controller scripts with a
+single policy engine and actuator surface for the OpenClaw cloud runtime.
+It intentionally uses only the Python standard library.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import errno
+import fcntl
+import glob
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+import traceback
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+
+HOME = Path(os.environ.get("OPENCLAW_HOME_DIR", "/home/flashcat"))
+OPENCLAW = HOME / ".openclaw"
+HERMES_HOME = HOME / ".hermes"
+WORKFLOW_ROOT = HOME / "multi-agent-hedge-fund-framework" / "trading-agents-workflow"
+WORKFLOW_DB = Path(os.environ.get("CAT_AGENTS_WORKFLOW_DB", str(WORKFLOW_ROOT / "tracking.db")))
+SCRIPTS = HOME / "scripts"
+STABILITY_DIR = OPENCLAW / "stability"
+LOG_DIR = OPENCLAW / "logs"
+CRON_DIR = OPENCLAW / "cron"
+AGENTS_DIR = OPENCLAW / "agents"
+TELEGRAM_DIR = OPENCLAW / "telegram"
+
+LATEST_PATH = STABILITY_DIR / "latest.json"
+POLICY_PATH = STABILITY_DIR / "policy.json"
+EVENTS_JSONL = STABILITY_DIR / "events.jsonl"
+ACTIONS_JSONL = STABILITY_DIR / "actions.jsonl"
+STATE_DB = STABILITY_DIR / "state.db"
+LOCK_PATH = STABILITY_DIR / "stabilityd.lock"
+LOG_PATH = STABILITY_DIR / "stabilityd.log"
+CONTROL_PLANE_BACKPRESSURE_PATH = STABILITY_DIR / "control-plane-backpressure.json"
+LANE_POLICY_PATH = STABILITY_DIR / "lane-policy.json"
+
+LEGACY_WATCHDOG_HEALTH = CRON_DIR / "health" / "gateway-watchdog.json"
+CRON_AUDIT_PATH = CRON_DIR / "health" / "cron-audit-latest.json"
+SESSION_GUARD_LATEST = OPENCLAW / "health" / "session-guard-latest.json"
+OLD_HEALTH_CONTROLLER_LATEST = OPENCLAW / "health" / "openclaw-health-controller-latest.json"
+JOBS_PATH = CRON_DIR / "jobs.json"
+LEASE_DIR = CRON_DIR / "leases"
+RUNS_BY_RUN_DIR = CRON_DIR / "runs" / "by-run"
+RUNS_BY_JOB_DIR = CRON_DIR / "runs" / "by-job"
+ORPHAN_RUNS_BY_JOB_DIR = CRON_DIR / "runs" / "orphaned-by-job"
+REPAIR_DIR = CRON_DIR / "repair-requests"
+REPAIR_PENDING_DIR = REPAIR_DIR / "pending"
+REPAIR_PROCESSED_DIR = REPAIR_DIR / "processed"
+REPAIR_STATUS_PATH = REPAIR_DIR / "status.json"
+GATEWAY_ERR_LOG = LOG_DIR / "gateway.err.log"
+
+PORT = int(os.environ.get("OPENCLAW_GATEWAY_PORT", "23466"))
+INTERVAL_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_INTERVAL_SECONDS", "30"))
+POLICY_TTL_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_POLICY_TTL_SECONDS", "180"))
+LOG_PRESSURE_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_LOG_PRESSURE_WINDOW_SECONDS", "900"))
+TREND_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_TREND_WINDOW_SECONDS", "1800"))
+TREND_SAMPLE_LIMIT = int(os.environ.get("OPENCLAW_STABILITY_TREND_SAMPLE_LIMIT", "240"))
+MEMORY_GROWTH_WARN_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_MEMORY_GROWTH_WARN_GB", "0.75")) * 1024**3)
+CHILD_GROWTH_WARN_COUNT = int(os.environ.get("OPENCLAW_STABILITY_CHILD_GROWTH_WARN", "4"))
+CRON_AUDIT_FRESH_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_CRON_AUDIT_FRESH_SECONDS", "3600"))
+LEGACY_CRON_AUDIT_REQUIRED = os.environ.get("OPENCLAW_STABILITY_LEGACY_CRON_AUDIT_REQUIRED", "0") == "1"
+CRON_HISTORY_WINDOW_DAYS = int(os.environ.get("OPENCLAW_STABILITY_CRON_HISTORY_DAYS", "7"))
+CRON_HEARTBEAT_WARN_MS = int(os.environ.get("OPENCLAW_STABILITY_CRON_HEARTBEAT_WARN_MS", "60000"))
+CRON_LONG_RUN_WARN_MS = int(os.environ.get("OPENCLAW_STABILITY_CRON_LONG_RUN_WARN_MS", str(15 * 60 * 1000)))
+CRON_TIMEOUT_NEAR_MISS_MS = int(os.environ.get("OPENCLAW_STABILITY_CRON_TIMEOUT_NEAR_MISS_MS", "2000"))
+CRON_MAX_CONCURRENCY_NORMAL = int(os.environ.get("OPENCLAW_STABILITY_CRON_MAX_CONCURRENCY_NORMAL", "3"))
+CRON_MAX_CONCURRENCY_DEGRADED = int(os.environ.get("OPENCLAW_STABILITY_CRON_MAX_CONCURRENCY_DEGRADED", "1"))
+CRON_RECOVERY_LIMITED_HEALTHY_STREAK = int(os.environ.get("OPENCLAW_STABILITY_CRON_RECOVERY_LIMITED_STREAK", "5"))
+CRON_RECOVERY_OPEN_HEALTHY_STREAK = int(os.environ.get("OPENCLAW_STABILITY_CRON_RECOVERY_OPEN_STREAK", "10"))
+RESTART_COOLDOWN_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_RESTART_COOLDOWN_SECONDS", "1800"))
+RESTART_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_RESTART_WINDOW_SECONDS", str(6 * 3600)))
+MAX_RESTARTS_PER_WINDOW = int(os.environ.get("OPENCLAW_STABILITY_MAX_RESTARTS", "2"))
+ACTION_STREAK_THRESHOLD = int(os.environ.get("OPENCLAW_STABILITY_ACTION_STREAK", "2"))
+STARTUP_GRACE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_STARTUP_GRACE_SECONDS", "240"))
+MEMORY_WARN_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_MEMORY_WARN_GB", "5.0")) * 1024**3)
+MEMORY_CRIT_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_MEMORY_CRIT_GB", "6.5")) * 1024**3)
+SWAP_WARN_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_SWAP_WARN_GB", "0.8")) * 1024**3)
+SWAP_CRIT_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_SWAP_CRIT_GB", "1.8")) * 1024**3)
+BACKUP_HEADROOM_WARN_RATIO = float(os.environ.get("OPENCLAW_STABILITY_BACKUP_HEADROOM_WARN_RATIO", "1.20"))
+BACKUP_KEEP_COUNT = int(os.environ.get("OPENCLAW_STABILITY_BACKUP_KEEP_COUNT", "3"))
+
+HERMERS_PROFILES = [
+    item.strip()
+    for item in os.environ.get(
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILES",
+        os.environ.get("OPENCLAW_STABILITY_HERMERS_PROFILES", "catnose,catbody,catheart,catears,cateyes,catpenclaw"),
+    ).split(",")
+    if item.strip()
+]
+HERMERS_ACP_ORPHAN_REAP_ENABLED = os.environ.get(
+    "CAT_AGENTS_STABILITY_REAP_HERMERS_ACP_ORPHANS",
+    os.environ.get("OPENCLAW_STABILITY_REAP_HERMERS_ACP_ORPHANS", "1"),
+) != "0"
+HERMERS_GATEWAY_RESTART_ENABLED = os.environ.get(
+    "CAT_AGENTS_STABILITY_RESTART_HERMERS_GATEWAY",
+    os.environ.get("OPENCLAW_STABILITY_RESTART_HERMERS_GATEWAY", "0"),
+) == "1"
+HERMERS_ACP_ORPHAN_MIN_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_ACP_ORPHAN_SECONDS", "120"))
+HERMERS_ACP_LONG_RUNNING_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_ACP_LONG_SECONDS", "600"))
+HERMERS_FAILURE_WINDOW_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_FAILURE_WINDOW_SECONDS", "1800"))
+HERMERS_FAILURE_BURST_THRESHOLD = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_FAILURE_BURST", "5"))
+HERMERS_STALE_SENT_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_STALE_SENT_SECONDS", "600"))
+
+TMP_FILE_MAX_AGE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_TMP_MAX_AGE_SECONDS", "3600"))
+ORPHAN_RUN_LOG_MIN_AGE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_ORPHAN_RUN_LOG_MIN_AGE_SECONDS", "3600"))
+MIN_STALE_RUNNING_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_MIN_STALE_RUNNING_SECONDS", "1800"))
+STALE_RUNNING_TIMEOUT_MULTIPLIER = int(os.environ.get("OPENCLAW_STABILITY_STALE_RUNNING_MULTIPLIER", "4"))
+LEASE_REAP_ENABLED = os.environ.get("OPENCLAW_STABILITY_REAP_LEASES", "1") != "0"
+SESSION_RESET_ENABLED = os.environ.get("OPENCLAW_STABILITY_RESET_SESSIONS", "1") != "0"
+CRON_MUTATION_ENABLED = os.environ.get("OPENCLAW_STABILITY_MUTATE_CRON", "1") != "0"
+GATEWAY_RESTART_ENABLED = os.environ.get("OPENCLAW_STABILITY_RESTART_GATEWAY", "1") != "0"
+SOFT_GATEWAY_RESTART_ENABLED = os.environ.get("OPENCLAW_STABILITY_SOFT_RESTART_GATEWAY", "0") == "1"
+SOFT_RESCUE_RESTART_ENABLED = os.environ.get("OPENCLAW_STABILITY_SOFT_RESCUE_RESTART", "1") != "0"
+SOFT_RESCUE_STREAK_THRESHOLD = int(os.environ.get("OPENCLAW_STABILITY_SOFT_RESCUE_STREAK", "20"))
+
+SESSION_RESET_COOLDOWN_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_SESSION_RESET_COOLDOWN_SECONDS", str(6 * 3600)))
+SESSION_FAIL_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_SESSION_FAIL_WINDOW_SECONDS", "1800"))
+SESSION_OVERFLOW_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_SESSION_OVERFLOW_WINDOW_SECONDS", "900"))
+SESSION_FAIL_THRESHOLD = int(os.environ.get("OPENCLAW_STABILITY_SESSION_FAIL_THRESHOLD", "3"))
+SESSION_OVERFLOW_THRESHOLD = int(os.environ.get("OPENCLAW_STABILITY_SESSION_OVERFLOW_THRESHOLD", "3"))
+ACTIVE_PROGRESS_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_SESSION_ACTIVE_WINDOW_SECONDS", "300"))
+ACTIVE_PROGRESS_EVENT_THRESHOLD = int(os.environ.get("OPENCLAW_STABILITY_SESSION_ACTIVE_EVENTS", "2"))
+HEAVY_TASK_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_HEAVY_WINDOW_SECONDS", "1800"))
+HEAVY_TASK_EVENT_THRESHOLD = int(os.environ.get("OPENCLAW_STABILITY_HEAVY_EVENTS", "3"))
+CONTROL_PLANE_HEAVY_JOB_IDS = {
+    item.strip()
+    for item in os.environ.get("OPENCLAW_STABILITY_CONTROL_PLANE_HEAVY_JOBS", "afd4bb03-7481-4d92-947f-845a3f112039").split(",")
+    if item.strip()
+}
+CONTROL_PLANE_HEARTBEAT_JOB_IDS = {
+    item.strip()
+    for item in os.environ.get("OPENCLAW_STABILITY_CONTROL_PLANE_HEARTBEAT_JOBS", "d68d571d-3c38-4a5e-9c5c-7f5a4d00371d").split(",")
+    if item.strip()
+}
+CONTROL_PLANE_DIRECT_SESSION_KEYS = {
+    item.strip()
+    for item in os.environ.get("OPENCLAW_STABILITY_CONTROL_PLANE_DIRECT_SESSIONS", "agent:main:telegram:direct:8390724843").split(",")
+    if item.strip()
+}
+CONTROL_PLANE_BACKPRESSURE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_CONTROL_PLANE_BACKPRESSURE_SECONDS", "1800"))
+
+SEVERITY_RANK = {"ok": 0, "info": 1, "warning": 2, "high": 3, "critical": 4}
+EVENT_TYPES_ACTIVE = {"message", "tool_call", "tool_result", "patch", "exec", "custom"}
+MESSAGE_ROLES_ACTIVE = {"assistant", "toolResult"}
+HEAVY_TOOL_NAMES = {"read", "write", "edit", "patch", "exec", "bash", "grep", "glob", "ls", "sessions_spawn", "sessions_send", "sessions_yield", "web_fetch", "memory_search", "memory_get"}
+HEAVY_TASK_TOKENS = {"trading_sim", "git ", "pytest", "npm ", "docker", ".py", ".js", ".ts", ".html", "apply_patch", "toolName", "build", "compile", "session", "cron", "memory", "diff --git"}
+
+FAIL_MARKERS = (
+    "LLM request timed out",
+    "surface_error reason=timeout",
+    "decision=fallback_model reason=timeout",
+    "decision=surface_error reason=timeout",
+    "network connection error",
+    "fetch failed",
+    "The AI service is temporarily overloaded",
+    "overloaded_error",
+    "provider unavailable",
+    "gateway timeout",
+    "app-server timeout",
+    "stuck session:",
+)
+
+OVERFLOW_MARKERS = (
+    "[context-overflow-diag]",
+    "context overflow detected",
+    "estimated context size exceeds safe threshold",
+    "context length exceeded",
+    "context_length_exceeded",
+    "maximum context length",
+    "context overflow",
+)
+
+IGNORED_ORPHAN_RUN_IDS = {"invalid-job-id"}
+IGNORED_ORPHAN_RUN_PREFIXES = ("test-",)
+
+
+def epoch() -> int:
+    return int(time.time())
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def ts() -> str:
+    return dt.datetime.now(dt.timezone.utc).astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def ensure_dirs() -> None:
+    for path in (
+        STABILITY_DIR,
+        LOG_DIR,
+        CRON_DIR / "health",
+        CRON_DIR / "guard",
+        LEASE_DIR,
+        RUNS_BY_RUN_DIR,
+        RUNS_BY_JOB_DIR,
+        ORPHAN_RUNS_BY_JOB_DIR,
+        REPAIR_PENDING_DIR,
+        REPAIR_PROCESSED_DIR,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def log_line(message: str) -> None:
+    ensure_dirs()
+    line = f"{ts()} {message}\n"
+    with LOG_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def load_json(path: Path, default: Any = None) -> Any:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return default
+    except Exception:
+        return default
+
+
+def write_json_atomic(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{int(time.time() * 1000)}.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=False)
+        fh.write("\n")
+    tmp.replace(path)
+
+
+def append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=False))
+        fh.write("\n")
+
+
+def tail_text(path: Path, max_bytes: int = 4_000_000) -> str:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+            return fh.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def file_age_seconds(path: Path) -> Optional[int]:
+    try:
+        return max(0, int(time.time() - path.stat().st_mtime))
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def parse_iso_epoch(value: Any) -> Optional[int]:
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        if value > 10_000_000_000:
+            return int(value / 1000)
+        return int(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        return int(dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        pass
+    systemd_match = re.search(r"^[A-Za-z]{3}\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+\S+$", value)
+    if systemd_match:
+        value = systemd_match.group(1)
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return int(dt.datetime.strptime(value, fmt).timestamp())
+        except Exception:
+            continue
+    return None
+
+
+def run_cmd(cmd: List[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+
+
+def run_user_cmd(cmd: List[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, env=env)
+
+
+def etime_seconds(value: Any) -> int:
+    raw = str(value or "").strip()
+    if not raw:
+        return 0
+    days = 0
+    if "-" in raw:
+        day_part, raw = raw.split("-", 1)
+        with contextlib.suppress(Exception):
+            days = int(day_part)
+    parts = raw.split(":")
+    try:
+        if len(parts) == 3:
+            hours, minutes, seconds = [int(part) for part in parts]
+        elif len(parts) == 2:
+            hours = 0
+            minutes, seconds = [int(part) for part in parts]
+        else:
+            hours = 0
+            minutes = 0
+            seconds = int(parts[0])
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
+    except Exception:
+        return 0
+
+
+def init_db() -> sqlite3.Connection:
+    ensure_dirs()
+    conn = sqlite3.connect(str(STATE_DB))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_epoch INTEGER NOT NULL, source TEXT, component TEXT, severity TEXT, key TEXT, payload TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS actions (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_epoch INTEGER NOT NULL, action_id TEXT, action TEXT, result TEXT, payload TEXT NOT NULL)"
+    )
+    conn.commit()
+    return conn
+
+
+def db_get(conn: sqlite3.Connection, key: str, default: Any = None) -> Any:
+    row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+    if not row:
+        return default
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return default
+
+
+def db_set(conn: sqlite3.Connection, key: str, value: Any) -> None:
+    conn.execute(
+        "INSERT INTO kv(key, value, updated_at) VALUES(?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        (key, json.dumps(value, ensure_ascii=False), epoch()),
+    )
+    conn.commit()
+
+
+def db_record_event(conn: sqlite3.Connection, event: Dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT INTO events(ts_epoch, source, component, severity, key, payload) VALUES(?, ?, ?, ?, ?, ?)",
+        (
+            int(event.get("tsEpoch") or epoch()),
+            event.get("source"),
+            event.get("component"),
+            event.get("severity"),
+            event.get("key"),
+            json.dumps(event, ensure_ascii=False),
+        ),
+    )
+    conn.commit()
+    append_jsonl(EVENTS_JSONL, event)
+
+
+def db_record_action(conn: sqlite3.Connection, action: Dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT INTO actions(ts_epoch, action_id, action, result, payload) VALUES(?, ?, ?, ?, ?)",
+        (
+            int(action.get("tsEpoch") or epoch()),
+            action.get("actionId"),
+            action.get("action"),
+            action.get("result"),
+            json.dumps(action, ensure_ascii=False),
+        ),
+    )
+    conn.commit()
+    append_jsonl(ACTIONS_JSONL, action)
+
+
+def add_finding(
+    findings: List[Dict[str, Any]],
+    key: str,
+    severity: str,
+    component: str,
+    message: str,
+    **extra: Any,
+) -> None:
+    payload = {
+        "key": key,
+        "severity": severity,
+        "component": component,
+        "message": message,
+    }
+    payload.update(extra)
+    findings.append(payload)
+
+
+def max_severity(findings: Iterable[Dict[str, Any]]) -> str:
+    highest = "ok"
+    for item in findings:
+        sev = str(item.get("severity") or "ok")
+        if SEVERITY_RANK.get(sev, 0) > SEVERITY_RANK.get(highest, 0):
+            highest = sev
+    return highest
+
+
+def tcp_ok(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=3):
+            return True
+    except OSError:
+        return False
+
+
+def http_ok(url: str, timeout: int = 8) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as res:
+            return 200 <= int(res.status) < 400
+    except Exception:
+        return False
+
+
+def systemctl_show_gateway() -> Dict[str, Any]:
+    props = "ActiveState,SubState,MainPID,ExecMainStartTimestamp,ExecMainStartTimestampMonotonic,NRestarts"
+    try:
+        out = run_cmd(["systemctl", "show", "openclaw-gateway.service", f"--property={props}"], timeout=8)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    data: Dict[str, Any] = {"exitCode": out.returncode}
+    if out.returncode != 0:
+        data["stderr"] = out.stderr[-800:]
+    for line in out.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in {"MainPID", "NRestarts"}:
+            with contextlib.suppress(Exception):
+                data[key] = int(value or "0")
+                continue
+        data[key] = value
+    return data
+
+
+def proc_status_bytes(pid: int, field: str) -> int:
+    if pid <= 0:
+        return 0
+    try:
+        text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return 0
+    for line in text.splitlines():
+        if not line.startswith(field + ":"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            with contextlib.suppress(Exception):
+                return int(parts[1]) * 1024
+    return 0
+
+
+def cgroup_bytes(name: str, metric: str) -> int:
+    candidates = [
+        Path("/sys/fs/cgroup/system.slice") / name / metric,
+        Path("/sys/fs/cgroup") / "system.slice" / name / metric,
+    ]
+    for path in candidates:
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+            if value == "max":
+                return 0
+            return int(value)
+        except Exception:
+            continue
+    return 0
+
+
+def ps_rows() -> List[Dict[str, str]]:
+    try:
+        out = run_cmd(["ps", "-eo", "pid=,ppid=,stat=,etime=,rss=,cmd="], timeout=8).stdout
+    except Exception:
+        return []
+    rows = []
+    for line in out.splitlines():
+        parts = line.strip().split(None, 5)
+        if len(parts) < 6:
+            continue
+        rows.append(
+            {
+                "pid": parts[0],
+                "ppid": parts[1],
+                "stat": parts[2],
+                "etime": parts[3],
+                "rssKb": parts[4],
+                "cmd": parts[5],
+            }
+        )
+    return rows
+
+
+def child_process_summary(root_pid: int) -> Dict[str, Any]:
+    rows = ps_rows()
+    by_parent: Dict[str, List[Dict[str, str]]] = {}
+    for row in rows:
+        by_parent.setdefault(row["ppid"], []).append(row)
+    seen: set[str] = set()
+    queue = [str(root_pid)] if root_pid else []
+    children: List[Dict[str, str]] = []
+    while queue:
+        parent = queue.pop(0)
+        for row in by_parent.get(parent, []):
+            pid = row["pid"]
+            if pid in seen:
+                continue
+            seen.add(pid)
+            children.append(row)
+            queue.append(pid)
+    codex_app_servers = [r for r in children if "codex app-server" in r["cmd"]]
+    openclaw_children = [r for r in children if "openclaw" in r["cmd"]]
+    return {
+        "count": len(children),
+        "codexAppServers": len(codex_app_servers),
+        "openclawChildren": len(openclaw_children),
+        "sample": children[:20],
+    }
+
+
+def gateway_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    service = systemctl_show_gateway()
+    active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
+    pid = int(service.get("MainPID") or 0)
+    port_ok = tcp_ok(PORT)
+    health_ok = http_ok(f"http://127.0.0.1:{PORT}/__openclaw__/health", timeout=8) if port_ok else False
+    service_age = None
+    start_epoch = parse_iso_epoch(service.get("ExecMainStartTimestamp"))
+    if start_epoch:
+        service_age = max(0, epoch() - start_epoch)
+    in_grace = service_age is not None and service_age < STARTUP_GRACE_SECONDS
+    memory = cgroup_bytes("openclaw-gateway.service", "memory.current") or proc_status_bytes(pid, "VmRSS")
+    swap = cgroup_bytes("openclaw-gateway.service", "memory.swap.current") or proc_status_bytes(pid, "VmSwap")
+    children = child_process_summary(pid)
+
+    if not active:
+        add_finding(findings, "gateway_service_down", "critical", "gateway", "openclaw-gateway.service is not active", service=service)
+    if not port_ok:
+        add_finding(
+            findings,
+            "gateway_port_down" if not in_grace else "gateway_starting",
+            "critical" if not in_grace else "warning",
+            "gateway",
+            f"gateway port {PORT} is not listening",
+            serviceAgeSeconds=service_age,
+        )
+    elif not health_ok:
+        add_finding(
+            findings,
+            "gateway_health_endpoint_failed" if not in_grace else "gateway_starting",
+            "critical" if not in_grace else "warning",
+            "gateway",
+            "gateway health endpoint failed",
+            serviceAgeSeconds=service_age,
+        )
+    if memory >= MEMORY_CRIT_BYTES:
+        add_finding(findings, "gateway_resource_saturation", "critical", "resource", "gateway memory is critically high", memoryBytes=memory)
+    elif memory >= MEMORY_WARN_BYTES:
+        add_finding(findings, "gateway_resource_pressure", "high", "resource", "gateway memory is high", memoryBytes=memory)
+    if swap >= SWAP_CRIT_BYTES:
+        add_finding(findings, "gateway_swap_saturation", "critical", "resource", "gateway swap usage is critically high", swapBytes=swap)
+    elif swap >= SWAP_WARN_BYTES:
+        add_finding(findings, "gateway_swap_pressure", "high", "resource", "gateway swap usage is high", swapBytes=swap)
+    if children["codexAppServers"] > 4 or children["openclawChildren"] > 16:
+        add_finding(findings, "gateway_child_accumulation", "high", "resource", "gateway child process accumulation detected", children=children)
+
+    return {
+        "service": service,
+        "active": active,
+        "pid": pid,
+        "port": PORT,
+        "portOk": port_ok,
+        "healthOk": health_ok,
+        "serviceAgeSeconds": service_age,
+        "startupGraceActive": bool(in_grace),
+        "memoryBytes": memory,
+        "swapBytes": swap,
+        "children": children,
+    }
+
+
+def systemctl_user_show(unit: str) -> Dict[str, Any]:
+    props = "ActiveState,SubState,MainPID,NRestarts,ExecMainStartTimestamp,MemoryCurrent,TasksCurrent"
+    try:
+        out = run_user_cmd(["systemctl", "--user", "show", unit, f"--property={props}"], timeout=8)
+    except Exception as exc:
+        return {"unit": unit, "error": f"{type(exc).__name__}: {exc}"}
+    data: Dict[str, Any] = {"unit": unit, "exitCode": out.returncode}
+    if out.returncode != 0:
+        data["stderr"] = out.stderr[-800:]
+    for line in out.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in {"MainPID", "NRestarts", "MemoryCurrent", "TasksCurrent"}:
+            with contextlib.suppress(Exception):
+                data[key] = int(value or "0")
+                continue
+        data[key] = value
+    return data
+
+
+def hermers_gateway_processes(rows: List[Dict[str, str]], profile: str) -> List[Dict[str, Any]]:
+    needle = f"--profile {profile} gateway run"
+    results = []
+    for row in rows:
+        if "hermes_cli.main" not in row.get("cmd", ""):
+            continue
+        if needle not in row.get("cmd", ""):
+            continue
+        item = dict(row)
+        item["ageSeconds"] = etime_seconds(row.get("etime"))
+        with contextlib.suppress(Exception):
+            item["rssBytes"] = int(row.get("rssKb") or "0") * 1024
+        results.append(item)
+    return results
+
+
+def hermers_acp_workers(rows: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    workers = []
+    known_profiles = set(HERMERS_PROFILES)
+    for row in rows:
+        cmd = row.get("cmd", "")
+        if " acp" not in cmd or "/hermes" not in cmd or " --accept-hooks" not in cmd:
+            continue
+        profile = ""
+        match = re.search(r"(?:^|\s)-p\s+([A-Za-z0-9_-]+)\s+acp(?:\s|$)", cmd)
+        if match:
+            profile = match.group(1)
+        if known_profiles and profile and profile not in known_profiles:
+            continue
+        item = dict(row)
+        item["profile"] = profile
+        item["ageSeconds"] = etime_seconds(row.get("etime"))
+        item["orphan"] = str(row.get("ppid") or "") == "1"
+        with contextlib.suppress(Exception):
+            item["rssBytes"] = int(row.get("rssKb") or "0") * 1024
+        workers.append(item)
+    return workers
+
+
+def hermers_workflow_summary() -> Dict[str, Any]:
+    if not WORKFLOW_DB.exists():
+        return {"dbFile": str(WORKFLOW_DB), "exists": False}
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=HERMERS_FAILURE_WINDOW_SECONDS)
+    cutoff_iso = cutoff.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    stale_cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=HERMERS_STALE_SENT_SECONDS)
+    stale_cutoff_iso = stale_cutoff.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    summary: Dict[str, Any] = {
+        "dbFile": str(WORKFLOW_DB),
+        "exists": True,
+        "failureWindowSeconds": HERMERS_FAILURE_WINDOW_SECONDS,
+        "staleSentSeconds": HERMERS_STALE_SENT_SECONDS,
+    }
+    try:
+        conn = sqlite3.connect(str(WORKFLOW_DB))
+        conn.row_factory = sqlite3.Row
+        failures = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(failure_type,''), 'unknown') AS failure_type, COUNT(*) AS count
+            FROM runtime_runs
+            WHERE runtime='hermers'
+              AND status='failed'
+              AND COALESCE(completed_at, started_at) >= ?
+            GROUP BY COALESCE(NULLIF(failure_type,''), 'unknown')
+            ORDER BY count DESC
+            """,
+            (cutoff_iso,),
+        ).fetchall()
+        stale_sent = conn.execute(
+            """
+            SELECT dispatch_id, meeting_id, agent_id, updated_at, sent_at
+            FROM mixed_meeting_dispatches
+            WHERE runtime='hermers'
+              AND status='sent'
+              AND updated_at < ?
+            ORDER BY updated_at
+            LIMIT 20
+            """,
+            (stale_cutoff_iso,),
+        ).fetchall()
+        summary["recentFailures"] = [dict(row) for row in failures]
+        summary["recentFailureCount"] = sum(int(row["count"] or 0) for row in failures)
+        summary["staleSentCount"] = len(stale_sent)
+        summary["staleSentSample"] = [dict(row) for row in stale_sent[:10]]
+        conn.close()
+    except Exception as exc:
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+    return summary
+
+
+def hermers_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rows = ps_rows()
+    profiles: Dict[str, Any] = {}
+    down = []
+    pid_mismatches = []
+    for profile in HERMERS_PROFILES:
+        unit = f"hermes-gateway-{profile}.service"
+        service = systemctl_user_show(unit)
+        active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
+        pid = int(service.get("MainPID") or 0)
+        state_path = HERMES_HOME / "profiles" / profile / "gateway_state.json"
+        state = load_json(state_path, {}) or {}
+        state_pid = int(state.get("pid") or 0) if isinstance(state, dict) else 0
+        procs = hermers_gateway_processes(rows, profile)
+        if not active:
+            down.append({"profile": profile, "unit": unit, "service": service})
+        if active and state_pid and pid and state_pid != pid:
+            pid_mismatches.append({"profile": profile, "servicePid": pid, "statePid": state_pid, "statePath": str(state_path)})
+        profiles[profile] = {
+            "unit": unit,
+            "service": service,
+            "active": active,
+            "pid": pid,
+            "statePath": str(state_path),
+            "state": state,
+            "gatewayProcesses": procs,
+        }
+
+    acp_workers = hermers_acp_workers(rows)
+    orphan_workers = [
+        item for item in acp_workers
+        if item.get("orphan") and int(item.get("ageSeconds") or 0) >= HERMERS_ACP_ORPHAN_MIN_SECONDS
+    ]
+    long_workers = [
+        item for item in acp_workers
+        if int(item.get("ageSeconds") or 0) >= HERMERS_ACP_LONG_RUNNING_SECONDS
+    ]
+    workflow = hermers_workflow_summary()
+    recent_failure_count = int(workflow.get("recentFailureCount") or 0)
+    stale_sent_count = int(workflow.get("staleSentCount") or 0)
+
+    if down:
+        add_finding(findings, "hermers_gateway_service_down", "critical", "hermers", "Hermers gateway user services are not active", count=len(down), sample=down[:10])
+    if pid_mismatches:
+        add_finding(findings, "hermers_gateway_state_pid_mismatch", "warning", "hermers", "Hermers gateway state pid differs from systemd main pid", count=len(pid_mismatches), sample=pid_mismatches[:10])
+    if orphan_workers:
+        add_finding(findings, "hermers_acp_orphan_workers", "high", "hermers", "Hermers ACP workers are orphaned from their workflow parent", count=len(orphan_workers), sample=orphan_workers[:10])
+    if long_workers:
+        add_finding(findings, "hermers_acp_long_running_workers", "warning", "hermers", "Hermers ACP workers exceeded the long-running threshold", count=len(long_workers), sample=long_workers[:10])
+    if recent_failure_count >= HERMERS_FAILURE_BURST_THRESHOLD:
+        add_finding(findings, "hermers_runtime_failure_burst", "high", "hermers", "Hermers runtime failures exceeded burst threshold", count=recent_failure_count, failures=workflow.get("recentFailures") or [])
+    if stale_sent_count > 0:
+        add_finding(findings, "hermers_stale_sent_dispatches", "high", "hermers", "Hermers dispatches are stuck in sent state without terminal runtime receipt", count=stale_sent_count, sample=workflow.get("staleSentSample") or [])
+    if workflow.get("error"):
+        add_finding(findings, "hermers_workflow_db_probe_failed", "warning", "hermers", "Hermers workflow DB probe failed", error=workflow.get("error"))
+
+    return {
+        "profiles": profiles,
+        "profileCount": len(profiles),
+        "activeProfileCount": sum(1 for item in profiles.values() if item.get("active")),
+        "acpWorkers": acp_workers,
+        "orphanAcpWorkers": orphan_workers,
+        "longRunningAcpWorkers": long_workers,
+        "workflow": workflow,
+        "reapOrphanAcpWorkersEnabled": HERMERS_ACP_ORPHAN_REAP_ENABLED,
+        "gatewayRestartEnabled": HERMERS_GATEWAY_RESTART_ENABLED,
+    }
+
+
+def iter_session_store_paths() -> List[Path]:
+    paths = []
+    if not AGENTS_DIR.exists():
+        return paths
+    for path in sorted(AGENTS_DIR.glob("*/sessions/sessions.json")):
+        if path.is_file():
+            paths.append(path)
+    return paths
+
+
+def parse_log_ts(line: str) -> Optional[int]:
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)", line)
+    if not m:
+        return None
+    value = m.group(1)
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    if re.search(r"[+-]\d{4}$", value):
+        value = value[:-5] + value[-5:-2] + ":" + value[-2:]
+    try:
+        return int(dt.datetime.fromisoformat(value).timestamp())
+    except Exception:
+        return None
+
+
+def collect_gateway_log_summary() -> Dict[str, Any]:
+    text = tail_text(GATEWAY_ERR_LOG, 4_000_000)
+    current_epoch = epoch()
+    cutoff = current_epoch - LOG_PRESSURE_WINDOW_SECONDS
+    counters = {
+        "wsTimeouts": 0,
+        "wsClosedBeforeConnect": 0,
+        "laneWaitExceeded": 0,
+        "laneTaskError": 0,
+        "memoryCronUnavailable": 0,
+        "memoryJsonParseFailures": 0,
+        "memoryScopeFailures": 0,
+        "providerOverloaded": 0,
+        "unknownCronJobId": 0,
+    }
+    for line in text.splitlines():
+        line_epoch = parse_log_ts(line)
+        if line_epoch is not None and line_epoch < cutoff:
+            continue
+        if "[ws] handshake timeout" in line or "handshake timeout" in line:
+            counters["wsTimeouts"] += 1
+        if "WebSocket was closed before the connection was established" in line:
+            counters["wsClosedBeforeConnect"] += 1
+        if "lane wait exceeded" in line or "laneWaitExceeded" in line:
+            counters["laneWaitExceeded"] += 1
+        if "lane task error" in line or "laneTaskError" in line:
+            counters["laneTaskError"] += 1
+        if "memory cron unavailable" in line or "memoryCronUnavailable" in line:
+            counters["memoryCronUnavailable"] += 1
+        if "memory json parse" in line or "memoryJsonParse" in line:
+            counters["memoryJsonParseFailures"] += 1
+        if "memory scope" in line or "memoryScope" in line:
+            counters["memoryScopeFailures"] += 1
+        if "provider overloaded" in line:
+            counters["providerOverloaded"] += 1
+        if "unknown cron job id" in line:
+            counters["unknownCronJobId"] += 1
+    counters["windowSeconds"] = LOG_PRESSURE_WINDOW_SECONDS
+    return counters
+
+
+def collect_channel_log_summary(account_ids: Iterable[str]) -> Dict[str, Any]:
+    text = tail_text(GATEWAY_ERR_LOG, 4_000_000)
+    current_epoch = epoch()
+    cutoff = current_epoch - LOG_PRESSURE_WINDOW_SECONDS
+    accounts = {str(account_id): {"channelStopExceeded": 0, "lastSeenEpoch": None} for account_id in account_ids}
+    totals = {
+        "telegramNetworkFailures": 0,
+        "telegramWebhookCleanupFailures": 0,
+        "telegramCommandFailures": 0,
+        "telegramChannelStopExceeded": 0,
+        "telegramChannelStopped": 0,
+        "telegramRestartLimitHits": 0,
+        "windowSeconds": LOG_PRESSURE_WINDOW_SECONDS,
+    }
+    for line in text.splitlines():
+        line_epoch = parse_log_ts(line)
+        if line_epoch is not None and line_epoch < cutoff:
+            continue
+        lower = line.lower()
+        if "[telegram]" not in lower and "telegram" not in lower:
+            continue
+        if "network request" in lower and "failed" in lower:
+            totals["telegramNetworkFailures"] += 1
+        if "webhook cleanup failed" in lower or "deletewebhook failed" in lower:
+            totals["telegramWebhookCleanupFailures"] += 1
+        if "deletemycommands failed" in lower or "setmycommands failed" in lower:
+            totals["telegramCommandFailures"] += 1
+        if "channel stop exceeded" in lower:
+            totals["telegramChannelStopExceeded"] += 1
+        if "health-monitor: restarting (reason: stopped)" in lower:
+            totals["telegramChannelStopped"] += 1
+        if "health-monitor: hit" in lower and "restarts/hour limit" in lower:
+            totals["telegramRestartLimitHits"] += 1
+        for account_id, item in accounts.items():
+            if account_id and account_id in line:
+                item["lastSeenEpoch"] = max(int(item.get("lastSeenEpoch") or 0), int(line_epoch or current_epoch))
+                if "channel stop exceeded" in lower:
+                    item["channelStopExceeded"] = int(item.get("channelStopExceeded") or 0) + 1
+                if "health-monitor: restarting (reason: stopped)" in lower:
+                    item["channelStopped"] = int(item.get("channelStopped") or 0) + 1
+                if "health-monitor: hit" in lower and "restarts/hour limit" in lower:
+                    item["restartLimitHits"] = int(item.get("restartLimitHits") or 0) + 1
+    return {"totals": totals, "accounts": accounts}
+
+
+def configured_timeout_ms(job: Dict[str, Any]) -> int:
+    execution = job.get("execution") if isinstance(job.get("execution"), dict) else {}
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    raw = execution.get("timeoutSeconds", payload.get("timeoutSeconds", 300))
+    try:
+        seconds = int(raw)
+    except Exception:
+        seconds = 300
+    return max(seconds, 60) * 1000
+
+
+def load_jobs() -> Dict[str, Any]:
+    data = load_json(JOBS_PATH, {})
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def job_items(data: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+    jobs = data.get("jobs")
+    if isinstance(jobs, list):
+        rows = []
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            job_id = str(job.get("id") or job.get("jobId") or "")
+            if job_id:
+                rows.append((job_id, job))
+        return rows
+    if isinstance(jobs, dict):
+        return [(str(k), v) for k, v in jobs.items() if isinstance(v, dict)]
+    return [(str(k), v) for k, v in data.items() if isinstance(v, dict) and ("runningAtMs" in v or "schedule" in v)]
+
+
+def active_job_ids(data: Dict[str, Any]) -> set[str]:
+    return {job_id for job_id, _ in job_items(data)}
+
+
+def find_stale_running_jobs(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    current = now_ms()
+    stale: List[Dict[str, Any]] = []
+    for job_id, job in job_items(data):
+        running_at = job.get("runningAtMs") or job.get("state", {}).get("runningAtMs") if isinstance(job.get("state"), dict) else job.get("runningAtMs")
+        if not isinstance(running_at, int):
+            continue
+        timeout_ms = configured_timeout_ms(job)
+        threshold_ms = max(MIN_STALE_RUNNING_SECONDS * 1000, timeout_ms * STALE_RUNNING_TIMEOUT_MULTIPLIER)
+        age_ms = current - running_at
+        if age_ms >= threshold_ms:
+            stale.append(
+                {
+                    "jobId": job_id,
+                    "name": job.get("name") or job.get("title") or job_id,
+                    "runningAtMs": running_at,
+                    "ageMs": age_ms,
+                    "thresholdMs": threshold_ms,
+                }
+            )
+    return stale
+
+
+def load_recent_job_runs(job_id: str, cutoff_ms: int) -> List[Dict[str, Any]]:
+    path = RUNS_BY_JOB_DIR / f"{job_id}.jsonl"
+    if not path.exists():
+        return []
+    runs: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                with contextlib.suppress(Exception):
+                    record = json.loads(line)
+                    if isinstance(record, dict) and int(record.get("ts") or 0) >= cutoff_ms:
+                        runs.append(record)
+    except Exception:
+        return runs
+    return runs
+
+
+def latest_success_run_after(runs: List[Dict[str, Any]], lower_bound_ms: int) -> Optional[Dict[str, Any]]:
+    successes = []
+    for run in runs:
+        if run.get("status") != "succeeded":
+            continue
+        run_ts = int(run.get("finishedAtMs") or run.get("ts") or 0)
+        if run_ts > lower_bound_ms:
+            successes.append((run_ts, run))
+    if not successes:
+        return None
+    return max(successes, key=lambda item: item[0])[1]
+
+
+def classify_cron_heartbeat(state: Dict[str, Any], timeout_ms: int) -> str:
+    last_status = str(state.get("lastStatus") or "unknown")
+    consecutive_errors = int(state.get("consecutiveErrors") or 0)
+    duration_ms = int(state.get("lastDurationMs") or 0)
+    if last_status == "error" or consecutive_errors > 0:
+        return "unhealthy"
+    if duration_ms >= max(timeout_ms - CRON_TIMEOUT_NEAR_MISS_MS, CRON_HEARTBEAT_WARN_MS):
+        return "near-timeout"
+    if duration_ms >= CRON_HEARTBEAT_WARN_MS:
+        return "slow"
+    return "ok"
+
+
+def collect_cron_cli_status() -> Dict[str, Any]:
+    """Read OpenClaw's computed cron status when the installed CLI exposes it."""
+    try:
+        out = run_cmd(["openclaw", "cron", "list", "--json"], timeout=15)
+    except Exception as exc:
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+    if out.returncode != 0:
+        return {"available": False, "exitCode": out.returncode, "stderr": out.stderr[-1000:]}
+    try:
+        payload = json.loads(out.stdout)
+    except Exception as exc:
+        return {"available": False, "error": f"json_parse_failed: {exc}", "stdoutSample": out.stdout[:1000]}
+    jobs = payload.get("jobs") if isinstance(payload, dict) else payload
+    if not isinstance(jobs, list):
+        return {"available": False, "error": "missing_jobs_array"}
+    by_job: Dict[str, Dict[str, Any]] = {}
+    status_counts: Dict[str, int] = {}
+    samples: Dict[str, List[Dict[str, Any]]] = {}
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        job_id = str(job.get("id") or "")
+        if not job_id:
+            continue
+        status = str(job.get("status") or "unknown")
+        status_counts[status] = int(status_counts.get(status, 0)) + 1
+        item = {
+            "jobId": job_id,
+            "status": status,
+            "name": job.get("name") or job_id,
+            "agentId": job.get("agentId"),
+            "enabled": job.get("enabled") is not False,
+        }
+        state = job.get("state") if isinstance(job.get("state"), dict) else {}
+        if state:
+            item["lastRunAtMs"] = state.get("lastRunAtMs")
+            item["lastStatus"] = state.get("lastStatus") or state.get("lastRunStatus")
+            item["consecutiveErrors"] = state.get("consecutiveErrors")
+            item["lastError"] = state.get("lastError")
+        by_job[job_id] = item
+        if status not in {"ok", "idle", "running", "disabled"}:
+            samples.setdefault(status, []).append(item)
+    return {
+        "available": True,
+        "jobCount": len(by_job),
+        "statusCounts": status_counts,
+        "byJob": by_job,
+        "nonOkSamples": {key: value[:10] for key, value in samples.items()},
+    }
+
+
+def find_recent_orphan_run_logs(active_ids: set[str], cutoff_ms: int) -> List[Dict[str, Any]]:
+    orphans: List[Dict[str, Any]] = []
+    if not RUNS_BY_JOB_DIR.exists():
+        return orphans
+    for path in sorted(RUNS_BY_JOB_DIR.glob("*.jsonl")):
+        job_id = path.stem
+        if job_id in active_ids:
+            continue
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        if int(stat.st_mtime * 1000) < cutoff_ms:
+            continue
+        ignored = job_id in IGNORED_ORPHAN_RUN_IDS or any(job_id.startswith(prefix) for prefix in IGNORED_ORPHAN_RUN_PREFIXES)
+        recent_runs = load_recent_job_runs(job_id, cutoff_ms)
+        orphans.append(
+            {
+                "jobId": job_id,
+                "recentRunCount": len(recent_runs),
+                "ageSeconds": max(0, int(time.time() - stat.st_mtime)),
+                "updatedAt": dt.datetime.fromtimestamp(stat.st_mtime).astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "sizeBytes": stat.st_size,
+                "ignored": ignored,
+            }
+        )
+    return orphans
+
+
+def build_cron_runtime_summary(data: Dict[str, Any], cli_status: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cutoff_ms = now_ms() - CRON_HISTORY_WINDOW_DAYS * 24 * 60 * 60 * 1000
+    agents: Dict[str, Dict[str, Any]] = {}
+    active_ids = active_job_ids(data)
+    cli_by_job = (cli_status or {}).get("byJob") if isinstance(cli_status, dict) else {}
+    if not isinstance(cli_by_job, dict):
+        cli_by_job = {}
+    totals = {
+        "recentRunCount": 0,
+        "recentFailureCount": 0,
+        "timeoutLikeFailureCount": 0,
+        "heartbeatIssueCount": 0,
+        "unhealthyHeartbeatCount": 0,
+        "longRunningJobCount": 0,
+        "slowJobCount": 0,
+        "errorJobCount": 0,
+        "cliStatusErrorCount": 0,
+        "staleCliStatusErrorCount": 0,
+        "cliStatusSkippedCount": 0,
+    }
+
+    def bucket_for(agent_id: str) -> Dict[str, Any]:
+        return agents.setdefault(
+            agent_id,
+            {
+                "jobCount": 0,
+                "recentRunCount": 0,
+                "recentFailureCount": 0,
+                "timeoutLikeFailureCount": 0,
+                "heartbeatCount": 0,
+                "heartbeatIssues": [],
+                "errorJobs": [],
+                "longRunningJobs": [],
+                "slowJobs": [],
+                "maxDurationMs": 0,
+            },
+        )
+
+    for job_id, job in job_items(data):
+        job_name = str(job.get("name") or job.get("title") or job_id)
+        agent_id = str(job.get("agentId") or "system")
+        state = job.get("state") if isinstance(job.get("state"), dict) else {}
+        cli_job = cli_by_job.get(job_id) if isinstance(cli_by_job.get(job_id), dict) else {}
+        cli_status_value = str(cli_job.get("status") or "")
+        timeout_ms = configured_timeout_ms(job)
+        last_duration_ms = int(state.get("lastDurationMs") or 0)
+        recent_runs = load_recent_job_runs(job_id, cutoff_ms)
+        recent_failures = [run for run in recent_runs if run.get("status") != "succeeded"]
+        timeout_like = [
+            run
+            for run in recent_failures
+            if int(run.get("durationMs") or 0) >= max(timeout_ms - CRON_TIMEOUT_NEAR_MISS_MS, 0)
+        ]
+
+        bucket = bucket_for(agent_id)
+        bucket["jobCount"] += 1
+        bucket["recentRunCount"] += len(recent_runs)
+        bucket["recentFailureCount"] += len(recent_failures)
+        bucket["timeoutLikeFailureCount"] += len(timeout_like)
+        bucket["maxDurationMs"] = max(int(bucket["maxDurationMs"]), last_duration_ms)
+
+        totals["recentRunCount"] += len(recent_runs)
+        totals["recentFailureCount"] += len(recent_failures)
+        totals["timeoutLikeFailureCount"] += len(timeout_like)
+
+        consecutive_errors = int(state.get("consecutiveErrors") or 0)
+        cli_last_run_at_ms = int(cli_job.get("lastRunAtMs") or 0)
+        stale_cli_error_success = latest_success_run_after(recent_runs, cli_last_run_at_ms) if cli_status_value == "error" else None
+        cli_error_active = cli_status_value == "error" and stale_cli_error_success is None
+        if state.get("lastStatus") == "error" or consecutive_errors > 0 or cli_error_active:
+            bucket["errorJobs"].append(
+                {
+                    "jobId": job_id,
+                    "jobName": job_name,
+                    "status": cli_status_value or None,
+                    "lastStatus": state.get("lastStatus"),
+                    "consecutiveErrors": consecutive_errors,
+                    "lastDurationMs": last_duration_ms,
+                    "lastError": state.get("lastError"),
+                    "staleCliStatusClearedByRun": stale_cli_error_success,
+                }
+            )
+            totals["errorJobCount"] += 1
+        if cli_error_active:
+            totals["cliStatusErrorCount"] += 1
+        elif cli_status_value == "error":
+            totals["staleCliStatusErrorCount"] += 1
+        if cli_status_value == "skipped":
+            totals["cliStatusSkippedCount"] += 1
+
+        if "heartbeat" in job_name.lower():
+            risk = classify_cron_heartbeat(state, timeout_ms)
+            bucket["heartbeatCount"] += 1
+            if risk != "ok":
+                issue = {
+                    "jobId": job_id,
+                    "jobName": job_name,
+                    "risk": risk,
+                    "lastStatus": state.get("lastStatus"),
+                    "lastDurationMs": last_duration_ms,
+                    "consecutiveErrors": consecutive_errors,
+                    "timeoutMs": timeout_ms,
+                }
+                bucket["heartbeatIssues"].append(issue)
+                totals["heartbeatIssueCount"] += 1
+                if risk == "unhealthy":
+                    totals["unhealthyHeartbeatCount"] += 1
+
+        if last_duration_ms >= CRON_LONG_RUN_WARN_MS:
+            bucket["longRunningJobs"].append(
+                {
+                    "jobId": job_id,
+                    "jobName": job_name,
+                    "lastDurationMs": last_duration_ms,
+                    "timeoutMs": timeout_ms,
+                    "lastStatus": state.get("lastStatus"),
+                }
+            )
+            totals["longRunningJobCount"] += 1
+        elif last_duration_ms >= CRON_HEARTBEAT_WARN_MS and "heartbeat" not in job_name.lower():
+            bucket["slowJobs"].append(
+                {
+                    "jobId": job_id,
+                    "jobName": job_name,
+                    "lastDurationMs": last_duration_ms,
+                    "timeoutMs": timeout_ms,
+                    "lastStatus": state.get("lastStatus"),
+                }
+            )
+            totals["slowJobCount"] += 1
+
+    for bucket in agents.values():
+        bucket["heartbeatIssues"] = sorted(bucket["heartbeatIssues"], key=lambda item: (-int(item["consecutiveErrors"]), -int(item["lastDurationMs"]), item["jobName"]))[:10]
+        bucket["errorJobs"] = sorted(bucket["errorJobs"], key=lambda item: (-int(item["consecutiveErrors"]), -int(item["lastDurationMs"]), item["jobName"]))[:10]
+        bucket["longRunningJobs"] = sorted(bucket["longRunningJobs"], key=lambda item: (-int(item["lastDurationMs"]), item["jobName"]))[:10]
+        bucket["slowJobs"] = sorted(bucket["slowJobs"], key=lambda item: (-int(item["lastDurationMs"]), item["jobName"]))[:10]
+
+    orphan_logs = find_recent_orphan_run_logs(active_ids, cutoff_ms)
+    active_orphans = [item for item in orphan_logs if not item.get("ignored")]
+    return {
+        "windowDays": CRON_HISTORY_WINDOW_DAYS,
+        "activeJobCount": len(active_ids),
+        "agents": agents,
+        "totals": totals,
+        "cliStatus": cli_status or {"available": False},
+        "orphanRunLogs": orphan_logs[:50],
+        "activeOrphanRunLogCount": len(active_orphans),
+    }
+
+
+def cron_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    jobs = load_jobs()
+    items = job_items(jobs)
+    stale = find_stale_running_jobs(jobs)
+    leases = sorted(LEASE_DIR.glob("*.json")) if LEASE_DIR.exists() else []
+    expired_leases = []
+    current_ms = now_ms()
+    for lease_path in leases:
+        lease = load_json(lease_path, {})
+        if not isinstance(lease, dict):
+            continue
+        expires = lease.get("expiresAtMs")
+        if isinstance(expires, int) and current_ms >= expires:
+            expired_leases.append({"path": str(lease_path), "jobId": lease.get("jobId"), "runId": lease.get("runId"), "expiresAtMs": expires})
+
+    audit = load_json(CRON_AUDIT_PATH, {}) or {}
+    audit_age = file_age_seconds(CRON_AUDIT_PATH)
+    audit_findings = audit.get("findings") if isinstance(audit.get("findings"), list) else []
+    audit_fresh = audit_age is not None and audit_age <= CRON_AUDIT_FRESH_SECONDS
+    high_audit = [f for f in audit_findings if str(f.get("severity")) == "high"] if audit_fresh else []
+    gateway_log = collect_gateway_log_summary()
+    cli_status = collect_cron_cli_status()
+    runtime = build_cron_runtime_summary(jobs, cli_status)
+    totals = runtime.get("totals") if isinstance(runtime.get("totals"), dict) else {}
+
+    if stale:
+        add_finding(findings, "cron_stale_running_state", "high", "cron", "stale running cron state detected", count=len(stale), sample=stale[:10])
+    if expired_leases:
+        add_finding(findings, "cron_expired_leases", "high", "cron", "expired cron leases detected", count=len(expired_leases), sample=expired_leases[:10])
+    if audit_age is None and LEGACY_CRON_AUDIT_REQUIRED:
+        add_finding(findings, "cron_audit_missing", "warning", "cron", "cron audit report is missing")
+    elif audit_age is not None and not audit_fresh and LEGACY_CRON_AUDIT_REQUIRED:
+        add_finding(findings, "cron_audit_stale", "warning", "cron", "cron audit report is stale", auditAgeSeconds=audit_age, freshSeconds=CRON_AUDIT_FRESH_SECONDS)
+    if high_audit:
+        add_finding(findings, "cron_audit_high_findings", "high", "cron", "cron audit contains high severity findings", count=len(high_audit), auditFindings=high_audit[:5])
+    if int(totals.get("unhealthyHeartbeatCount") or 0) > 0:
+        heartbeat_issues = []
+        for agent in (runtime.get("agents") or {}).values():
+            if isinstance(agent, dict):
+                heartbeat_issues.extend([item for item in agent.get("heartbeatIssues") or [] if item.get("risk") == "unhealthy"])
+        add_finding(
+            findings,
+            "cron_heartbeat_unhealthy",
+            "high",
+            "cron",
+            "cron heartbeat jobs are unhealthy",
+            count=int(totals.get("unhealthyHeartbeatCount") or 0),
+            sample=heartbeat_issues[:10],
+        )
+    elif int(totals.get("heartbeatIssueCount") or 0) > 0:
+        heartbeat_issues = []
+        for agent in (runtime.get("agents") or {}).values():
+            if isinstance(agent, dict):
+                heartbeat_issues.extend(agent.get("heartbeatIssues") or [])
+        add_finding(
+            findings,
+            "cron_heartbeat_slow",
+            "warning",
+            "cron",
+            "cron heartbeat jobs are slow or near timeout",
+            count=int(totals.get("heartbeatIssueCount") or 0),
+            sample=heartbeat_issues[:10],
+        )
+    if int(totals.get("longRunningJobCount") or 0) > 0:
+        long_jobs = []
+        for agent in (runtime.get("agents") or {}).values():
+            if isinstance(agent, dict):
+                long_jobs.extend(agent.get("longRunningJobs") or [])
+        add_finding(findings, "cron_long_running_jobs", "warning", "cron", "cron jobs have long recent durations", count=int(totals.get("longRunningJobCount") or 0), sample=long_jobs[:10])
+    if int(totals.get("timeoutLikeFailureCount") or 0) >= 3:
+        add_finding(
+            findings,
+            "cron_timeout_like_failures",
+            "warning",
+            "cron",
+            "cron jobs have timeout-like failures in the history window",
+            count=int(totals.get("timeoutLikeFailureCount") or 0),
+            windowDays=runtime.get("windowDays"),
+        )
+    if int(totals.get("cliStatusErrorCount") or 0) > 0:
+        add_finding(
+            findings,
+            "cron_cli_status_error_jobs",
+            "warning",
+            "cron",
+            "OpenClaw cron CLI reports jobs in error status",
+            count=int(totals.get("cliStatusErrorCount") or 0),
+            statusCounts=(runtime.get("cliStatus") or {}).get("statusCounts"),
+            sample=((runtime.get("cliStatus") or {}).get("nonOkSamples") or {}).get("error", [])[:10],
+        )
+    elif int(totals.get("staleCliStatusErrorCount") or 0) > 0:
+        add_finding(
+            findings,
+            "cron_cli_status_stale_error_observations",
+            "info",
+            "cron",
+            "OpenClaw cron CLI error statuses appear stale after newer successful run records",
+            count=int(totals.get("staleCliStatusErrorCount") or 0),
+            statusCounts=(runtime.get("cliStatus") or {}).get("statusCounts"),
+        )
+    if int(totals.get("cliStatusSkippedCount") or 0) >= 3:
+        add_finding(
+            findings,
+            "cron_cli_status_skipped_jobs",
+            "warning",
+            "cron",
+            "OpenClaw cron CLI reports repeated skipped jobs",
+            count=int(totals.get("cliStatusSkippedCount") or 0),
+            statusCounts=(runtime.get("cliStatus") or {}).get("statusCounts"),
+            sample=((runtime.get("cliStatus") or {}).get("nonOkSamples") or {}).get("skipped", [])[:10],
+        )
+    if int(runtime.get("activeOrphanRunLogCount") or 0) > 0:
+        add_finding(
+            findings,
+            "cron_orphan_run_logs",
+            "warning",
+            "cron",
+            "orphan by-job run logs exist for inactive job ids",
+            count=int(runtime.get("activeOrphanRunLogCount") or 0),
+            sample=[item for item in runtime.get("orphanRunLogs") or [] if not item.get("ignored")][:10],
+        )
+    if gateway_log["laneWaitExceeded"] >= 5:
+        add_finding(findings, "gateway_congestion_logs", "high", "gateway", "gateway congestion markers found in logs", gatewayLog=gateway_log)
+    elif gateway_log["laneTaskError"] >= 5 or gateway_log["unknownCronJobId"] >= 1:
+        add_finding(
+            findings,
+            "gateway_task_reconcile_observations",
+            "warning",
+            "gateway",
+            "gateway task reconciliation or lane task error markers found in logs",
+            gatewayLog=gateway_log,
+        )
+    if gateway_log["wsClosedBeforeConnect"] >= 20 or gateway_log["wsTimeouts"] >= 3:
+        add_finding(findings, "gateway_ws_instability", "high", "gateway", "gateway websocket instability markers found in logs", gatewayLog=gateway_log)
+    if gateway_log["memoryCronUnavailable"] >= 10:
+        add_finding(findings, "memory_core_unavailable", "high", "runtime", "memory core unavailable markers found in logs", gatewayLog=gateway_log)
+
+    return {
+        "jobsPath": str(JOBS_PATH),
+        "jobCount": len(items),
+        "staleRunning": stale,
+        "leaseCount": len(leases),
+        "expiredLeases": expired_leases,
+        "auditAgeSeconds": audit_age,
+        "auditFresh": bool(audit_fresh),
+        "auditFreshSeconds": CRON_AUDIT_FRESH_SECONDS,
+        "auditFindingCount": len(audit_findings),
+        "highAuditFindings": high_audit[:20],
+        "runtime": runtime,
+        "gatewayLog": gateway_log,
+    }
+
+
+def discover_telegram_accounts() -> Dict[str, Dict[str, Any]]:
+    accounts: Dict[str, Dict[str, Any]] = {}
+    config = load_json(OPENCLAW / "openclaw.json", {}) or {}
+
+    def add_account(account_id: str, token: Optional[str] = None) -> None:
+        if not account_id:
+            return
+        item = accounts.setdefault(account_id, {})
+        if token:
+            item["token"] = token
+
+    channels = config.get("channels") if isinstance(config, dict) else {}
+    telegram_cfg = channels.get("telegram") if isinstance(channels, dict) else {}
+    telegram_accounts = telegram_cfg.get("accounts") if isinstance(telegram_cfg, dict) else {}
+    if isinstance(telegram_accounts, dict):
+        for account_id, account_cfg in telegram_accounts.items():
+            token = None
+            if isinstance(account_cfg, dict):
+                raw = account_cfg.get("botToken") or account_cfg.get("token")
+                if isinstance(raw, str):
+                    token = raw
+            add_account(str(account_id), token)
+
+    bindings = config.get("bindings") if isinstance(config, dict) else []
+    if isinstance(bindings, list):
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
+            match = binding.get("match") if isinstance(binding.get("match"), dict) else {}
+            if match.get("channel") == "telegram":
+                add_account(str(match.get("accountId") or telegram_cfg.get("defaultAccount") or "default"))
+
+    def scan(obj: Any, prefix: str = "default") -> None:
+        if isinstance(obj, dict):
+            if "telegram" in obj and isinstance(obj["telegram"], dict):
+                tg = obj["telegram"]
+                token = tg.get("botToken") or tg.get("token")
+                account_raw = tg.get("accountId") or obj.get("accountId") or obj.get("id")
+                if isinstance(token, str) or account_raw:
+                    account_id = str(account_raw or prefix)
+                    add_account(account_id, token if isinstance(token, str) else None)
+            for key, value in obj.items():
+                if key.lower() in {"token", "bottoken", "secret"}:
+                    continue
+                scan(value, str(key))
+        elif isinstance(obj, list):
+            for idx, value in enumerate(obj):
+                scan(value, f"{prefix}-{idx}")
+
+    scan(config)
+
+    if TELEGRAM_DIR.exists():
+        for path in TELEGRAM_DIR.glob("**/*"):
+            name = path.name
+            if name.endswith(".offset") or name.endswith("offset.json") or name == "offset":
+                account_id = path.parent.name if path.parent != TELEGRAM_DIR else path.stem.replace(".offset", "")
+                add_account(account_id)
+
+    env_accounts = os.environ.get("OPENCLAW_STABILITY_TELEGRAM_ACCOUNTS", "")
+    for raw in env_accounts.split(","):
+        raw = raw.strip()
+        if raw:
+            add_account(raw)
+    return accounts
+
+
+def read_offset(account_id: str) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    candidates = [
+        TELEGRAM_DIR / f"update-offset-{account_id}.json",
+        TELEGRAM_DIR / account_id / "offset.json",
+        TELEGRAM_DIR / account_id / "offset",
+        TELEGRAM_DIR / f"{account_id}.offset",
+        TELEGRAM_DIR / f"{account_id}.json",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        value: Optional[int] = None
+        data = load_json(path, None)
+        if isinstance(data, dict):
+            for key in ("lastUpdateId", "offset", "update_id", "last_update_id"):
+                if isinstance(data.get(key), int):
+                    value = int(data[key])
+                    break
+            if value is None:
+                nested = data.get("state") if isinstance(data.get("state"), dict) else {}
+                for key in ("lastUpdateId", "offset", "update_id", "last_update_id"):
+                    if isinstance(nested.get(key), int):
+                        value = int(nested[key])
+                        break
+        elif isinstance(data, int):
+            value = data
+        if value is None:
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+                value = int(text)
+            except Exception:
+                value = None
+        return value, file_age_seconds(path), str(path)
+    return None, None, None
+
+
+def telegram_api(token: str, method: str, query: str = "") -> Dict[str, Any]:
+    if not token:
+        return {"ok": False, "description": "missing token"}
+    url = f"https://api.telegram.org/bot{token}/{method}{query}"
+    req = urllib.request.Request(url, headers={"User-Agent": "cat-agents-stabilityd/1"})
+    proxy_url = os.environ.get("OPENCLAW_STABILITY_HEALTH_PROXY", "http://127.0.0.1:7890")
+    handlers = []
+    if proxy_url:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+    opener = urllib.request.build_opener(*handlers)
+    try:
+        with opener.open(req, timeout=18) as res:
+            return json.loads(res.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read().decode("utf-8", errors="replace"))
+        except Exception:
+            return {"ok": False, "description": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "description": f"{type(exc).__name__}: {exc}"}
+
+
+def channel_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    accounts = discover_telegram_accounts()
+    result: Dict[str, Any] = {}
+    warn_seconds = int(os.environ.get("OPENCLAW_STABILITY_CHANNEL_WARN_SECONDS", "300"))
+    crit_seconds = int(os.environ.get("OPENCLAW_STABILITY_CHANNEL_CRIT_SECONDS", "600"))
+    probe_api = os.environ.get("OPENCLAW_STABILITY_TELEGRAM_API_PROBE", "0") == "1"
+    stale_offset_legacy_finding = os.environ.get("OPENCLAW_STABILITY_STALE_TELEGRAM_OFFSET_FINDING", "0") == "1"
+    for account_id, meta in accounts.items():
+        token = meta.get("token")
+        last_update_id, offset_age, offset_path = read_offset(account_id)
+        pending_count: Optional[int] = None
+        pending_oldest_age: Optional[int] = None
+        error = None
+        if token and probe_api:
+            # Never call getUpdates during normal stability checks. Gateway owns
+            # Telegram long polling; a second getUpdates caller causes 409
+            # conflicts and can make live sessions look unresponsive.
+            getme = telegram_api(token, "getMe")
+            if not getme.get("ok"):
+                error = getme.get("description") or "getMe failed"
+        if error:
+            add_finding(findings, f"telegram_{account_id}_api_error", "high", "channel", f"telegram account {account_id} API probe failed", error=error)
+        if offset_age is not None:
+            if pending_count and pending_count > 0 and offset_age >= crit_seconds:
+                add_finding(
+                    findings,
+                    f"telegram_{account_id}_consumer_lag",
+                    "critical",
+                    "channel",
+                    f"telegram account {account_id} has pending updates and stale offset",
+                    offsetAgeSeconds=offset_age,
+                    pendingCount=pending_count,
+                    pendingOldestAgeSeconds=pending_oldest_age,
+                )
+            elif stale_offset_legacy_finding and offset_age >= crit_seconds * 6:
+                add_finding(
+                    findings,
+                    f"telegram_{account_id}_offset_stale",
+                    "warning",
+                    "channel",
+                    f"telegram account {account_id} offset file is stale",
+                    offsetAgeSeconds=offset_age,
+                    pendingCount=pending_count,
+                )
+            elif offset_age >= warn_seconds and pending_count and pending_count > 0:
+                add_finding(
+                    findings,
+                    f"telegram_{account_id}_consumer_lag_warn",
+                    "high",
+                    "channel",
+                    f"telegram account {account_id} pending updates are accumulating",
+                    offsetAgeSeconds=offset_age,
+                    pendingCount=pending_count,
+                )
+        result[account_id] = {
+            "lastUpdateId": last_update_id,
+            "offsetAgeSeconds": offset_age,
+            "offsetPath": offset_path,
+            "pendingCount": pending_count,
+            "pendingOldestAgeSeconds": pending_oldest_age,
+            "error": error,
+            "hasToken": bool(token),
+            "apiProbeEnabled": bool(probe_api),
+        }
+    log_summary = collect_channel_log_summary(accounts.keys())
+    totals = (log_summary.get("totals") or {}) if isinstance(log_summary, dict) else {}
+    if int(totals.get("telegramNetworkFailures") or 0) >= 10:
+        add_finding(
+            findings,
+            "telegram_provider_network_errors",
+            "high",
+            "channel",
+            "telegram provider network failures are elevated in gateway logs",
+            channelLog=log_summary,
+        )
+    elif int(totals.get("telegramRestartLimitHits") or 0) > 0:
+        add_finding(
+            findings,
+            "telegram_channel_restart_limited",
+            "high",
+            "channel",
+            "telegram channel providers hit health-monitor restart limits",
+            channelLog=log_summary,
+        )
+    elif int(totals.get("telegramChannelStopped") or 0) >= 6:
+        add_finding(
+            findings,
+            "telegram_channel_restart_churn",
+            "high",
+            "channel",
+            "telegram channel providers are repeatedly stopping and restarting",
+            channelLog=log_summary,
+        )
+    elif int(totals.get("telegramChannelStopExceeded") or 0) > 0:
+        add_finding(
+            findings,
+            "telegram_channel_stop_slow",
+            "warning",
+            "channel",
+            "telegram channel shutdown exceeded expected time in gateway logs",
+            channelLog=log_summary,
+        )
+    result["_logSummary"] = log_summary
+    return result
+
+
+def parse_session_problems_from_logs() -> Dict[str, Dict[str, Any]]:
+    text = tail_text(GATEWAY_ERR_LOG, 4_000_000)
+    fail_cutoff = epoch() - SESSION_FAIL_WINDOW_SECONDS
+    overflow_cutoff = epoch() - SESSION_OVERFLOW_WINDOW_SECONDS
+    problems: Dict[str, Dict[str, Any]] = {}
+    stuck_pat = re.compile(r"stuck session: sessionId=([^ ]+) sessionKey=([^ ]+) state=([^ ]+) age=(\d+)s")
+    key_pat = re.compile(r"(agent:[^\s,'\"\\]+)")
+    for line in text.splitlines():
+        line_epoch = parse_log_ts(line)
+        if line_epoch is None:
+            continue
+        lower = line.lower()
+        m = stuck_pat.search(line)
+        if m:
+            if line_epoch < fail_cutoff:
+                continue
+            session_key = m.group(2)
+            bucket = problems.setdefault(session_key, {"failures": [], "overflowCount": 0, "stuckCount": 0, "sample": []})
+            bucket["stuckCount"] += 1
+            bucket["failures"].append({"kind": "stuck", "line": line[-500:]})
+            bucket["sample"].append(line[-500:])
+            continue
+        if not any(marker in lower for marker in FAIL_MARKERS + OVERFLOW_MARKERS):
+            continue
+        keys = key_pat.findall(line)
+        for session_key in keys:
+            bucket = problems.setdefault(session_key, {"failures": [], "overflowCount": 0, "stuckCount": 0, "sample": []})
+            if any(marker in lower for marker in OVERFLOW_MARKERS):
+                if line_epoch >= overflow_cutoff:
+                    bucket["overflowCount"] += 1
+            if any(marker in lower for marker in FAIL_MARKERS):
+                if line_epoch >= fail_cutoff:
+                    bucket["failures"].append({"kind": "failure", "line": line[-500:]})
+            bucket["sample"].append(line[-500:])
+            bucket["sample"] = bucket["sample"][-5:]
+    return problems
+
+
+def analyze_session_activity(entry: Dict[str, Any]) -> Dict[str, Any]:
+    session_id = entry.get("sessionId")
+    store_hint = entry.get("sessionFile") or entry.get("path") or entry.get("transcriptPath")
+    candidates: List[Path] = []
+    if isinstance(store_hint, str):
+        candidates.append(Path(store_hint))
+    if isinstance(session_id, str):
+        for store in iter_session_store_paths():
+            candidates.extend(store.parent.glob(f"{session_id}.jsonl"))
+            candidates.extend(store.parent.glob(f"{session_id}.trajectory.jsonl"))
+    current_ms = now_ms()
+    active_count = 0
+    heavy_count = 0
+    for path in candidates[:8]:
+        if not path.exists() or not path.is_file():
+            continue
+        text = tail_text(path, 500_000)
+        for line in text.splitlines()[-300:]:
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            event_ms = None
+            for key in ("timestamp", "ts", "createdAt", "updatedAt"):
+                if key in obj:
+                    parsed = parse_iso_epoch(obj[key])
+                    if parsed is not None:
+                        event_ms = parsed * 1000
+                        break
+            if event_ms is None:
+                event_ms = int(path.stat().st_mtime * 1000)
+            age_ms = current_ms - event_ms
+            if age_ms <= ACTIVE_PROGRESS_WINDOW_SECONDS * 1000:
+                event_type = str(obj.get("type") or obj.get("event") or "")
+                role = str(obj.get("role") or "")
+                if event_type in EVENT_TYPES_ACTIVE or role in MESSAGE_ROLES_ACTIVE:
+                    active_count += 1
+            if age_ms <= HEAVY_TASK_WINDOW_SECONDS * 1000:
+                payload_text = json.dumps(obj, ensure_ascii=False)[:1500].lower()
+                msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+                tool_name = str(msg.get("toolName") or obj.get("toolName") or "")
+                if any(name in payload_text for name in HEAVY_TOOL_NAMES) or tool_name in HEAVY_TOOL_NAMES or any(token in payload_text for token in HEAVY_TASK_TOKENS):
+                    heavy_count += 1
+    return {
+        "active": active_count >= ACTIVE_PROGRESS_EVENT_THRESHOLD,
+        "heavy": heavy_count >= HEAVY_TASK_EVENT_THRESHOLD,
+        "activeCount": active_count,
+        "heavyCount": heavy_count,
+        "reason": "recent_progress" if active_count >= ACTIVE_PROGRESS_EVENT_THRESHOLD else "insufficient_recent_progress",
+    }
+
+
+def find_session_entry(session_key: str) -> Tuple[Optional[Path], Optional[Dict[str, Any]]]:
+    for store_path in iter_session_store_paths():
+        store = load_json(store_path, {})
+        if not isinstance(store, dict) or session_key not in store:
+            continue
+        entry = store.get(session_key)
+        if isinstance(entry, dict):
+            return store_path, entry
+    return None, None
+
+
+def session_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    stores = iter_session_store_paths()
+    total_entries = 0
+    stale_entries = []
+    for store_path in stores:
+        data = load_json(store_path, {})
+        if not isinstance(data, dict):
+            continue
+        total_entries += len(data)
+        for session_key, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            status = str(entry.get("status") or entry.get("state") or "")
+            updated = parse_iso_epoch(entry.get("updatedAt") or entry.get("endedAt") or entry.get("createdAt"))
+            if updated is None:
+                for key in ("updatedAtMs", "endedAtMs", "createdAtMs", "runningAtMs", "startedAtMs"):
+                    raw = entry.get(key)
+                    if isinstance(raw, int):
+                        updated = int(raw / 1000) if raw > 10_000_000_000 else raw
+                        break
+            age = epoch() - updated if updated else None
+            if status in {"timeout", "error", "failed", "aborted"} and age is not None and age >= 3600:
+                stale_entries.append({"storePath": str(store_path), "sessionKey": session_key, "status": status, "ageSeconds": age, "sessionId": entry.get("sessionId")})
+    problems = parse_session_problems_from_logs()
+    reset_candidates = []
+    stale_log_candidates = []
+    protected_candidates = []
+    for key, meta in problems.items():
+        failure_count = len(meta.get("failures") or [])
+        overflow_count = int(meta.get("overflowCount") or 0)
+        stuck_count = int(meta.get("stuckCount") or 0)
+        if failure_count >= SESSION_FAIL_THRESHOLD or overflow_count >= SESSION_OVERFLOW_THRESHOLD or stuck_count >= SESSION_FAIL_THRESHOLD:
+            item = {
+                "sessionKey": key,
+                "failureCount": failure_count,
+                "overflowCount": overflow_count,
+                "stuckCount": stuck_count,
+                "sample": (meta.get("sample") or [])[-3:],
+            }
+            store_path, entry = find_session_entry(key)
+            if not entry:
+                stale_log_candidates.append(item)
+                continue
+            activity = analyze_session_activity(entry)
+            item["storePath"] = str(store_path)
+            item["sessionId"] = entry.get("sessionId")
+            item["activity"] = activity
+            if activity.get("active") or activity.get("heavy"):
+                protected_candidates.append(item)
+                continue
+            reset_candidates.append(item)
+    main_candidates = [r for r in reset_candidates if r["sessionKey"].startswith("agent:main:") or ":main:" in r["sessionKey"]]
+    if stale_entries:
+        add_finding(findings, "session_stale_entries", "info", "session", "stale failed session entries detected", count=len(stale_entries), sample=stale_entries[:10])
+    if stale_log_candidates:
+        add_finding(
+            findings,
+            "session_problem_stale_log_observations",
+            "warning",
+            "session",
+            "session problem log entries no longer map to live session store entries",
+            count=len(stale_log_candidates),
+            sample=stale_log_candidates[:10],
+        )
+    if protected_candidates:
+        add_finding(
+            findings,
+            "session_problem_protected_active",
+            "warning",
+            "session",
+            "session problem log entries map to active or heavy sessions and are protected from reset",
+            count=len(protected_candidates),
+            sample=protected_candidates[:10],
+        )
+    if reset_candidates:
+        sev = "high" if len(reset_candidates) < 8 and len(main_candidates) < 2 else "critical"
+        add_finding(
+            findings,
+            "session_problem_backlog",
+            sev,
+            "session",
+            "session problem backlog detected",
+            count=len(reset_candidates),
+            mainCount=len(main_candidates),
+            sample=reset_candidates[:10],
+        )
+    return {
+        "storeCount": len(stores),
+        "entryCount": total_entries,
+        "staleEntries": stale_entries[:50],
+        "problemCount": len(problems),
+        "resetCandidates": reset_candidates[:50],
+        "staleLogCandidates": stale_log_candidates[:50],
+        "protectedCandidates": protected_candidates[:50],
+        "mainResetCandidateCount": len(main_candidates),
+    }
+
+
+def backup_disk_summary() -> Dict[str, Any]:
+    backup_dir = OPENCLAW / "backups"
+    backups = []
+    if backup_dir.exists():
+        for path in sorted(backup_dir.glob("openclaw-backup-*.tar.gz")):
+            with contextlib.suppress(Exception):
+                stat = path.stat()
+                backups.append(
+                    {
+                        "path": str(path),
+                        "name": path.name,
+                        "sizeBytes": stat.st_size,
+                        "mtimeEpoch": int(stat.st_mtime),
+                    }
+                )
+    backups.sort(key=lambda item: int(item["mtimeEpoch"]), reverse=True)
+    latest_size = int(backups[0]["sizeBytes"]) if backups else 0
+    total_size = sum(int(item["sizeBytes"]) for item in backups)
+    return {
+        "backupDir": str(backup_dir),
+        "keepCount": BACKUP_KEEP_COUNT,
+        "backupCount": len(backups),
+        "totalBackupBytes": total_size,
+        "latestBackupBytes": latest_size,
+        "latestBackups": backups[:BACKUP_KEEP_COUNT],
+    }
+
+
+def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    statvfs = os.statvfs(str(OPENCLAW))
+    free = statvfs.f_bavail * statvfs.f_frsize
+    total = statvfs.f_blocks * statvfs.f_frsize
+    used_ratio = 1 - (free / total) if total else 0
+    if used_ratio >= 0.92:
+        add_finding(findings, "disk_pressure", "critical", "resource", "disk usage is critically high", usedRatio=used_ratio, freeBytes=free)
+    elif used_ratio >= 0.85:
+        add_finding(findings, "disk_pressure", "high", "resource", "disk usage is high", usedRatio=used_ratio, freeBytes=free)
+    logs_size = 0
+    for path in LOG_DIR.glob("*.log"):
+        with contextlib.suppress(Exception):
+            logs_size += path.stat().st_size
+    backups = backup_disk_summary()
+    latest_backup_size = int(backups.get("latestBackupBytes") or 0)
+    if latest_backup_size > 0:
+        required = int(latest_backup_size * BACKUP_HEADROOM_WARN_RATIO)
+        if free < required:
+            add_finding(
+                findings,
+                "backup_disk_headroom_low",
+                "warning",
+                "resource",
+                "free disk headroom is low for the next OpenClaw backup",
+                freeBytes=free,
+                latestBackupBytes=latest_backup_size,
+                recommendedFreeBytes=required,
+                backupKeepCount=BACKUP_KEEP_COUNT,
+            )
+    return {
+        "diskFreeBytes": free,
+        "diskTotalBytes": total,
+        "diskUsedRatio": used_ratio,
+        "topLevelLogBytes": logs_size,
+        "backups": backups,
+    }
+
+
+def config_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    checks = {
+        "openclawJsonExists": (OPENCLAW / "openclaw.json").exists(),
+        "gatewayServiceExists": Path("/etc/systemd/system/openclaw-gateway.service").exists(),
+        "stabilityServiceExists": Path("/etc/systemd/system/cat-agents-stabilityd.service").exists(),
+    }
+    if not checks["openclawJsonExists"]:
+        add_finding(findings, "openclaw_config_missing", "critical", "config", "openclaw.json is missing")
+    return checks
+
+
+def update_streaks(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    prev = db_get(conn, "streaks", {}) or {}
+    current_keys = {f["key"]: f for f in findings}
+    updated: Dict[str, Any] = {}
+    now_s = epoch()
+    for key, finding in current_keys.items():
+        old = prev.get(key) if isinstance(prev.get(key), dict) else {}
+        updated[key] = {
+            "count": int(old.get("count") or 0) + 1,
+            "firstSeen": int(old.get("firstSeen") or now_s),
+            "lastSeen": now_s,
+            "severity": finding.get("severity"),
+            "component": finding.get("component"),
+        }
+    db_set(conn, "streaks", updated)
+    return updated
+
+
+def update_runtime_trends(conn: sqlite3.Connection, snapshot: Dict[str, Any], findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    now_s = int(snapshot.get("checkedAtEpoch") or epoch())
+    gateway = snapshot.get("gateway") if isinstance(snapshot.get("gateway"), dict) else {}
+    hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
+    resource = snapshot.get("resource") if isinstance(snapshot.get("resource"), dict) else {}
+    children = gateway.get("children") if isinstance(gateway.get("children"), dict) else {}
+    hermers_workflow = hermers.get("workflow") if isinstance(hermers.get("workflow"), dict) else {}
+    sample = {
+        "tsEpoch": now_s,
+        "gatewayMemoryBytes": int(gateway.get("memoryBytes") or 0),
+        "gatewaySwapBytes": int(gateway.get("swapBytes") or 0),
+        "gatewayChildCount": int(children.get("count") or 0),
+        "hermersAcpWorkers": len(hermers.get("acpWorkers") or []),
+        "hermersOrphanAcpWorkers": len(hermers.get("orphanAcpWorkers") or []),
+        "hermersRecentFailureCount": int(hermers_workflow.get("recentFailureCount") or 0),
+        "hermersStaleSentCount": int(hermers_workflow.get("staleSentCount") or 0),
+        "codexAppServers": int(children.get("codexAppServers") or 0),
+        "openclawChildren": int(children.get("openclawChildren") or 0),
+        "diskFreeBytes": int(resource.get("diskFreeBytes") or 0),
+        "diskUsedRatio": float(resource.get("diskUsedRatio") or 0),
+    }
+    previous = db_get(conn, "runtime_trend_samples", []) or []
+    if not isinstance(previous, list):
+        previous = []
+    cutoff = now_s - max(TREND_WINDOW_SECONDS * 2, 3600)
+    samples = [item for item in previous if isinstance(item, dict) and int(item.get("tsEpoch") or 0) >= cutoff]
+    samples.append(sample)
+    samples = samples[-TREND_SAMPLE_LIMIT:]
+    db_set(conn, "runtime_trend_samples", samples)
+
+    window_samples = [item for item in samples if int(item.get("tsEpoch") or 0) >= now_s - TREND_WINDOW_SECONDS]
+    baseline = window_samples[0] if window_samples else sample
+    memory_delta = int(sample["gatewayMemoryBytes"]) - int(baseline.get("gatewayMemoryBytes") or 0)
+    child_delta = int(sample["gatewayChildCount"]) - int(baseline.get("gatewayChildCount") or 0)
+    disk_free_delta = int(sample["diskFreeBytes"]) - int(baseline.get("diskFreeBytes") or 0)
+    trend = {
+        "windowSeconds": TREND_WINDOW_SECONDS,
+        "sampleCount": len(window_samples),
+        "baselineEpoch": baseline.get("tsEpoch"),
+        "current": sample,
+        "deltas": {
+            "gatewayMemoryBytes": memory_delta,
+            "gatewayChildCount": child_delta,
+            "diskFreeBytes": disk_free_delta,
+        },
+    }
+    if len(window_samples) >= 3 and memory_delta >= MEMORY_GROWTH_WARN_BYTES and sample["gatewayMemoryBytes"] >= MEMORY_WARN_BYTES * 0.8:
+        add_finding(
+            findings,
+            "gateway_memory_growth",
+            "warning",
+            "resource",
+            "gateway memory is growing quickly within the trend window",
+            trend=trend,
+        )
+    if len(window_samples) >= 3 and child_delta >= CHILD_GROWTH_WARN_COUNT:
+        add_finding(
+            findings,
+            "gateway_child_growth",
+            "warning",
+            "resource",
+            "gateway child process count is growing within the trend window",
+            trend=trend,
+        )
+    return trend
+
+
+def recent_restart_history(conn: sqlite3.Connection) -> List[int]:
+    history = db_get(conn, "stabilityd_gateway_restart_history", []) or []
+    cutoff = epoch() - RESTART_WINDOW_SECONDS
+    return [int(x) for x in history if int(x) >= cutoff]
+
+
+def record_restart_time(conn: sqlite3.Connection) -> None:
+    history = recent_restart_history(conn)
+    now_s = epoch()
+    history.append(now_s)
+    db_set(conn, "stabilityd_gateway_restart_history", history)
+    db_set(conn, "stabilityd_last_gateway_restart_at", now_s)
+
+
+def hot(streaks: Dict[str, Any], key: str) -> bool:
+    return int(streaks.get(key, {}).get("count") or 0) >= ACTION_STREAK_THRESHOLD
+
+
+def sustained(streaks: Dict[str, Any], key: str, threshold: int) -> bool:
+    return int(streaks.get(key, {}).get("count") or 0) >= threshold
+
+
+def update_lane_recovery(conn: sqlite3.Connection, now_s: int, pressures: Dict[str, bool]) -> Dict[str, Any]:
+    previous = db_get(conn, "lane_recovery_state", {}) or {}
+    previous_domains = previous.get("domains") if isinstance(previous.get("domains"), dict) else previous
+    domains: Dict[str, Any] = {}
+    for domain in ("cron", "session", "channel", "hermers", "resource"):
+        old = previous_domains.get(domain) if isinstance(previous_domains.get(domain), dict) else {}
+        pressure = bool(pressures.get(domain))
+        pressure_streak = int(old.get("pressureStreak") or 0)
+        healthy_streak = int(old.get("healthyStreak") or 0)
+        if pressure:
+            pressure_streak += 1
+            healthy_streak = 0
+        else:
+            healthy_streak += 1
+            pressure_streak = 0
+        domains[domain] = {
+            "pressure": pressure,
+            "pressureStreak": pressure_streak,
+            "healthyStreak": healthy_streak,
+            "updatedAtEpoch": now_s,
+        }
+    cron_healthy = int(domains["cron"]["healthyStreak"])
+    if pressures.get("cron") or pressures.get("resource") or pressures.get("channel"):
+        cron_next = "critical-only"
+    elif cron_healthy >= CRON_RECOVERY_OPEN_HEALTHY_STREAK:
+        cron_next = "open"
+    elif cron_healthy >= CRON_RECOVERY_LIMITED_HEALTHY_STREAK:
+        cron_next = "limited"
+    else:
+        cron_next = "hold"
+    payload = {
+        "schemaVersion": 1,
+        "updatedAt": ts(),
+        "updatedAtEpoch": now_s,
+        "cronRecoveryLimitedHealthyStreak": CRON_RECOVERY_LIMITED_HEALTHY_STREAK,
+        "cronRecoveryOpenHealthyStreak": CRON_RECOVERY_OPEN_HEALTHY_STREAK,
+        "domains": domains,
+        "cronNextAdmissionWhenGlobalGatesAllow": cron_next,
+    }
+    db_set(conn, "lane_recovery_state", payload)
+    return payload
+
+
+def build_lane_policy(
+    *,
+    now_s: int,
+    mode: str,
+    severity: str,
+    keys: set[str],
+    streaks: Dict[str, Any],
+    gateway: Dict[str, Any],
+    can_mutate_cron: bool,
+    can_reset_session: bool,
+    should_pause_cron: bool,
+    should_defer_control_plane_heavy: bool,
+    control_plane_defer_until: int,
+    restart_storm: bool,
+    cooldown_active: bool,
+    recovery: Dict[str, Any],
+) -> Dict[str, Any]:
+    gateway_unavailable = mode == "gateway-unreachable" or not gateway.get("active") or not gateway.get("portOk")
+    resource_pressure = bool({"gateway_resource_saturation", "gateway_swap_saturation", "disk_pressure"} & keys) or mode == "resource-pressure"
+    cron_pressure = bool({"cron_stale_running_state", "cron_expired_leases", "gateway_congestion_logs", "cron_heartbeat_unhealthy"} & keys)
+    session_pressure = "session_problem_backlog" in keys
+    channel_pressure = bool(
+        {"telegram_provider_network_errors", "telegram_channel_restart_limited", "telegram_channel_restart_churn"} & keys
+    ) or any(k.endswith("_consumer_lag") or k.endswith("_consumer_lag_warn") for k in keys)
+    hermers_pressure = bool(
+        {
+            "hermers_gateway_service_down",
+            "hermers_acp_orphan_workers",
+            "hermers_runtime_failure_burst",
+            "hermers_stale_sent_dispatches",
+        } & keys
+    )
+    direct_pressure = gateway_unavailable or "gateway_congestion_logs" in keys or channel_pressure or resource_pressure or restart_storm
+
+    direct_admission = "open"
+    if gateway_unavailable:
+        direct_admission = "closed"
+    elif restart_storm or cooldown_active or direct_pressure:
+        direct_admission = "priority-only"
+
+    if gateway_unavailable:
+        cron_max_concurrency = 0
+    elif restart_storm or cooldown_active:
+        cron_max_concurrency = CRON_MAX_CONCURRENCY_DEGRADED
+    elif should_pause_cron or resource_pressure:
+        cron_max_concurrency = CRON_MAX_CONCURRENCY_DEGRADED
+    elif severity in {"high", "critical"}:
+        cron_max_concurrency = CRON_MAX_CONCURRENCY_DEGRADED
+    else:
+        cron_max_concurrency = CRON_MAX_CONCURRENCY_NORMAL
+
+    if gateway_unavailable:
+        channel_probe_mode = "disabled"
+    elif channel_pressure:
+        channel_probe_mode = "passive-offset-only"
+    elif os.environ.get("OPENCLAW_STABILITY_TELEGRAM_API_PROBE", "0") == "1":
+        channel_probe_mode = "non-consuming-api-probe"
+    else:
+        channel_probe_mode = "passive"
+
+    session_reset_allowed = bool(can_reset_session)
+    main_session_reset_allowed = session_reset_allowed and not ("session_problem_backlog" in keys and severity == "critical")
+    cron_evidence = sorted(k for k in keys if k in {"cron_stale_running_state", "cron_expired_leases", "gateway_congestion_logs", "cron_heartbeat_unhealthy"})
+    cron_observations = sorted(
+        k
+        for k in keys
+        if k
+        in {
+            "cron_audit_high_findings",
+            "cron_audit_stale",
+            "cron_audit_missing",
+            "cron_heartbeat_slow",
+            "cron_long_running_jobs",
+            "cron_timeout_like_failures",
+            "cron_orphan_run_logs",
+            "cron_cli_status_error_jobs",
+            "cron_cli_status_skipped_jobs",
+            "gateway_task_reconcile_observations",
+        }
+    )
+    session_evidence = sorted(k for k in keys if k in {"session_problem_backlog"})
+    session_observations = sorted(k for k in keys if k in {"session_stale_entries", "session_problem_stale_log_observations", "session_problem_protected_active"})
+    channel_evidence = sorted(
+        k
+        for k in keys
+        if k.startswith("telegram_")
+        and (
+            k.endswith("_consumer_lag")
+            or k.endswith("_consumer_lag_warn")
+            or k in {"telegram_provider_network_errors", "telegram_channel_restart_limited", "telegram_channel_restart_churn"}
+        )
+    )
+    channel_observations = sorted(k for k in keys if k.startswith("telegram_") and k not in set(channel_evidence))
+    hermers_evidence = sorted(
+        k
+        for k in keys
+        if k
+        in {
+            "hermers_gateway_service_down",
+            "hermers_acp_orphan_workers",
+            "hermers_runtime_failure_burst",
+            "hermers_stale_sent_dispatches",
+        }
+    )
+    hermers_observations = sorted(k for k in keys if k.startswith("hermers_") and k not in set(hermers_evidence))
+    streak_counts = {key: int((streaks.get(key) or {}).get("count") or 0) for key in sorted(keys)}
+
+    cron_recovery = ((recovery.get("domains") or {}).get("cron") or {}) if isinstance(recovery, dict) else {}
+    cron_healthy_streak = int(cron_recovery.get("healthyStreak") or 0)
+    active_cron_pause = bool(should_pause_cron and (cron_pressure or resource_pressure or gateway_unavailable or channel_pressure))
+    if cron_max_concurrency == 0:
+        cron_admission = "closed"
+    elif active_cron_pause:
+        cron_admission = "critical-only"
+    elif restart_storm or cooldown_active or cron_max_concurrency < CRON_MAX_CONCURRENCY_NORMAL:
+        cron_admission = "limited"
+    elif cron_healthy_streak < CRON_RECOVERY_OPEN_HEALTHY_STREAK:
+        cron_admission = "limited"
+    else:
+        cron_admission = "open"
+    cron_state = "blocked" if cron_admission == "closed" else "constrained" if cron_admission != "open" else "normal"
+    session_state = "constrained" if session_pressure else "normal"
+    channel_state = "blocked" if channel_probe_mode == "disabled" else "constrained" if channel_pressure else "normal"
+    hermers_state = "blocked" if "hermers_gateway_service_down" in keys else "constrained" if hermers_pressure else "normal"
+
+    return {
+        "schemaVersion": 1,
+        "updatedAt": ts(),
+        "updatedAtEpoch": now_s,
+        "validUntilEpoch": now_s + POLICY_TTL_SECONDS,
+        "primaryPressureDomains": {
+            "cron": bool(cron_pressure),
+            "session": bool(session_pressure),
+            "channel": bool(channel_pressure),
+            "hermers": bool(hermers_pressure),
+        },
+        "secondaryPressureDomains": {
+            "gateway": bool(gateway_unavailable or "gateway_congestion_logs" in keys),
+            "resource": bool(resource_pressure),
+        },
+        "direct": {
+            "admission": direct_admission,
+            "priority": "highest",
+            "protectDirectSessions": True,
+            "reasons": sorted(
+                r
+                for r in [
+                    "gateway-unavailable" if gateway_unavailable else "",
+                    "restart-storm" if restart_storm else "",
+                    "cooldown" if cooldown_active else "",
+                    "gateway-congestion" if "gateway_congestion_logs" in keys else "",
+                    "channel-pressure" if channel_pressure else "",
+                    "resource-pressure" if resource_pressure else "",
+                ]
+                if r
+            ),
+        },
+        "controlPlane": {
+            "heavyReports": "defer" if should_defer_control_plane_heavy else "run",
+            "deferUntilEpoch": int(control_plane_defer_until or 0),
+            "heartbeat": "run",
+            "directSessions": "protect-priority",
+        },
+        "recovery": recovery,
+        "domains": {
+            "cron": {
+                "state": cron_state,
+                "pressure": bool(cron_pressure),
+                "evidenceKeys": cron_evidence,
+                "observationKeys": cron_observations,
+                "streakCounts": {k: streak_counts[k] for k in cron_evidence if k in streak_counts},
+                "governanceAction": "pause-non-critical" if active_cron_pause else "limit-concurrency" if cron_max_concurrency < CRON_MAX_CONCURRENCY_NORMAL else "observe",
+                "stabilizationGoal": "reduce cron queue age, stale running state, expired leases, heartbeat failure, and retry density without interrupting critical heartbeat work",
+            },
+            "session": {
+                "state": session_state,
+                "pressure": bool(session_pressure),
+                "evidenceKeys": session_evidence,
+                "observationKeys": session_observations,
+                "streakCounts": {k: streak_counts[k] for k in session_evidence if k in streak_counts},
+                "governanceAction": "reset-eligible-inactive-sessions" if session_reset_allowed and session_pressure else "protect-and-observe" if session_pressure else "observe",
+                "stabilizationGoal": "reduce stuck or failed session backlog while protecting active, direct, and heavy-but-progressing sessions",
+            },
+            "channel": {
+                "state": channel_state,
+                "pressure": bool(channel_pressure),
+                "evidenceKeys": channel_evidence,
+                "observationKeys": channel_observations,
+                "streakCounts": {k: streak_counts[k] for k in channel_evidence if k in streak_counts},
+                "governanceAction": "passive-backoff" if channel_pressure else "passive-observe",
+                "stabilizationGoal": "keep provider delivery healthy without competing with the Gateway consumer",
+            },
+            "hermers": {
+                "state": hermers_state,
+                "pressure": bool(hermers_pressure),
+                "evidenceKeys": hermers_evidence,
+                "observationKeys": hermers_observations,
+                "streakCounts": {k: streak_counts[k] for k in hermers_evidence if k in streak_counts},
+                "governanceAction": "reap-orphan-acp-workers" if "hermers_acp_orphan_workers" in keys else "restart-gateway-disabled-observe" if "hermers_gateway_service_down" in keys else "observe",
+                "stabilizationGoal": "keep Hermers profile gateways, ACP workers, runtime receipts, and workflow-facing execution readiness healthy without masking runtime failures as workflow success",
+            },
+        },
+        "cron": {
+            "maxConcurrency": int(cron_max_concurrency),
+            "nonCriticalPaused": bool(active_cron_pause),
+            "mutateStateAllowed": bool(can_mutate_cron),
+            "bulkAllowed": mode == "healthy" and severity in {"ok", "info"},
+            "admission": cron_admission,
+            "pressure": bool(cron_pressure),
+            "criticalJobsAllowed": not gateway_unavailable,
+            "heartbeatAllowed": not gateway_unavailable,
+        },
+        "channel": {
+            "probeMode": channel_probe_mode,
+            "consumeUpdates": False,
+            "providerBackoff": "increase" if channel_pressure else "normal",
+            "pressure": bool(channel_pressure),
+        },
+        "session": {
+            "resetAllowed": session_reset_allowed,
+            "ordinaryResetAllowed": session_reset_allowed,
+            "mainResetAllowed": main_session_reset_allowed,
+            "pressure": bool(session_pressure),
+            "protectedDirectSessionKeys": sorted(CONTROL_PLANE_DIRECT_SESSION_KEYS),
+        },
+        "hermers": {
+            "pressure": bool(hermers_pressure),
+            "reapOrphanAcpWorkersAllowed": bool(HERMERS_ACP_ORPHAN_REAP_ENABLED),
+            "gatewayRestartAllowed": bool(HERMERS_GATEWAY_RESTART_ENABLED),
+            "gatewayRestartDefault": "disabled",
+        },
+    }
+
+
+def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]], snapshot: Dict[str, Any], streaks: Dict[str, Any]) -> Dict[str, Any]:
+    severity = max_severity(findings)
+    keys = {str(f.get("key")) for f in findings}
+    components = {str(f.get("component")) for f in findings}
+    reasons = [str(f.get("key")) for f in findings if SEVERITY_RANK.get(str(f.get("severity")), 0) >= SEVERITY_RANK["high"]]
+    mode = "healthy"
+    if severity != "ok":
+        mode = "degraded"
+    if {"gateway_service_down", "gateway_port_down", "gateway_health_endpoint_failed"} & keys:
+        mode = "gateway-unreachable"
+    elif any(k.endswith("_consumer_lag") for k in keys):
+        mode = "channel-stalled"
+    elif {"telegram_provider_network_errors", "telegram_channel_restart_limited", "telegram_channel_restart_churn"} & keys:
+        mode = "delivery-failing"
+    elif "cron_stale_running_state" in keys or "cron_expired_leases" in keys:
+        mode = "cron-state-corrupt"
+    elif "gateway_congestion_logs" in keys or "cron_heartbeat_unhealthy" in keys:
+        mode = "cron-congested"
+    elif "session_problem_backlog" in keys:
+        mode = "session-stuck"
+    elif "hermers_gateway_service_down" in keys:
+        mode = "hermers-unavailable"
+    elif {"hermers_acp_orphan_workers", "hermers_runtime_failure_burst", "hermers_stale_sent_dispatches"} & keys:
+        mode = "hermers-degraded"
+    elif "gateway_resource_saturation" in keys or "gateway_swap_saturation" in keys or "disk_pressure" in keys:
+        mode = "resource-pressure"
+
+    now_s = epoch()
+    last_restart = int(db_get(conn, "stabilityd_last_gateway_restart_at", 0) or 0)
+    cooldown_until = last_restart + RESTART_COOLDOWN_SECONDS if last_restart else 0
+    cooldown_active = cooldown_until > now_s
+    restart_history = recent_restart_history(conn)
+    restart_storm = len(restart_history) >= MAX_RESTARTS_PER_WINDOW
+    restart_storm_clears_at = min(restart_history) + RESTART_WINDOW_SECONDS if restart_storm and restart_history else 0
+    if restart_storm:
+        mode = "restart-storm"
+        severity = "critical"
+        reasons.append("restart_storm")
+    elif cooldown_active and mode != "healthy":
+        mode = "cooldown"
+
+    restart_candidate = False
+    can_restart = False
+    restart_reason = "no-actionable-streak"
+    restart_blocked_reasons: List[str] = []
+    gateway = snapshot.get("gateway") or {}
+    hard_fault_candidate = hot(streaks, "gateway_service_down") or hot(streaks, "gateway_port_down") or hot(streaks, "gateway_health_endpoint_failed")
+    if hard_fault_candidate:
+        restart_candidate = True
+        restart_reason = "gateway-basic-health-failed"
+    if not restart_candidate and not restart_storm and not cooldown_active and not gateway.get("startupGraceActive"):
+        if SOFT_GATEWAY_RESTART_ENABLED:
+            for key in keys:
+                if key.startswith("telegram_") and key.endswith("_consumer_lag") and hot(streaks, key):
+                    restart_candidate = True
+                    restart_reason = key
+                    break
+            if not restart_candidate and hot(streaks, "session_problem_backlog") and (
+                hot(streaks, "gateway_resource_saturation")
+                or hot(streaks, "gateway_resource_pressure")
+                or hot(streaks, "gateway_child_accumulation")
+            ):
+                restart_candidate = True
+                restart_reason = "stuck-sessions-with-resource-pressure"
+            if not restart_candidate and hot(streaks, "cron_audit_high_findings") and hot(streaks, "session_problem_backlog"):
+                restart_candidate = True
+                restart_reason = "cron-and-session-pressure"
+        if not restart_candidate and SOFT_RESCUE_RESTART_ENABLED:
+            resource_exhausted = (
+                sustained(streaks, "gateway_resource_saturation", SOFT_RESCUE_STREAK_THRESHOLD)
+                or sustained(streaks, "gateway_swap_saturation", SOFT_RESCUE_STREAK_THRESHOLD)
+                or sustained(streaks, "disk_pressure", SOFT_RESCUE_STREAK_THRESHOLD)
+            )
+            cron_blocked = (
+                sustained(streaks, "cron_stale_running_state", SOFT_RESCUE_STREAK_THRESHOLD)
+                or sustained(streaks, "cron_expired_leases", SOFT_RESCUE_STREAK_THRESHOLD)
+                or sustained(streaks, "cron_heartbeat_unhealthy", SOFT_RESCUE_STREAK_THRESHOLD)
+                or sustained(streaks, "cron_audit_high_findings", SOFT_RESCUE_STREAK_THRESHOLD)
+            )
+            session_blocked = sustained(streaks, "session_problem_backlog", SOFT_RESCUE_STREAK_THRESHOLD)
+            runtime_blocked = cron_blocked and session_blocked
+            gateway_congested = sustained(streaks, "gateway_congestion_logs", SOFT_RESCUE_STREAK_THRESHOLD)
+            channel_blocked = any(
+                key.startswith("telegram_")
+                and key.endswith("_consumer_lag")
+                and sustained(streaks, key, SOFT_RESCUE_STREAK_THRESHOLD)
+                for key in keys
+            )
+            provider_broken = (
+                sustained(streaks, "telegram_provider_network_errors", SOFT_RESCUE_STREAK_THRESHOLD)
+                or sustained(streaks, "telegram_channel_restart_limited", SOFT_RESCUE_STREAK_THRESHOLD)
+                or sustained(streaks, "telegram_channel_restart_churn", SOFT_RESCUE_STREAK_THRESHOLD)
+            )
+            if severity == "critical" and (
+                (runtime_blocked and (resource_exhausted or gateway_congested))
+                or (channel_blocked and resource_exhausted)
+                or (provider_broken and channel_blocked and gateway_congested)
+            ):
+                restart_candidate = True
+                restart_reason = "soft-pressure-rescue"
+    if restart_storm:
+        restart_blocked_reasons.append("restart-storm")
+    elif cooldown_active:
+        restart_blocked_reasons.append("cooldown")
+    elif gateway.get("startupGraceActive"):
+        restart_blocked_reasons.append("startup-grace")
+
+    if restart_candidate and not GATEWAY_RESTART_ENABLED:
+        restart_blocked_reasons.append("restart-actuator-disabled")
+    can_restart = bool(restart_candidate and GATEWAY_RESTART_ENABLED and not restart_blocked_reasons)
+
+    can_mutate_cron = CRON_MUTATION_ENABLED and not restart_storm and not can_restart and mode not in {"gateway-unreachable", "channel-stalled", "resource-pressure", "restart-storm"}
+    can_reset_session = SESSION_RESET_ENABLED and not restart_storm and mode not in {"gateway-unreachable", "resource-pressure", "restart-storm"}
+    should_pause_cron = mode in {"channel-stalled", "delivery-failing", "cron-congested", "hermers-unavailable", "hermers-degraded", "resource-pressure", "cooldown", "restart-storm"}
+    should_defer_control_plane_heavy = mode in {"cooldown", "cron-congested", "resource-pressure", "restart-storm"} or (
+        severity == "critical" and "session_problem_backlog" in keys
+    )
+    control_plane_defer_until = 0
+    if should_defer_control_plane_heavy:
+        control_plane_defer_until = max(cooldown_until if cooldown_active else 0, now_s + CONTROL_PLANE_BACKPRESSURE_SECONDS)
+    gateway_unavailable = mode == "gateway-unreachable" or not gateway.get("active") or not gateway.get("portOk")
+    resource_pressure = bool({"gateway_resource_saturation", "gateway_swap_saturation", "disk_pressure"} & keys) or mode == "resource-pressure"
+    recovery = update_lane_recovery(
+        conn,
+        now_s,
+        {
+            "cron": bool({"cron_stale_running_state", "cron_expired_leases", "gateway_congestion_logs", "cron_heartbeat_unhealthy"} & keys) or gateway_unavailable,
+            "session": "session_problem_backlog" in keys,
+            "channel": bool(
+                {"telegram_provider_network_errors", "telegram_channel_restart_limited", "telegram_channel_restart_churn"} & keys
+            ) or any(k.endswith("_consumer_lag") or k.endswith("_consumer_lag_warn") for k in keys),
+            "hermers": bool(
+                {
+                    "hermers_gateway_service_down",
+                    "hermers_acp_orphan_workers",
+                    "hermers_runtime_failure_burst",
+                    "hermers_stale_sent_dispatches",
+                } & keys
+            ),
+            "resource": resource_pressure,
+        },
+    )
+    lanes = build_lane_policy(
+        now_s=now_s,
+        mode=mode,
+        severity=severity,
+        keys=keys,
+        streaks=streaks,
+        gateway=gateway,
+        can_mutate_cron=bool(can_mutate_cron),
+        can_reset_session=bool(can_reset_session),
+        should_pause_cron=bool(should_pause_cron),
+        should_defer_control_plane_heavy=bool(should_defer_control_plane_heavy),
+        control_plane_defer_until=control_plane_defer_until,
+        restart_storm=bool(restart_storm),
+        cooldown_active=bool(cooldown_active),
+        recovery=recovery,
+    )
+    policy = {
+        "schemaVersion": 1,
+        "updatedAt": ts(),
+        "updatedAtEpoch": now_s,
+        "validUntilEpoch": now_s + POLICY_TTL_SECONDS,
+        "mode": mode,
+        "severity": severity,
+        "canMutateCronState": bool(can_mutate_cron),
+        "canResetSession": bool(can_reset_session),
+        "gatewayRestartEnabled": bool(GATEWAY_RESTART_ENABLED),
+        "restartCandidate": bool(restart_candidate),
+        "restartBlockedReasons": restart_blocked_reasons,
+        "restartBlockedReason": ",".join(restart_blocked_reasons),
+        "canRestartGateway": bool(can_restart),
+        "canRunBulkCron": mode == "healthy" and severity in {"ok", "info"},
+        "shouldPauseNonCriticalCron": bool(should_pause_cron),
+        "deferControlPlaneHeavyReports": bool(should_defer_control_plane_heavy),
+        "controlPlaneBackpressureUntilEpoch": control_plane_defer_until,
+        "cooldownUntilEpoch": cooldown_until if cooldown_active else 0,
+        "restartReason": restart_reason,
+        "softRescueRestartEnabled": bool(SOFT_RESCUE_RESTART_ENABLED),
+        "softRescueStreakThreshold": SOFT_RESCUE_STREAK_THRESHOLD,
+        "restartStorm": bool(restart_storm),
+        "restartStormClearsAtEpoch": restart_storm_clears_at,
+        "recentRestartCount": len(restart_history),
+        "restartHistorySource": "cat-agents-stabilityd-owned-restarts-only",
+        "restartWindowSeconds": RESTART_WINDOW_SECONDS,
+        "maxRestarts": MAX_RESTARTS_PER_WINDOW,
+        "lanes": lanes,
+        "reasons": sorted(set(reasons)),
+    }
+    return policy
+
+
+def control_plane_backpressure(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
+    active = bool(policy.get("deferControlPlaneHeavyReports"))
+    jobs = load_jobs()
+    job_lookup = {job_id: job for job_id, job in job_items(jobs)}
+    heavy_jobs = []
+    for job_id in sorted(CONTROL_PLANE_HEAVY_JOB_IDS):
+        job = job_lookup.get(job_id) or {}
+        heavy_jobs.append(
+            {
+                "jobId": job_id,
+                "name": job.get("name") or job_id,
+                "agentId": job.get("agentId"),
+                "enabled": job.get("enabled") is not False,
+                "timeoutSeconds": ((job.get("payload") or {}).get("timeoutSeconds") if isinstance(job.get("payload"), dict) else None),
+                "action": "defer-heavy-report" if active else "run-normally",
+            }
+        )
+    heartbeat_jobs = []
+    for job_id in sorted(CONTROL_PLANE_HEARTBEAT_JOB_IDS):
+        job = job_lookup.get(job_id) or {}
+        heartbeat_jobs.append(
+            {
+                "jobId": job_id,
+                "name": job.get("name") or job_id,
+                "agentId": job.get("agentId"),
+                "enabled": job.get("enabled") is not False,
+                "action": "run-normally",
+            }
+        )
+    payload = {
+        "schemaVersion": 1,
+        "updatedAt": ts(),
+        "updatedAtEpoch": epoch(),
+        "active": active,
+        "mode": policy.get("mode"),
+        "severity": policy.get("severity"),
+        "deferHeavyReports": active,
+        "deferUntilEpoch": int(policy.get("controlPlaneBackpressureUntilEpoch") or 0),
+        "reasons": policy.get("reasons") or [],
+        "heavyReportJobs": heavy_jobs,
+        "heartbeatJobs": heartbeat_jobs,
+        "directSessionKeys": sorted(CONTROL_PLANE_DIRECT_SESSION_KEYS),
+        "directSessionAction": "protect-priority",
+        "instruction": (
+            "When active, control-plane heavy reports should write a short deferred note and exit. "
+            "Heartbeat jobs and direct sessions are not deferred."
+        ),
+    }
+    return payload
+
+
+def clear_stale_running_state(data: Dict[str, Any], stale: List[Dict[str, Any]]) -> int:
+    stale_ids = {item["jobId"] for item in stale}
+    changed = 0
+    for job_id, job in job_items(data):
+        if job_id not in stale_ids:
+            continue
+        if "runningAtMs" in job:
+            job.pop("runningAtMs", None)
+            changed += 1
+        state = job.get("state")
+        if isinstance(state, dict) and "runningAtMs" in state:
+            state.pop("runningAtMs", None)
+            changed += 1
+        job["lastRecoveredAtMs"] = now_ms()
+        job["lastRecoveryReason"] = "stale_running_state"
+    return changed
+
+
+def snapshot_jobs() -> Optional[str]:
+    if not JOBS_PATH.exists():
+        return None
+    snapshot_dir = CRON_DIR / "snapshots" / "jobs"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    dest = snapshot_dir / f"jobs.before-stabilityd-{stamp}.json"
+    shutil.copy2(JOBS_PATH, dest)
+    return str(dest)
+
+
+def cleanup_stale_tmp_files() -> List[str]:
+    removed = []
+    cutoff = time.time() - TMP_FILE_MAX_AGE_SECONDS
+    for path in JOBS_PATH.parent.glob("jobs.json.*.tmp"):
+        try:
+            if path.stat().st_mtime >= cutoff:
+                continue
+            path.unlink(missing_ok=True)
+            removed.append(str(path))
+        except Exception:
+            continue
+    return removed
+
+
+def build_repair_gate_from_policy(policy: Dict[str, Any]) -> Dict[str, Any]:
+    can_mutate = bool(policy.get("canMutateCronState"))
+    blocked = []
+    if not can_mutate:
+        blocked.append(str(policy.get("mode") or "cron-mutation-disabled"))
+    if policy.get("restartBlockedReasons"):
+        blocked.extend(str(item) for item in policy.get("restartBlockedReasons") or [])
+    return {
+        "status": "ready" if can_mutate else "blocked",
+        "reason": "normal" if can_mutate else ",".join(sorted(set(blocked))) or "cron-mutation-blocked",
+        "observedAt": ts(),
+        "policyUpdatedAt": policy.get("updatedAt"),
+        "policyValidUntilEpoch": policy.get("validUntilEpoch"),
+    }
+
+
+def enqueue_repair_request(
+    job_id: str,
+    reason: str,
+    source: str,
+    run_id: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
+    gate: Optional[Dict[str, Any]] = None,
+) -> str:
+    safe_reason = reason.replace("/", "-").replace(" ", "-")
+    path = REPAIR_PENDING_DIR / f"{job_id}__{safe_reason}.json"
+    current_ms = now_ms()
+    existing = load_json(path, {}) if path.exists() else {}
+    active_gate = gate or {}
+    payload = {
+        "jobId": job_id,
+        "runId": run_id,
+        "reason": reason,
+        "source": source,
+        "status": "pending",
+        "queueState": active_gate.get("status") or "ready",
+        "firstDetectedAtMs": int(existing.get("firstDetectedAtMs", current_ms)) if isinstance(existing, dict) else current_ms,
+        "lastDetectedAtMs": current_ms,
+        "count": int(existing.get("count", 0)) + 1 if isinstance(existing, dict) else 1,
+        "details": details or {},
+        "gate": active_gate,
+    }
+    write_json_atomic(path, payload)
+    return str(path)
+
+
+def update_repair_queue_status(policy: Dict[str, Any]) -> Dict[str, Any]:
+    gate = build_repair_gate_from_policy(policy)
+    pending = 0
+    blocked = 0
+    ready = 0
+    updated = 0
+    for request_path in sorted(REPAIR_PENDING_DIR.glob("*.json")):
+        pending += 1
+        payload = load_json(request_path, {}) or {}
+        if not isinstance(payload, dict):
+            continue
+        payload["queueState"] = gate["status"]
+        payload["gate"] = gate
+        write_json_atomic(request_path, payload)
+        updated += 1
+        if gate["status"] == "ready":
+            ready += 1
+        else:
+            blocked += 1
+    summary = {
+        "updatedAt": ts(),
+        "updatedAtEpoch": epoch(),
+        "queueMode": gate["status"],
+        "reason": gate["reason"],
+        "pendingCount": pending,
+        "readyCount": ready,
+        "blockedCount": blocked,
+        "processedCount": len(list(REPAIR_PROCESSED_DIR.glob("*.json"))),
+        "updatedPendingEntries": updated,
+        "policyUpdatedAt": policy.get("updatedAt"),
+    }
+    write_json_atomic(REPAIR_STATUS_PATH, summary)
+    return summary
+
+
+def cron_actuate(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
+    actions: List[Dict[str, Any]] = []
+    removed_tmp = cleanup_stale_tmp_files()
+    if removed_tmp:
+        actions.append({"action": "cleanup_stale_tmp_files", "result": "ok", "removed": removed_tmp})
+    repair_queue = update_repair_queue_status(policy)
+    if repair_queue.get("pendingCount") or repair_queue.get("updatedPendingEntries"):
+        actions.append({"action": "update_repair_queue_status", "result": "ok", "repairQueue": repair_queue})
+    if not policy.get("canMutateCronState"):
+        return actions
+    cron = snapshot.get("cron") or {}
+    data = load_jobs()
+    stale = cron.get("staleRunning") or []
+    gate = build_repair_gate_from_policy(policy)
+    if stale:
+        snap_path = snapshot_jobs()
+        changed = clear_stale_running_state(data, stale)
+        if changed:
+            write_json_atomic(JOBS_PATH, data)
+            repair_paths = []
+            for item in stale:
+                repair_paths.append(
+                    enqueue_repair_request(
+                        str(item["jobId"]),
+                        "stale_running_state",
+                        "cat-agents-stabilityd",
+                        details={"ageMs": item.get("ageMs"), "thresholdMs": item.get("thresholdMs")},
+                        gate=gate,
+                    )
+                )
+            actions.append(
+                {
+                    "action": "clear_stale_running_state",
+                    "result": "ok",
+                    "changed": changed,
+                    "snapshotPath": snap_path,
+                    "repairRequests": repair_paths,
+                }
+            )
+    if LEASE_REAP_ENABLED:
+        reaped = []
+        for item in cron.get("expiredLeases") or []:
+            lease_path = Path(str(item.get("path") or ""))
+            run_id = item.get("runId")
+            job_id = item.get("jobId")
+            if not lease_path.exists() or not job_id:
+                continue
+            run_path = RUNS_BY_RUN_DIR / f"{run_id}.json" if run_id else None
+            if run_path and run_path.exists():
+                run_record = load_json(run_path, {}) or {}
+                if run_record.get("status") == "running":
+                    finished = now_ms()
+                    started = int(run_record.get("startedAtMs", finished) or finished)
+                    run_record["status"] = "orphaned"
+                    run_record["finishedAtMs"] = finished
+                    run_record["durationMs"] = max(0, finished - started)
+                    run_record["failure"] = {"class": "lease_expired", "message": "Lease expired without completion update."}
+                    run_record["result"] = None
+                    write_json_atomic(run_path, run_record)
+                    append_jsonl(
+                        RUNS_BY_JOB_DIR / f"{job_id}.jsonl",
+                        {
+                            "ts": finished,
+                            "jobId": job_id,
+                            "runId": run_id,
+                            "action": "orphan-reaped",
+                            "status": "orphaned",
+                            "durationMs": run_record["durationMs"],
+                        },
+                    )
+            with contextlib.suppress(Exception):
+                lease_path.unlink(missing_ok=True)
+            repair = enqueue_repair_request(str(job_id), "lease_expired", "cat-agents-stabilityd", run_id=str(run_id) if run_id else None, gate=gate)
+            reaped.append({"jobId": job_id, "runId": run_id, "leasePath": str(lease_path), "repairRequestPath": repair})
+        if reaped:
+            actions.append({"action": "reap_expired_leases", "result": "ok", "reaped": reaped})
+    return actions
+
+
+def reset_session(session_key: str, reason: str, conn: sqlite3.Connection) -> Dict[str, Any]:
+    last_key = f"session_reset:{session_key}"
+    last_reset = int(db_get(conn, last_key, 0) or 0)
+    if last_reset and epoch() - last_reset < SESSION_RESET_COOLDOWN_SECONDS:
+        return {"sessionKey": session_key, "result": "cooldown_skip", "reason": reason}
+    for store_path in iter_session_store_paths():
+        store = load_json(store_path, {})
+        if not isinstance(store, dict) or session_key not in store:
+            continue
+        entry = store.get(session_key)
+        if not isinstance(entry, dict):
+            return {"sessionKey": session_key, "result": "invalid_entry", "storePath": str(store_path)}
+        session_id = entry.get("sessionId")
+        if not session_id:
+            return {"sessionKey": session_key, "result": "missing_session_id", "storePath": str(store_path)}
+        activity = analyze_session_activity(entry)
+        if activity.get("heavy"):
+            return {"sessionKey": session_key, "result": "heavy_task_skip", "activity": activity, "storePath": str(store_path), "sessionId": session_id}
+        if activity.get("active"):
+            return {"sessionKey": session_key, "result": "active_skip", "activity": activity, "storePath": str(store_path), "sessionId": session_id}
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        backup_dir = store_path.parent / "manual-backups"
+        backup_dir.mkdir(exist_ok=True)
+        shutil.copy2(store_path, backup_dir / f"sessions.json.before-stabilityd-{session_id}-{stamp}.bak")
+        for path in store_path.parent.glob(f"{session_id}*"):
+            if path.is_file():
+                shutil.copy2(path, backup_dir / f"{path.name}.before-stabilityd-{stamp}.bak")
+        store.pop(session_key, None)
+        write_json_atomic(store_path, store)
+        archived = []
+        for path in list(store_path.parent.glob(f"{session_id}*")):
+            if not path.is_file():
+                continue
+            new_path = path.with_name(path.name + f".stabilityd-reset-{stamp}")
+            path.rename(new_path)
+            archived.append(str(new_path))
+        db_set(conn, last_key, epoch())
+        return {
+            "sessionKey": session_key,
+            "result": "reset",
+            "reason": reason,
+            "storePath": str(store_path),
+            "sessionId": session_id,
+            "archivedFiles": archived,
+        }
+    db_set(conn, last_key, epoch())
+    return {"sessionKey": session_key, "result": "not_found", "reason": reason}
+
+
+def session_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
+    actions: List[Dict[str, Any]] = []
+    if not policy.get("canResetSession"):
+        return actions
+    candidates = (snapshot.get("session") or {}).get("resetCandidates") or []
+    results = []
+    for item in candidates[:10]:
+        session_key = str(item.get("sessionKey") or "")
+        if not session_key:
+            continue
+        last_key = f"session_reset:{session_key}"
+        last_seen = int(db_get(conn, last_key, 0) or 0)
+        if last_seen and epoch() - last_seen < SESSION_RESET_COOLDOWN_SECONDS:
+            continue
+        reason = "context_overflow" if int(item.get("overflowCount") or 0) >= SESSION_OVERFLOW_THRESHOLD else "repeated_failures"
+        results.append(reset_session(session_key, reason, conn))
+    if results:
+        actions.append({"action": "reset_unhealthy_sessions", "result": "ok", "results": results})
+    return actions
+
+
+def gateway_restart(conn: sqlite3.Connection, reason: str) -> Dict[str, Any]:
+    action_id = f"gateway-restart-{int(time.time())}"
+    started = time.time()
+    cmd = ["sudo", "-n", "systemctl", "restart", "openclaw-gateway.service"]
+    try:
+        proc = run_cmd(cmd, timeout=60)
+        duration = int((time.time() - started) * 1000)
+        result = "ok" if proc.returncode == 0 else "failed"
+        payload = {
+            "actionId": action_id,
+            "ts": ts(),
+            "tsEpoch": epoch(),
+            "source": "cat-agents-stabilityd",
+            "component": "gateway",
+            "action": "restart_gateway",
+            "result": result,
+            "reason": reason,
+            "exitCode": proc.returncode,
+            "durationMs": duration,
+            "stderr": proc.stderr[-1200:],
+        }
+        if proc.returncode == 0:
+            record_restart_time(conn)
+        return payload
+    except Exception as exc:
+        return {
+            "actionId": action_id,
+            "ts": ts(),
+            "tsEpoch": epoch(),
+            "source": "cat-agents-stabilityd",
+            "component": "gateway",
+            "action": "restart_gateway",
+            "result": "failed",
+            "reason": reason,
+            "exitCode": -1,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def hermers_actuate(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
+    actions: List[Dict[str, Any]] = []
+    hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
+    if not HERMERS_ACP_ORPHAN_REAP_ENABLED:
+        return actions
+    workers = hermers.get("orphanAcpWorkers") if isinstance(hermers.get("orphanAcpWorkers"), list) else []
+    killed = []
+    for item in workers[:20]:
+        try:
+            pid = int(item.get("pid") or 0)
+        except Exception:
+            pid = 0
+        if pid <= 1:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append({"pid": pid, "profile": item.get("profile"), "ageSeconds": item.get("ageSeconds"), "signal": "SIGTERM"})
+        except ProcessLookupError:
+            killed.append({"pid": pid, "profile": item.get("profile"), "result": "already_exited"})
+        except Exception as exc:
+            killed.append({"pid": pid, "profile": item.get("profile"), "result": "failed", "error": f"{type(exc).__name__}: {exc}"})
+    if killed:
+        actions.append({"action": "reap_hermers_acp_orphan_workers", "result": "ok", "workers": killed})
+    return actions
+
+
+def actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str, Any], no_action: bool = False) -> List[Dict[str, Any]]:
+    actions: List[Dict[str, Any]] = []
+    if no_action:
+        return [{"action": "none", "result": "dry_run", "reason": "no_action"}]
+    for action in cron_actuate(snapshot, policy):
+        action.update({"actionId": f"{action['action']}-{int(time.time() * 1000)}", "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd", "component": "cron"})
+        actions.append(action)
+    for action in session_actuate(conn, snapshot, policy):
+        action.update({"actionId": f"{action['action']}-{int(time.time() * 1000)}", "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd", "component": "session"})
+        actions.append(action)
+    for action in hermers_actuate(snapshot, policy):
+        action.update({"actionId": f"{action['action']}-{int(time.time() * 1000)}", "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd", "component": "hermers"})
+        actions.append(action)
+    if policy.get("canRestartGateway"):
+        actions.append(gateway_restart(conn, str(policy.get("restartReason") or "policy")))
+    return actions or [{"action": "none", "result": "ok", "reason": policy.get("restartReason") or "no-action"}]
+
+
+def write_legacy_watchdog_health(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> None:
+    gateway = snapshot.get("gateway") or {}
+    control_plane = snapshot.get("controlPlane") or {}
+    payload = {
+        "updatedAt": policy.get("updatedAt"),
+        "updatedAtEpoch": policy.get("updatedAtEpoch"),
+        "mode": policy.get("mode"),
+        "reason": ",".join(policy.get("reasons") or []) or policy.get("restartReason") or policy.get("mode"),
+        "needsRestart": bool(policy.get("canRestartGateway")),
+        "restartAllowed": bool(policy.get("canRestartGateway")),
+        "recentRestarts": policy.get("recentRestartCount"),
+        "lastRestartAtEpoch": int(policy.get("cooldownUntilEpoch") or 0) - RESTART_COOLDOWN_SECONDS if policy.get("cooldownUntilEpoch") else 0,
+        "restartWindowSeconds": RESTART_WINDOW_SECONDS,
+        "maxRestarts": MAX_RESTARTS_PER_WINDOW,
+        "startupGraceSeconds": STARTUP_GRACE_SECONDS,
+        "startupGraceActive": bool(gateway.get("startupGraceActive")),
+        "isRunning": bool(gateway.get("active")),
+        "hasListener": bool(gateway.get("portOk")),
+        "tcpProbeOk": bool(gateway.get("portOk")),
+        "healthOk": bool(gateway.get("healthOk")),
+        "errorStorm": "gateway_congestion_logs" in set(policy.get("reasons") or []),
+        "laneCongested": "gateway_congestion_logs" in set(policy.get("reasons") or []),
+        "wsUnstable": "gateway_ws_instability" in set(policy.get("reasons") or []),
+        "canMutateCronState": bool(policy.get("canMutateCronState")),
+        "canRunBulkJobs": bool(policy.get("canRunBulkCron")),
+        "shouldPauseCron": bool(policy.get("shouldPauseNonCriticalCron")),
+        "deferControlPlaneHeavyReports": bool(policy.get("deferControlPlaneHeavyReports")),
+        "controlPlaneBackpressureUntilEpoch": int(policy.get("controlPlaneBackpressureUntilEpoch") or 0),
+        "controlPlaneBackpressureActive": bool(control_plane.get("active")),
+        "source": "cat-agents-stabilityd",
+    }
+    write_json_atomic(LEGACY_WATCHDOG_HEALTH, payload)
+
+
+def collect_snapshot(conn: sqlite3.Connection) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
+    findings: List[Dict[str, Any]] = []
+    snapshot: Dict[str, Any] = {
+        "schemaVersion": 1,
+        "checkedAt": ts(),
+        "checkedAtEpoch": epoch(),
+    }
+    snapshot["gateway"] = gateway_collect(findings)
+    snapshot["cron"] = cron_collect(findings)
+    snapshot["session"] = session_collect(findings)
+    snapshot["channel"] = channel_collect(findings)
+    snapshot["hermers"] = hermers_collect(findings)
+    snapshot["resource"] = resource_collect(findings)
+    snapshot["config"] = config_collect(findings)
+    snapshot["trends"] = update_runtime_trends(conn, snapshot, findings)
+    findings.sort(key=lambda item: (-SEVERITY_RANK.get(str(item.get("severity")), 0), str(item.get("component")), str(item.get("key"))))
+    snapshot["findings"] = findings
+    snapshot["severity"] = max_severity(findings)
+    streaks = update_streaks(conn, findings)
+    snapshot["streaks"] = streaks
+    policy = policy_from_findings(conn, findings, snapshot, streaks)
+    snapshot["policy"] = policy
+    return snapshot, findings, policy
+
+
+def run_once(conn: sqlite3.Connection, no_action: bool = False) -> Dict[str, Any]:
+    ensure_dirs()
+    snapshot, findings, policy = collect_snapshot(conn)
+    snapshot["controlPlane"] = control_plane_backpressure(snapshot, policy)
+    actions = actuate(conn, snapshot, policy, no_action=no_action)
+    snapshot["actions"] = actions
+    snapshot["completedAt"] = ts()
+    snapshot["completedAtEpoch"] = epoch()
+    write_json_atomic(POLICY_PATH, policy)
+    write_json_atomic(LATEST_PATH, snapshot)
+    write_json_atomic(LANE_POLICY_PATH, policy.get("lanes") or {})
+    write_json_atomic(CONTROL_PLANE_BACKPRESSURE_PATH, snapshot["controlPlane"])
+    write_legacy_watchdog_health(snapshot, policy)
+    for finding in findings:
+        if SEVERITY_RANK.get(str(finding.get("severity")), 0) >= SEVERITY_RANK["high"]:
+            event_key = f"event:{finding.get('key')}"
+            last_event_at = int(db_get(conn, event_key, 0) or 0)
+            if last_event_at and snapshot["checkedAtEpoch"] - last_event_at < 300:
+                continue
+            event = {
+                "ts": snapshot["checkedAt"],
+                "tsEpoch": snapshot["checkedAtEpoch"],
+                "source": "cat-agents-stabilityd",
+                "component": finding.get("component"),
+                "severity": finding.get("severity"),
+                "key": finding.get("key"),
+                "message": finding.get("message"),
+                "policyMode": policy.get("mode"),
+                "evidence": {k: v for k, v in finding.items() if k not in {"key", "severity", "component", "message"}},
+            }
+            db_record_event(conn, event)
+            db_set(conn, event_key, snapshot["checkedAtEpoch"])
+    for action in actions:
+        db_record_action(conn, action)
+    log_line(
+        "severity={} mode={} findings={} actions={}".format(
+            snapshot.get("severity"),
+            policy.get("mode"),
+            len(findings),
+            ",".join(str(a.get("action")) for a in actions),
+        )
+    )
+    return snapshot
+
+
+class StopSignal(Exception):
+    pass
+
+
+def daemon_loop(no_action: bool = False) -> int:
+    ensure_dirs()
+    lock_fh = LOCK_PATH.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EAGAIN):
+            print("cat-agents-stabilityd is already running", file=sys.stderr)
+            return 1
+        raise
+
+    stopping = {"value": False}
+
+    def handle_signal(_signum: int, _frame: Any) -> None:
+        stopping["value"] = True
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    conn = init_db()
+    log_line(f"daemon started interval={INTERVAL_SECONDS}s no_action={no_action}")
+    while not stopping["value"]:
+        started = time.time()
+        try:
+            run_once(conn, no_action=no_action)
+        except Exception as exc:
+            err = {
+                "ts": ts(),
+                "tsEpoch": epoch(),
+                "source": "cat-agents-stabilityd",
+                "component": "daemon",
+                "severity": "critical",
+                "key": "stabilityd_loop_error",
+                "message": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc()[-4000:],
+            }
+            db_record_event(conn, err)
+            log_line(f"loop_error {type(exc).__name__}: {exc}")
+        elapsed = time.time() - started
+        sleep_for = max(1, INTERVAL_SECONDS - elapsed)
+        end = time.time() + sleep_for
+        while time.time() < end and not stopping["value"]:
+            time.sleep(min(1, end - time.time()))
+    log_line("daemon stopped")
+    return 0
+
+
+def read_json_or_empty(path: Path) -> Any:
+    return load_json(path, {})
+
+
+def print_json(payload: Any) -> int:
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def tail_jsonl(path: Path, limit: int = 20) -> List[Any]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    except Exception:
+        return []
+    out = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            out.append({"raw": line})
+    return out
+
+
+def runbook() -> Dict[str, Any]:
+    latest = load_json(LATEST_PATH, {}) or {}
+    policy = load_json(POLICY_PATH, {}) or {}
+    lanes = load_json(LANE_POLICY_PATH, {}) or policy.get("lanes") or {}
+    findings = latest.get("findings") or []
+    commands = [
+        "systemctl status cat-agents-stabilityd.service --no-pager",
+        "systemctl status openclaw-gateway.service --no-pager",
+        "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability status",
+        "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability lanes",
+        "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability findings",
+        "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability actions --limit 20",
+        "tail -n 100 /home/flashcat/.openclaw/stability/events.jsonl",
+    ]
+    if policy.get("mode") == "restart-storm":
+        commands.insert(0, "systemctl cat cat-agents-stabilityd.service")
+    return {
+        "generatedAt": ts(),
+        "mode": policy.get("mode"),
+        "severity": policy.get("severity"),
+        "policy": policy,
+        "lanes": lanes,
+        "topFindings": findings[:10],
+        "recommendedCommands": commands,
+        "rollback": [
+            "sudo systemctl disable --now cat-agents-stabilityd.service",
+            "sudo systemctl enable --now openclaw-gateway-watchdog.service",
+            "sudo systemctl enable --now openclaw-cron-guard.timer",
+            "sudo systemctl enable --now openclaw-session-guard.timer",
+            "sudo systemctl enable --now openclaw-health-controller.timer",
+        ],
+    }
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Cat agents stability control plane")
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("daemon")
+    once_p = sub.add_parser("once")
+    once_p.add_argument("--no-action", action="store_true")
+    sub.add_parser("status")
+    sub.add_parser("snapshot")
+    sub.add_parser("policy")
+    sub.add_parser("lanes")
+    sub.add_parser("findings")
+    actions_p = sub.add_parser("actions")
+    actions_p.add_argument("--limit", type=int, default=20)
+    sub.add_parser("events")
+    sub.add_parser("runbook")
+    doctor_p = sub.add_parser("doctor")
+    doctor_p.add_argument("--no-action", action="store_true")
+    repair_p = sub.add_parser("repair")
+    repair_p.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+
+    cmd = args.cmd or "status"
+    if cmd == "daemon":
+        return daemon_loop(no_action=False)
+    if cmd == "once":
+        conn = init_db()
+        return print_json(run_once(conn, no_action=args.no_action))
+    if cmd == "status":
+        latest = load_json(LATEST_PATH, {}) or {}
+        policy = load_json(POLICY_PATH, {}) or {}
+        return print_json(
+            {
+                "checkedAt": latest.get("checkedAt"),
+                "completedAt": latest.get("completedAt"),
+                "severity": latest.get("severity"),
+                "mode": policy.get("mode"),
+                "policyAgeSeconds": file_age_seconds(POLICY_PATH),
+                "findingCount": len(latest.get("findings") or []),
+                "lastActions": latest.get("actions"),
+            }
+        )
+    if cmd == "snapshot":
+        return print_json(read_json_or_empty(LATEST_PATH))
+    if cmd == "policy":
+        return print_json(read_json_or_empty(POLICY_PATH))
+    if cmd == "lanes":
+        lanes = load_json(LANE_POLICY_PATH, {}) or (load_json(POLICY_PATH, {}) or {}).get("lanes") or {}
+        return print_json(lanes)
+    if cmd == "findings":
+        latest = load_json(LATEST_PATH, {}) or {}
+        return print_json(latest.get("findings") or [])
+    if cmd == "actions":
+        return print_json(tail_jsonl(ACTIONS_JSONL, limit=args.limit))
+    if cmd == "events":
+        return print_json(tail_jsonl(EVENTS_JSONL, limit=50))
+    if cmd == "runbook":
+        return print_json(runbook())
+    if cmd == "doctor":
+        conn = init_db()
+        snap = run_once(conn, no_action=args.no_action)
+        return print_json({"severity": snap.get("severity"), "policy": snap.get("policy"), "findings": snap.get("findings"), "actions": snap.get("actions")})
+    if cmd == "repair":
+        conn = init_db()
+        snap = run_once(conn, no_action=args.dry_run)
+        return print_json({"dryRun": args.dry_run, "actions": snap.get("actions"), "policy": snap.get("policy")})
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

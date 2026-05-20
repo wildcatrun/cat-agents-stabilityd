@@ -1,0 +1,23 @@
+[Unit]
+Description=Cat Agents Stability Control Plane
+After=network-online.target openclaw-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flashcat
+Group=flashcat
+WorkingDirectory=/home/flashcat
+Environment=OPENCLAW_GATEWAY_PORT=23466
+Environment=CAT_AGENTS_STABILITY_INTERVAL_SECONDS=30
+Environment=OPENCLAW_STABILITY_INTERVAL_SECONDS=30
+Environment=OPENCLAW_STABILITY_RESTART_GATEWAY=0
+ExecStart=/usr/bin/python3 /home/flashcat/cat-agents-stabilityd/bin/cat_agents_stabilityd.py daemon
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
