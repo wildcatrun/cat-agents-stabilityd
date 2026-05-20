@@ -41,4 +41,3 @@ Allowed repair path examples:
 npm run check
 npm run smoke:mcp
 ```
-
