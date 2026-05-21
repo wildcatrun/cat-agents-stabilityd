@@ -37,6 +37,30 @@ function boolConfig(value, fallback = false) {
   return Boolean(value);
 }
 
+function configList(value, fallback = []) {
+  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
+  if (typeof value === "string") return value.split(",").map((item) => item.trim()).filter(Boolean);
+  return fallback;
+}
+
+function normalizeAgentId(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function configuredAgentSet(api, key, fallback = []) {
+  const accessConfig = objectConfig(pluginConfig(api).toolAccess);
+  return new Set(configList(accessConfig[key] ?? pluginConfig(api)[key], fallback).map(normalizeAgentId));
+}
+
+function stabilityToolMode(api, toolContext = {}) {
+  const agentId = normalizeAgentId(toolContext.agentId);
+  const disabledAgents = configuredAgentSet(api, "disabledAgents", []);
+  if (disabledAgents.has(agentId)) return "disabled";
+  const fullAgents = configuredAgentSet(api, "fullAgents", ["main"]);
+  if (fullAgents.has(agentId)) return "full";
+  return "probe_only";
+}
+
 function stabilityBin(api) {
   const configured = pluginConfig(api).stabilityBin;
   if (typeof configured === "string" && configured.trim()) return configured.trim();
@@ -110,6 +134,36 @@ const toolParameters = {
   }
 };
 
+const profileProbeParameters = {
+  type: "object",
+  additionalProperties: false,
+  properties: {}
+};
+
+async function profileProbe(api, toolContext = {}) {
+  const status = await runStability(api, ["status"]);
+  return {
+    ok: true,
+    checkedAt: new Date().toISOString(),
+    source: "openclaw_plugin",
+    agentId: toolContext.agentId || "",
+    workspaceDir: toolContext.workspaceDir || "",
+    agentDir: toolContext.agentDir || "",
+    sessionId: toolContext.sessionId || "",
+    messageChannel: toolContext.messageChannel || "",
+    agentAccountId: toolContext.agentAccountId || "",
+    senderIsOwner: Boolean(toolContext.senderIsOwner),
+    stabilityStatus: {
+      ok: status.ok,
+      severity: status.json?.severity ?? "",
+      mode: status.json?.mode ?? "",
+      findingCount: status.json?.findingCount ?? null,
+      checkedAt: status.json?.checkedAt ?? "",
+      completedAt: status.json?.completedAt ?? ""
+    }
+  };
+}
+
 export default definePluginEntry({
   id: PLUGIN_ID,
   name: "Cat Agents Stability",
@@ -127,11 +181,25 @@ export default definePluginEntry({
     }
   },
   register(api) {
-    api.registerTool({
-      name: "cat_agents_stability",
-      description: "Read cat-agents stability status, desired-state drift, findings, lane policy, runbook, and guarded doctor/repair actions.",
-      parameters: toolParameters,
-      execute: async (_id, params) => jsonText(await runStability(api, stabilityArgs(api, params || {})))
+    api.registerTool((toolContext) => {
+      const mode = stabilityToolMode(api, toolContext);
+      if (mode === "disabled") return null;
+      const profileProbeTool = {
+        name: "stability_profile_probe",
+        description: "Run a limited read-only stability probe for the active OpenClaw agent/profile without exposing global findings, drift, runbook, or repair actions.",
+        parameters: profileProbeParameters,
+        execute: async () => jsonText(await profileProbe(api, toolContext))
+      };
+      if (mode !== "full") return profileProbeTool;
+      return [
+        {
+          name: "cat_agents_stability",
+          description: "Read cat-agents stability status, desired-state drift, findings, lane policy, runbook, and guarded doctor/repair actions. Full surface is limited to configured governance agents.",
+          parameters: toolParameters,
+          execute: async (_id, params) => jsonText(await runStability(api, stabilityArgs(api, params || {})))
+        },
+        profileProbeTool
+      ];
     });
   }
 });

@@ -5,7 +5,8 @@
   "version": "0.1.0",
   "contracts": {
     "tools": [
-      "cat_agents_stability"
+      "cat_agents_stability",
+      "stability_profile_probe"
     ]
   },
   "activation": {
@@ -26,6 +27,25 @@
       "toolTimeoutMs": {
         "type": "number",
         "description": "Tool execution timeout in milliseconds. Default 30000."
+      },
+      "toolAccess": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Per-agent OpenClaw tool exposure. Full agents receive cat_agents_stability plus stability_profile_probe; all other agents receive only stability_profile_probe unless disabled.",
+        "properties": {
+          "fullAgents": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "disabledAgents": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
       }
     }
   }
