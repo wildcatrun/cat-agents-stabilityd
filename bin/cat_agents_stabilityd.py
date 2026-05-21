@@ -68,6 +68,10 @@ ACTIONS_JSONL = STABILITY_DIR / "actions.jsonl"
 STATE_DB = STABILITY_DIR / "state.db"
 LOCK_PATH = STABILITY_DIR / "stabilityd.lock"
 LOG_PATH = STABILITY_DIR / "stabilityd.log"
+RESOURCE_EVIDENCE_DIR = STABILITY_DIR / "resource-evidence"
+RESOURCE_HUMAN_GATE_DIR = STABILITY_DIR / "human-gate"
+RESOURCE_INCIDENT_DIR = STABILITY_DIR / "incidents"
+RESOURCE_INCIDENT_LATEST = RESOURCE_INCIDENT_DIR / "gateway-resource-pressure-latest.json"
 CONTROL_PLANE_BACKPRESSURE_PATH = STABILITY_DIR / "control-plane-backpressure.json"
 LANE_POLICY_PATH = STABILITY_DIR / "lane-policy.json"
 WORKFLOW_STABILITY_EVIDENCE_JSON = WORKFLOW_GOVERNANCE_LOG_DIR / "stability-evidence-latest.json"
@@ -119,6 +123,15 @@ MEMORY_WARN_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_MEMORY_WARN_GB"
 MEMORY_CRIT_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_MEMORY_CRIT_GB", "6.5")) * 1024**3)
 SWAP_WARN_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_SWAP_WARN_GB", "0.8")) * 1024**3)
 SWAP_CRIT_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_SWAP_CRIT_GB", "1.8")) * 1024**3)
+SYSTEM_MEMORY_AVAILABLE_WARN_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_SYSTEM_MEM_AVAILABLE_WARN_GB", "1.0")) * 1024**3)
+SYSTEM_MEMORY_AVAILABLE_CRIT_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_SYSTEM_MEM_AVAILABLE_CRIT_GB", "0.5")) * 1024**3)
+SYSTEM_SWAP_WARN_RATIO = float(os.environ.get("OPENCLAW_STABILITY_SYSTEM_SWAP_WARN_RATIO", "0.50"))
+SYSTEM_SWAP_CRIT_RATIO = float(os.environ.get("OPENCLAW_STABILITY_SYSTEM_SWAP_CRIT_RATIO", "0.90"))
+SYSTEM_COMMIT_WARN_RATIO = float(os.environ.get("OPENCLAW_STABILITY_SYSTEM_COMMIT_WARN_RATIO", "0.95"))
+SYSTEM_COMMIT_CRIT_RATIO = float(os.environ.get("OPENCLAW_STABILITY_SYSTEM_COMMIT_CRIT_RATIO", "1.10"))
+RESOURCE_INCIDENT_STREAK_THRESHOLD = int(os.environ.get("OPENCLAW_STABILITY_RESOURCE_INCIDENT_STREAK", "3"))
+RESOURCE_EVIDENCE_CAPTURE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_RESOURCE_EVIDENCE_SECONDS", "600"))
+RESOURCE_HUMAN_GATE_REFRESH_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_RESOURCE_HUMAN_GATE_SECONDS", "300"))
 BACKUP_HEADROOM_WARN_RATIO = float(os.environ.get("OPENCLAW_STABILITY_BACKUP_HEADROOM_WARN_RATIO", "1.20"))
 BACKUP_KEEP_COUNT = int(os.environ.get("OPENCLAW_STABILITY_BACKUP_KEEP_COUNT", "3"))
 
@@ -216,6 +229,40 @@ OVERFLOW_MARKERS = (
 IGNORED_ORPHAN_RUN_IDS = {"invalid-job-id"}
 IGNORED_ORPHAN_RUN_PREFIXES = ("test-",)
 
+RESOURCE_PRESSURE_KEYS = {
+    "gateway_resource_incident",
+    "gateway_resource_saturation",
+    "gateway_resource_pressure",
+    "gateway_swap_saturation",
+    "gateway_swap_pressure",
+    "gateway_memory_growth",
+    "system_memory_saturation",
+    "system_memory_pressure",
+    "system_swap_saturation",
+    "system_swap_pressure",
+    "system_commit_saturation",
+    "system_commit_pressure",
+    "disk_pressure",
+}
+
+RESOURCE_INCIDENT_IMMEDIATE_KEYS = {
+    "gateway_resource_saturation",
+    "gateway_swap_saturation",
+    "system_memory_saturation",
+    "system_swap_saturation",
+    "system_commit_saturation",
+    "disk_pressure",
+}
+
+RESOURCE_INCIDENT_SUSTAINED_KEYS = {
+    "gateway_resource_pressure",
+    "gateway_swap_pressure",
+    "gateway_memory_growth",
+    "system_memory_pressure",
+    "system_swap_pressure",
+    "system_commit_pressure",
+}
+
 
 def epoch() -> int:
     return int(time.time())
@@ -241,6 +288,9 @@ def ensure_dirs() -> None:
         ORPHAN_RUNS_BY_JOB_DIR,
         REPAIR_PENDING_DIR,
         REPAIR_PROCESSED_DIR,
+        RESOURCE_EVIDENCE_DIR,
+        RESOURCE_HUMAN_GATE_DIR,
+        RESOURCE_INCIDENT_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -330,6 +380,52 @@ def run_user_cmd(cmd: List[str], timeout: int = 10) -> subprocess.CompletedProce
     env = dict(os.environ)
     env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, env=env)
+
+
+def command_probe(cmd: List[str], timeout: int = 5, max_chars: int = 16_000) -> Dict[str, Any]:
+    started = time.time()
+    try:
+        proc = run_cmd(cmd, timeout=timeout)
+        duration = int((time.time() - started) * 1000)
+        return {
+            "cmd": cmd,
+            "exitCode": proc.returncode,
+            "durationMs": duration,
+            "stdout": proc.stdout[-max_chars:],
+            "stderr": proc.stderr[-max_chars:],
+        }
+    except Exception as exc:
+        duration = int((time.time() - started) * 1000)
+        return {
+            "cmd": cmd,
+            "exitCode": -1,
+            "durationMs": duration,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def meminfo_bytes() -> Dict[str, int]:
+    data: Dict[str, int] = {}
+    try:
+        text = Path("/proc/meminfo").read_text(encoding="utf-8")
+    except Exception:
+        return data
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, raw = line.split(":", 1)
+        parts = raw.strip().split()
+        if not parts:
+            continue
+        with contextlib.suppress(Exception):
+            value = int(parts[0])
+            unit = parts[1].lower() if len(parts) > 1 else "b"
+            data[key] = value * 1024 if unit == "kb" else value
+    return data
+
+
+def resource_pressure_active(keys: set[str]) -> bool:
+    return bool(RESOURCE_PRESSURE_KEYS & keys)
 
 
 def etime_seconds(value: Any) -> int:
@@ -748,6 +844,9 @@ def build_workflow_stability_evidence(snapshot: Optional[Dict[str, Any]] = None)
     desired = latest.get("desiredState") if isinstance(latest.get("desiredState"), dict) else desired_state_drift()
     findings = latest.get("findings") if isinstance(latest.get("findings"), list) else []
     actions = latest.get("actions") if isinstance(latest.get("actions"), list) else []
+    resource_human_gate = load_json(RESOURCE_HUMAN_GATE_DIR / "gateway-resource-pressure-latest.json", {}) or {}
+    current_keys = {str(item.get("key")) for item in findings if isinstance(item, dict)}
+    resource_gate_active = bool(resource_pressure_active(current_keys))
     return {
         "schemaVersion": 1,
         "generatedAt": ts(),
@@ -781,6 +880,17 @@ def build_workflow_stability_evidence(snapshot: Optional[Dict[str, Any]] = None)
         },
         "topFindings": findings[:20],
         "recentActions": actions[:20],
+        "resourceHumanGate": {
+            "active": resource_gate_active,
+            "status": resource_human_gate.get("status") if resource_gate_active else None,
+            "generatedAt": resource_human_gate.get("generatedAt"),
+            "severity": resource_human_gate.get("severity"),
+            "mode": resource_human_gate.get("mode"),
+            "triggerKeys": resource_human_gate.get("triggerKeys") or [],
+            "jsonPath": str(RESOURCE_HUMAN_GATE_DIR / "gateway-resource-pressure-latest.json"),
+            "markdownPath": str(RESOURCE_HUMAN_GATE_DIR / "gateway-resource-pressure-latest.md"),
+            "incidentPath": str(RESOURCE_INCIDENT_LATEST),
+        },
         "catBrainConsumption": {
             "agentId": "main",
             "heartbeatUse": "Read this evidence before 30min semantic governance checks and before deciding whether to ask cat_claw for Human Gate submission.",
@@ -795,6 +905,7 @@ def render_workflow_stability_evidence_md(evidence: Dict[str, Any]) -> str:
     policy = evidence.get("policy") or {}
     findings = evidence.get("topFindings") or []
     observations = desired.get("observations") or []
+    resource_gate = evidence.get("resourceHumanGate") if isinstance(evidence.get("resourceHumanGate"), dict) else {}
     lines = [
         "# Cat Agents Stability Evidence",
         "",
@@ -819,6 +930,16 @@ def render_workflow_stability_evidence_md(evidence: Dict[str, Any]) -> str:
     if observations:
         for item in observations[:20]:
             lines.append(f"- {item.get('key')}: {item.get('message')}")
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Resource Human Gate"])
+    if resource_gate.get("status"):
+        lines.append(f"- status: {resource_gate.get('status')}")
+        lines.append(f"- generatedAt: {resource_gate.get('generatedAt')}")
+        lines.append(f"- severity: {resource_gate.get('severity')}")
+        lines.append(f"- mode: {resource_gate.get('mode')}")
+        lines.append(f"- triggerKeys: {', '.join(resource_gate.get('triggerKeys') or []) or 'none'}")
+        lines.append(f"- markdownPath: {resource_gate.get('markdownPath')}")
     else:
         lines.append("- none")
     lines.extend([
@@ -2344,12 +2465,96 @@ def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
                 recommendedFreeBytes=required,
                 backupKeepCount=BACKUP_KEEP_COUNT,
             )
+    meminfo = meminfo_bytes()
+    mem_total = int(meminfo.get("MemTotal") or 0)
+    mem_available = int(meminfo.get("MemAvailable") or 0)
+    swap_total = int(meminfo.get("SwapTotal") or 0)
+    swap_free = int(meminfo.get("SwapFree") or 0)
+    swap_used = max(0, swap_total - swap_free)
+    swap_used_ratio = (swap_used / swap_total) if swap_total else 0
+    commit_limit = int(meminfo.get("CommitLimit") or 0)
+    committed_as = int(meminfo.get("Committed_AS") or 0)
+    commit_ratio = (committed_as / commit_limit) if commit_limit else 0
+    if mem_available and mem_available <= SYSTEM_MEMORY_AVAILABLE_CRIT_BYTES:
+        add_finding(
+            findings,
+            "system_memory_saturation",
+            "critical",
+            "resource",
+            "system available memory is critically low",
+            memAvailableBytes=mem_available,
+            memTotalBytes=mem_total,
+        )
+    elif mem_available and mem_available <= SYSTEM_MEMORY_AVAILABLE_WARN_BYTES:
+        add_finding(
+            findings,
+            "system_memory_pressure",
+            "high",
+            "resource",
+            "system available memory is low",
+            memAvailableBytes=mem_available,
+            memTotalBytes=mem_total,
+        )
+    if swap_total and (swap_used >= SWAP_CRIT_BYTES or swap_used_ratio >= SYSTEM_SWAP_CRIT_RATIO):
+        add_finding(
+            findings,
+            "system_swap_saturation",
+            "critical",
+            "resource",
+            "system swap usage is critically high",
+            swapUsedBytes=swap_used,
+            swapTotalBytes=swap_total,
+            swapUsedRatio=swap_used_ratio,
+        )
+    elif swap_total and (swap_used >= SWAP_WARN_BYTES or swap_used_ratio >= SYSTEM_SWAP_WARN_RATIO):
+        add_finding(
+            findings,
+            "system_swap_pressure",
+            "high",
+            "resource",
+            "system swap usage is high",
+            swapUsedBytes=swap_used,
+            swapTotalBytes=swap_total,
+            swapUsedRatio=swap_used_ratio,
+        )
+    if commit_limit and commit_ratio >= SYSTEM_COMMIT_CRIT_RATIO:
+        add_finding(
+            findings,
+            "system_commit_saturation",
+            "critical",
+            "resource",
+            "system committed memory exceeds safe commit headroom",
+            committedBytes=committed_as,
+            commitLimitBytes=commit_limit,
+            commitRatio=commit_ratio,
+        )
+    elif commit_limit and commit_ratio >= SYSTEM_COMMIT_WARN_RATIO:
+        add_finding(
+            findings,
+            "system_commit_pressure",
+            "high",
+            "resource",
+            "system committed memory is near commit limit",
+            committedBytes=committed_as,
+            commitLimitBytes=commit_limit,
+            commitRatio=commit_ratio,
+        )
     return {
         "diskFreeBytes": free,
         "diskTotalBytes": total,
         "diskUsedRatio": used_ratio,
         "topLevelLogBytes": logs_size,
         "backups": backups,
+        "memory": {
+            "memTotalBytes": mem_total,
+            "memAvailableBytes": mem_available,
+            "swapTotalBytes": swap_total,
+            "swapUsedBytes": swap_used,
+            "swapUsedRatio": swap_used_ratio,
+            "committedBytes": committed_as,
+            "commitLimitBytes": commit_limit,
+            "commitRatio": commit_ratio,
+        },
     }
 
 
@@ -2387,12 +2592,17 @@ def update_runtime_trends(conn: sqlite3.Connection, snapshot: Dict[str, Any], fi
     gateway = snapshot.get("gateway") if isinstance(snapshot.get("gateway"), dict) else {}
     hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
     resource = snapshot.get("resource") if isinstance(snapshot.get("resource"), dict) else {}
+    system_memory = resource.get("memory") if isinstance(resource.get("memory"), dict) else {}
     children = gateway.get("children") if isinstance(gateway.get("children"), dict) else {}
     hermers_workflow = hermers.get("workflow") if isinstance(hermers.get("workflow"), dict) else {}
     sample = {
         "tsEpoch": now_s,
         "gatewayMemoryBytes": int(gateway.get("memoryBytes") or 0),
         "gatewaySwapBytes": int(gateway.get("swapBytes") or 0),
+        "systemMemAvailableBytes": int(system_memory.get("memAvailableBytes") or 0),
+        "systemSwapUsedBytes": int(system_memory.get("swapUsedBytes") or 0),
+        "systemSwapUsedRatio": float(system_memory.get("swapUsedRatio") or 0),
+        "systemCommitRatio": float(system_memory.get("commitRatio") or 0),
         "gatewayChildCount": int(children.get("count") or 0),
         "hermersAcpWorkers": len(hermers.get("acpWorkers") or []),
         "hermersOrphanAcpWorkers": len(hermers.get("orphanAcpWorkers") or []),
@@ -2447,6 +2657,52 @@ def update_runtime_trends(conn: sqlite3.Connection, snapshot: Dict[str, Any], fi
             trend=trend,
         )
     return trend
+
+
+def add_resource_governance_findings(
+    findings: List[Dict[str, Any]],
+    snapshot: Dict[str, Any],
+    streaks: Dict[str, Any],
+) -> None:
+    keys = {str(f.get("key")) for f in findings}
+    finding_by_key = {str(f.get("key")): f for f in findings if isinstance(f, dict)}
+    immediate = sorted(
+        key
+        for key in (RESOURCE_INCIDENT_IMMEDIATE_KEYS & keys)
+        if SEVERITY_RANK.get(str((finding_by_key.get(key) or {}).get("severity")), 0) >= SEVERITY_RANK["critical"]
+    )
+    sustained_keys = [
+        key
+        for key in sorted(RESOURCE_INCIDENT_SUSTAINED_KEYS & keys)
+        if sustained(streaks, key, RESOURCE_INCIDENT_STREAK_THRESHOLD)
+    ]
+    if not immediate and not sustained_keys:
+        return
+    gateway = snapshot.get("gateway") if isinstance(snapshot.get("gateway"), dict) else {}
+    resource = snapshot.get("resource") if isinstance(snapshot.get("resource"), dict) else {}
+    system_memory = resource.get("memory") if isinstance(resource.get("memory"), dict) else {}
+    streak_counts = {
+        key: int((streaks.get(key) or {}).get("count") or 0)
+        for key in sorted((RESOURCE_INCIDENT_IMMEDIATE_KEYS | RESOURCE_INCIDENT_SUSTAINED_KEYS) & keys)
+    }
+    add_finding(
+        findings,
+        "gateway_resource_incident",
+        "critical",
+        "resource",
+        "resource pressure requires incident handling and Human Gate options",
+        immediateKeys=immediate,
+        sustainedKeys=sustained_keys,
+        streakCounts=streak_counts,
+        gatewayMemoryBytes=int(gateway.get("memoryBytes") or 0),
+        gatewaySwapBytes=int(gateway.get("swapBytes") or 0),
+        systemMemAvailableBytes=int(system_memory.get("memAvailableBytes") or 0),
+        systemSwapUsedBytes=int(system_memory.get("swapUsedBytes") or 0),
+        systemSwapUsedRatio=float(system_memory.get("swapUsedRatio") or 0),
+        systemCommitRatio=float(system_memory.get("commitRatio") or 0),
+        humanGateRequired=True,
+        recommendedOptions=["controlled_gateway_restart", "load_shed_and_observe", "rollback_or_hold_runtime_changes"],
+    )
 
 
 def recent_restart_history(conn: sqlite3.Connection) -> List[int]:
@@ -2532,7 +2788,7 @@ def build_lane_policy(
     recovery: Dict[str, Any],
 ) -> Dict[str, Any]:
     gateway_unavailable = mode == "gateway-unreachable" or not gateway.get("active") or not gateway.get("portOk")
-    resource_pressure = bool({"gateway_resource_saturation", "gateway_swap_saturation", "disk_pressure"} & keys) or mode == "resource-pressure"
+    resource_pressure = resource_pressure_active(keys) or mode == "resource-pressure"
     cron_pressure = bool({"cron_stale_running_state", "cron_expired_leases", "gateway_congestion_logs", "cron_heartbeat_unhealthy"} & keys)
     session_pressure = "session_problem_backlog" in keys
     channel_pressure = bool(
@@ -2772,7 +3028,7 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         mode = "hermers-unavailable"
     elif {"hermers_acp_orphan_workers", "hermers_runtime_failure_burst", "hermers_stale_sent_dispatches"} & keys:
         mode = "hermers-degraded"
-    elif "gateway_resource_saturation" in keys or "gateway_swap_saturation" in keys or "disk_pressure" in keys:
+    elif resource_pressure_active(keys):
         mode = "resource-pressure"
 
     now_s = epoch()
@@ -2819,6 +3075,9 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
             resource_exhausted = (
                 sustained(streaks, "gateway_resource_saturation", SOFT_RESCUE_STREAK_THRESHOLD)
                 or sustained(streaks, "gateway_swap_saturation", SOFT_RESCUE_STREAK_THRESHOLD)
+                or sustained(streaks, "system_memory_saturation", SOFT_RESCUE_STREAK_THRESHOLD)
+                or sustained(streaks, "system_swap_saturation", SOFT_RESCUE_STREAK_THRESHOLD)
+                or sustained(streaks, "system_commit_saturation", SOFT_RESCUE_STREAK_THRESHOLD)
                 or sustained(streaks, "disk_pressure", SOFT_RESCUE_STREAK_THRESHOLD)
             )
             cron_blocked = (
@@ -2869,7 +3128,7 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
     if should_defer_control_plane_heavy:
         control_plane_defer_until = max(cooldown_until if cooldown_active else 0, now_s + CONTROL_PLANE_BACKPRESSURE_SECONDS)
     gateway_unavailable = mode == "gateway-unreachable" or not gateway.get("active") or not gateway.get("portOk")
-    resource_pressure = bool({"gateway_resource_saturation", "gateway_swap_saturation", "disk_pressure"} & keys) or mode == "resource-pressure"
+    resource_pressure = resource_pressure_active(keys) or mode == "resource-pressure"
     recovery = update_lane_recovery(
         conn,
         now_s,
@@ -3303,6 +3562,236 @@ def gateway_restart(conn: sqlite3.Connection, reason: str) -> Dict[str, Any]:
         }
 
 
+def resource_trigger_keys(snapshot: Dict[str, Any]) -> List[str]:
+    findings = snapshot.get("findings") if isinstance(snapshot.get("findings"), list) else []
+    keys = {str(item.get("key")) for item in findings if isinstance(item, dict)}
+    triggers = set(keys & RESOURCE_PRESSURE_KEYS)
+    triggers.update(keys & {"gateway_service_down", "gateway_port_down", "gateway_health_endpoint_failed"})
+    return sorted(triggers)
+
+
+def capture_resource_evidence(snapshot: Dict[str, Any], policy: Dict[str, Any], trigger_keys: List[str]) -> Dict[str, Any]:
+    stamp = time.strftime("%Y%m%dT%H%M%S%z")
+    evidence_path = RESOURCE_EVIDENCE_DIR / f"resource-evidence-{stamp}.json"
+    latest_path = RESOURCE_EVIDENCE_DIR / "latest.json"
+    probes = {
+        "date": command_probe(["date", "-Is"], timeout=3, max_chars=2_000),
+        "loadavg": command_probe(["cat", "/proc/loadavg"], timeout=3, max_chars=2_000),
+        "meminfo": command_probe(["cat", "/proc/meminfo"], timeout=3, max_chars=8_000),
+        "memoryPressure": command_probe(["cat", "/proc/pressure/memory"], timeout=3, max_chars=4_000),
+        "free": command_probe(["free", "-h"], timeout=3, max_chars=4_000),
+        "gatewayService": command_probe(
+            [
+                "systemctl",
+                "show",
+                "openclaw-gateway.service",
+                "--property=MainPID,ExecMainStartTimestamp,MemoryCurrent,MemoryPeak,CPUUsageNSec,TasksCurrent,NRestarts,ActiveState,SubState",
+            ],
+            timeout=5,
+            max_chars=6_000,
+        ),
+        "journaldAndSnapd": command_probe(
+            [
+                "systemctl",
+                "show",
+                "systemd-journald.service",
+                "snapd.service",
+                "--property=Id,MainPID,ExecMainStartTimestamp,MemoryCurrent,MemoryPeak,CPUUsageNSec,TasksCurrent,NRestarts,ActiveState,SubState",
+            ],
+            timeout=5,
+            max_chars=8_000,
+        ),
+        "topMem": command_probe(["bash", "-lc", "ps aux --sort=-%mem | head -40"], timeout=5, max_chars=12_000),
+        "topCpu": command_probe(["bash", "-lc", "ps aux --sort=-%cpu | head -40"], timeout=5, max_chars=12_000),
+        "recentKernelMemory": command_probe(
+            ["bash", "-lc", "journalctl -k --since '-30 min' --no-pager | grep -Ei 'memory pressure|oom|Out of memory|Killed process|watchdog' | tail -120"],
+            timeout=5,
+            max_chars=16_000,
+        ),
+    }
+    payload = {
+        "schemaVersion": 1,
+        "capturedAt": ts(),
+        "capturedAtEpoch": epoch(),
+        "source": "cat-agents-stabilityd",
+        "triggerKeys": trigger_keys,
+        "policyMode": policy.get("mode"),
+        "policySeverity": policy.get("severity"),
+        "policyReasons": policy.get("reasons") or [],
+        "gateway": snapshot.get("gateway") or {},
+        "resource": snapshot.get("resource") or {},
+        "trends": snapshot.get("trends") or {},
+        "topFindings": (snapshot.get("findings") or [])[:20],
+        "probes": probes,
+    }
+    write_json_atomic(evidence_path, payload)
+    write_json_atomic(latest_path, payload)
+    return {"path": str(evidence_path), "latestPath": str(latest_path), "payload": payload}
+
+
+def render_resource_human_gate_md(payload: Dict[str, Any]) -> str:
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+    gateway = payload.get("gateway") if isinstance(payload.get("gateway"), dict) else {}
+    resource = payload.get("resource") if isinstance(payload.get("resource"), dict) else {}
+    memory = resource.get("memory") if isinstance(resource.get("memory"), dict) else {}
+    trigger_keys = ", ".join(payload.get("triggerKeys") or []) or "none"
+    options = payload.get("options") if isinstance(payload.get("options"), list) else []
+    lines = [
+        "# Gateway Resource Human Gate Package",
+        "",
+        f"- generatedAt: {payload.get('generatedAt')}",
+        f"- severity: {payload.get('severity')}",
+        f"- mode: {payload.get('mode')}",
+        f"- triggerKeys: {trigger_keys}",
+        f"- evidencePath: {evidence.get('path')}",
+        "",
+        "## Current Resource Facts",
+        f"- gatewayMemoryBytes: {gateway.get('memoryBytes')}",
+        f"- gatewaySwapBytes: {gateway.get('swapBytes')}",
+        f"- systemMemAvailableBytes: {memory.get('memAvailableBytes')}",
+        f"- systemSwapUsedBytes: {memory.get('swapUsedBytes')}",
+        f"- systemSwapUsedRatio: {memory.get('swapUsedRatio')}",
+        f"- systemCommitRatio: {memory.get('commitRatio')}",
+        "",
+        "## Human Gate Options",
+    ]
+    for item in options:
+        lines.extend(
+            [
+                f"### {item.get('label')}",
+                f"- decisionId: {item.get('decisionId')}",
+                f"- action: {item.get('action')}",
+                f"- boundary: {item.get('boundary')}",
+                f"- rollback: {item.get('rollback')}",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Secretary Notes",
+            "- 本包只准备 Human Gate 证据，不自动重启 Gateway。",
+            "- 猫之脑应结合最新 workflow readiness、dispatch/receipt 和 Gateway health 判断是否提交给猫爪。",
+            "- 猫爪提交给闪电猫时必须保留三套以上可批准方案，并等待闪电猫原话确认。",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_resource_human_gate_package(
+    snapshot: Dict[str, Any],
+    policy: Dict[str, Any],
+    trigger_keys: List[str],
+    evidence: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    evidence_meta = evidence or {}
+    payload = {
+        "schemaVersion": 1,
+        "generatedAt": ts(),
+        "generatedAtEpoch": epoch(),
+        "source": "cat-agents-stabilityd",
+        "status": "pending_human_gate",
+        "severity": policy.get("severity"),
+        "mode": policy.get("mode"),
+        "triggerKeys": trigger_keys,
+        "restartCandidate": bool(policy.get("restartCandidate")),
+        "restartBlockedReasons": policy.get("restartBlockedReasons") or [],
+        "gateway": snapshot.get("gateway") or {},
+        "resource": snapshot.get("resource") or {},
+        "trends": snapshot.get("trends") or {},
+        "evidence": {
+            "path": evidence_meta.get("path"),
+            "latestPath": evidence_meta.get("latestPath"),
+        },
+        "options": [
+            {
+                "decisionId": "A",
+                "label": "A. 受控重启 Gateway",
+                "action": "在保留当前证据、确认 active checkout 和回滚分支后，由闪电猫批准一次手工 Gateway restart，并做 health/readiness/smoke 复核。",
+                "boundary": "只重启 OpenClaw Gateway，不改模型路由、不改 profile、不改交易相关状态。",
+                "rollback": "如重启后 Gateway health/readiness 或 workflow smoke 失败，回到最近确认可用 checkout 或暂停 workflow 派发。",
+            },
+            {
+                "decisionId": "B",
+                "label": "B. 降载观察",
+                "action": "暂停非关键 cron 和重报告，保留心跳与直接控制面，持续采集资源快照，等待内存/Swap 回落。",
+                "boundary": "不重启、不删除、不迁移，只做 admission/backpressure 和证据采集。",
+                "rollback": "若 swap 或 memory pressure 继续恶化，升级到方案 A 或 C。",
+            },
+            {
+                "decisionId": "C",
+                "label": "C. 暂停变更并回退候选代码",
+                "action": "冻结新 workflow/plugin 变更，必要时将 active checkout 回到已登记 rollback 分支，再重新评估 Gateway 内存趋势。",
+                "boundary": "只处理代码版本风险，不触碰生产交易、账号、密钥或业务数据。",
+                "rollback": "如回退后问题仍存在，说明根因更偏长期 Gateway/运行态内存膨胀，应转入 A 或容量治理。",
+            },
+        ],
+        "pauseOption": {
+            "label": "暂停工作流",
+            "action": "暂停本轮资源处置工作流，继续只读观察。",
+        },
+        "terminateOption": {
+            "label": "终止工作流",
+            "action": "认为当前资源 incident 已收口，归档证据并停止升级。",
+        },
+    }
+    json_path = RESOURCE_HUMAN_GATE_DIR / "gateway-resource-pressure-latest.json"
+    md_path = RESOURCE_HUMAN_GATE_DIR / "gateway-resource-pressure-latest.md"
+    write_json_atomic(json_path, payload)
+    md_path.write_text(render_resource_human_gate_md(payload), encoding="utf-8")
+    write_json_atomic(RESOURCE_INCIDENT_LATEST, payload)
+    return {
+        "jsonPath": str(json_path),
+        "markdownPath": str(md_path),
+        "incidentPath": str(RESOURCE_INCIDENT_LATEST),
+    }
+
+
+def resource_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
+    actions: List[Dict[str, Any]] = []
+    trigger_keys = resource_trigger_keys(snapshot)
+    if not trigger_keys:
+        return actions
+    now_s = epoch()
+    last_capture = int(db_get(conn, "resource_evidence_last_capture_at", 0) or 0)
+    capture_due = not last_capture or now_s - last_capture >= RESOURCE_EVIDENCE_CAPTURE_SECONDS
+    incident_active = "gateway_resource_incident" in trigger_keys or bool(RESOURCE_INCIDENT_IMMEDIATE_KEYS & set(trigger_keys))
+    evidence_meta: Optional[Dict[str, Any]] = None
+    if capture_due:
+        evidence = capture_resource_evidence(snapshot, policy, trigger_keys)
+        evidence_meta = {k: v for k, v in evidence.items() if k != "payload"}
+        db_set(conn, "resource_evidence_last_capture_at", now_s)
+        actions.append(
+            {
+                "action": "capture_resource_evidence",
+                "result": "ok",
+                "triggerKeys": trigger_keys,
+                "resourceEvidencePath": evidence_meta.get("path"),
+                "resourceEvidenceLatestPath": evidence_meta.get("latestPath"),
+            }
+        )
+    elif (RESOURCE_EVIDENCE_DIR / "latest.json").exists():
+        evidence_meta = {
+            "path": str(RESOURCE_EVIDENCE_DIR / "latest.json"),
+            "latestPath": str(RESOURCE_EVIDENCE_DIR / "latest.json"),
+        }
+    if incident_active:
+        last_gate = int(db_get(conn, "resource_human_gate_last_prepare_at", 0) or 0)
+        if not last_gate or now_s - last_gate >= RESOURCE_HUMAN_GATE_REFRESH_SECONDS:
+            package = write_resource_human_gate_package(snapshot, policy, trigger_keys, evidence_meta)
+            db_set(conn, "resource_human_gate_last_prepare_at", now_s)
+            actions.append(
+                {
+                    "action": "prepare_resource_human_gate",
+                    "result": "ok",
+                    "triggerKeys": trigger_keys,
+                    "requiresHumanGate": True,
+                    **package,
+                }
+            )
+    return actions
+
+
 def hermers_actuate(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
     actions: List[Dict[str, Any]] = []
     hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
@@ -3333,6 +3822,9 @@ def actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str
     actions: List[Dict[str, Any]] = []
     if no_action:
         return [{"action": "none", "result": "dry_run", "reason": "no_action"}]
+    for action in resource_actuate(conn, snapshot, policy):
+        action.update({"actionId": f"{action['action']}-{int(time.time() * 1000)}", "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd", "component": "resource"})
+        actions.append(action)
     for action in cron_actuate(snapshot, policy):
         action.update({"actionId": f"{action['action']}-{int(time.time() * 1000)}", "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd", "component": "cron"})
         actions.append(action)
@@ -3406,10 +3898,11 @@ def collect_snapshot(conn: sqlite3.Connection) -> Tuple[Dict[str, Any], List[Dic
             evidence={k: v for k, v in drift.items() if k not in {"key", "severity", "component", "message"}},
         )
     snapshot["trends"] = update_runtime_trends(conn, snapshot, findings)
+    streaks = update_streaks(conn, findings)
+    add_resource_governance_findings(findings, snapshot, streaks)
     findings.sort(key=lambda item: (-SEVERITY_RANK.get(str(item.get("severity")), 0), str(item.get("component")), str(item.get("key"))))
     snapshot["findings"] = findings
     snapshot["severity"] = max_severity(findings)
-    streaks = update_streaks(conn, findings)
     snapshot["streaks"] = streaks
     policy = policy_from_findings(conn, findings, snapshot, streaks)
     snapshot["policy"] = policy
