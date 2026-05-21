@@ -862,6 +862,20 @@ def http_ok(url: str, timeout: int = 8) -> bool:
         return False
 
 
+def gateway_http_health(port: int, timeout: int = 8) -> Dict[str, Any]:
+    health_url = f"http://127.0.0.1:{port}/health"
+    readyz_url = f"http://127.0.0.1:{port}/readyz"
+    health_ok = http_ok(health_url, timeout=timeout)
+    readyz_ok = http_ok(readyz_url, timeout=timeout)
+    return {
+        "healthUrl": health_url,
+        "readyzUrl": readyz_url,
+        "healthOk": health_ok,
+        "readyzOk": readyz_ok,
+        "ok": health_ok and readyz_ok,
+    }
+
+
 def systemctl_show_gateway() -> Dict[str, Any]:
     props = "ActiveState,SubState,MainPID,ExecMainStartTimestamp,ExecMainStartTimestampMonotonic,NRestarts"
     try:
@@ -971,7 +985,8 @@ def gateway_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
     pid = int(service.get("MainPID") or 0)
     port_ok = tcp_ok(PORT)
-    health_ok = http_ok(f"http://127.0.0.1:{PORT}/__openclaw__/health", timeout=8) if port_ok else False
+    http_health = gateway_http_health(PORT, timeout=8) if port_ok else {"healthOk": False, "readyzOk": False, "ok": False}
+    health_ok = bool(http_health.get("ok"))
     service_age = None
     start_epoch = parse_iso_epoch(service.get("ExecMainStartTimestamp"))
     if start_epoch:
@@ -1019,6 +1034,7 @@ def gateway_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
         "port": PORT,
         "portOk": port_ok,
         "healthOk": health_ok,
+        "httpHealth": http_health,
         "serviceAgeSeconds": service_age,
         "startupGraceActive": bool(in_grace),
         "memoryBytes": memory,
