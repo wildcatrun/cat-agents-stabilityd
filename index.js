@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 const PLUGIN_ID = "cat-agents-stability";
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
 
-const READ_ACTIONS = new Set(["status", "snapshot", "policy", "lanes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook"]);
+const READ_ACTIONS = new Set(["status", "snapshot", "policy", "lanes", "profile-modes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook"]);
 const GUARDED_ACTIONS = new Set(["doctor", "repair", "once"]);
 
 function jsonText(value) {
@@ -124,7 +124,7 @@ const toolParameters = {
   properties: {
     action: {
       type: "string",
-      enum: ["status", "snapshot", "policy", "lanes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook", "doctor", "repair", "once"]
+      enum: ["status", "snapshot", "policy", "lanes", "profile-modes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook", "doctor", "repair", "once"]
     },
     limit: { type: "number" },
     noAction: { type: "boolean" },

@@ -253,7 +253,58 @@ Actuators:
 Hermers actuator default boundary:
 
 - Allowed by default: record findings, classify stale dispatch/messageflow state, and terminate orphan ACP worker process groups when owner liveness and timeout evidence are clear.
+- Allowed for explicitly managed low-priority profiles: adjust profile runtime mode from `warm` to `cold` or `hibernate` when idle evidence is clear, while protecting active work and protected profiles.
 - Disabled by default: restart Hermers gateways, rewrite profile config, migrate cron ownership, or switch runtime adapter. These require explicit operator/Human Gate authorization.
+
+## Hermers Profile Runtime Modes
+
+2026-05-23 resource optimization lesson:
+
+- The 4C/8G development server did not show CPU saturation or kernel OOM. The risk was memory commitment and swap pressure from multiple long-lived Hermers profile gateways plus OpenClaw Gateway.
+- Stopping one low-priority idle profile (`catears`) released roughly 0.9-1.1 GiB of usable headroom and reduced swap pressure without restarting Gateway or touching active trading workflow state.
+- This worked because the profile was not on the critical governance path and had no evidence of current useful work. It would be unsafe to apply the same action blindly to an active development profile such as `catbody`.
+
+Runtime mode definitions:
+
+- `hot`: profile has active ACP workers, active workflow runtime rows, or active dispatch evidence. It must not be stopped.
+- `warm`: profile is eligible to stay running and accept work normally.
+- `cold`: profile has been idle beyond the cold threshold. In v1 this is an explicit policy/admission state: keep the service available, but avoid sending optional/background work unless needed.
+- `hibernate`: profile has been idle beyond the hibernate threshold, or was already stopped by a recorded stabilityd hibernate action. For explicitly managed low-priority profiles, stabilityd may stop the user service and suppress "service down" findings while the profile remains intentionally hibernated.
+
+Default profile mode policy:
+
+- Managed profiles default to `catears` only.
+- Protected profiles default to `catbody`, `catheart`, `main`, and `cat_claw`; these must not be stopped by the profile mode actuator.
+- Cold threshold defaults to 30 minutes idle.
+- Hibernate threshold defaults to 8 hours idle.
+- `cold` is advisory in the current implementation. `hibernate` is the first memory-releasing actuator.
+
+Configuration:
+
+- `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ENABLED=1|0`
+- `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTUATE=1|0`, default `1`
+- `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_START=1|0`, default `1`
+- `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_MANAGED=catears`
+- `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_PROTECTED=catbody,catheart,main,cat_claw`
+- `CAT_AGENTS_STABILITY_HERMERS_PROFILE_COLD_IDLE_SECONDS=1800`
+- `CAT_AGENTS_STABILITY_HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS=28800`
+- `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS=600`
+
+State and evidence:
+
+- `/home/flashcat/.openclaw/stability/hermers-profile-modes.json`
+- `cat-agents-stability profile-modes`
+- `cat-agents-stability lanes`, under `domains.hermers.profileRuntimeModes`
+- `cat-agents-stability actions`, when an actual profile mode service start/stop is performed
+
+Safety rules:
+
+- Never infer that every profile is safe to hibernate. A profile must be explicitly listed in the managed set and absent from the protected set.
+- Never stop a profile with active ACP workers, active workflow runtime rows, or active dispatch evidence.
+- Workflow activity probe failure blocks hibernation. If the workflow DB is missing, locked, schema-drifted, or unreadable, stabilityd keeps managed profiles expected-active and emits an activity-probe finding instead of reclaiming them.
+- A service being inactive is not by itself proof of intentional hibernation. stabilityd suppresses `hermers_gateway_service_down` only when a managed profile is inactive because of a recorded stabilityd hibernate action or equivalent explicit policy state.
+- Do not use systemd hard memory caps or Node heap caps as the first response when the problem is agent runtime residency. Prefer profile lifecycle, admission control, and session/context externalization first.
+- Human/operator-critical roles stay resident unless Flashcat explicitly changes their protection class.
 
 ## State Machine
 
@@ -661,6 +712,8 @@ Soft pressure actions:
 - Write backpressure state for cooperative jobs to read.
 - Prefer subagent/systemd isolation for heavy control-plane reports over running them inside the same direct-response lane.
 - As a last-resort rescue path, allow one controlled Gateway restart only when soft-pressure governance has clearly failed and the system has remained at collapse edge for a sustained window.
+- Move explicitly managed idle Hermers profiles through `warm -> cold -> hibernate` before treating memory pressure as a Gateway restart problem.
+- Keep active development profiles protected; if a profile is doing visible work, stabilityd may observe it but must not reclaim it as memory headroom.
 
 Action ladder:
 

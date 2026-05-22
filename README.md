@@ -24,6 +24,7 @@ cat-agents-stabilityd/
 - External daemon: `cat-agents-stabilityd.service` keeps observing when Gateway is degraded or down.
 - Local Codex MCP: exposes read and dry-run tools to the local Codex control panel.
 - Hermers adapter package: defines the governance contract for Hermers profile/IM/runtime probes without moving workflow state into Hermers.
+- Hermers profile modes: evaluates managed profile runtime residency (`warm`, `cold`, `hibernate`) and can hibernate explicitly managed idle profiles while protecting active or critical profiles.
 
 ## Desired State
 
@@ -35,6 +36,7 @@ Use read-only drift checks before changing deployment state:
 bin/cat-agents-stability desired-state
 bin/cat-agents-stability drift
 bin/cat-agents-stability workflow-evidence
+bin/cat-agents-stability profile-modes
 ```
 
 `workflow-evidence` writes `stability-evidence-latest.json` and `stability-evidence-latest.md` into `trading-agents-workflow/governance-logs/` so cat-brain `main` can consume stability facts during heartbeat governance.

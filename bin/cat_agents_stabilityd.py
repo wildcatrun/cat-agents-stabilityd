@@ -74,6 +74,7 @@ RESOURCE_INCIDENT_DIR = STABILITY_DIR / "incidents"
 RESOURCE_INCIDENT_LATEST = RESOURCE_INCIDENT_DIR / "gateway-resource-pressure-latest.json"
 CONTROL_PLANE_BACKPRESSURE_PATH = STABILITY_DIR / "control-plane-backpressure.json"
 LANE_POLICY_PATH = STABILITY_DIR / "lane-policy.json"
+HERMERS_PROFILE_MODES_PATH = STABILITY_DIR / "hermers-profile-modes.json"
 WORKFLOW_STABILITY_EVIDENCE_JSON = WORKFLOW_GOVERNANCE_LOG_DIR / "stability-evidence-latest.json"
 WORKFLOW_STABILITY_EVIDENCE_MD = WORKFLOW_GOVERNANCE_LOG_DIR / "stability-evidence-latest.md"
 DESIRED_STATE_PATH = Path(
@@ -156,6 +157,22 @@ HERMERS_ACP_LONG_RUNNING_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERM
 HERMERS_FAILURE_WINDOW_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_FAILURE_WINDOW_SECONDS", "1800"))
 HERMERS_FAILURE_BURST_THRESHOLD = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_FAILURE_BURST", "5"))
 HERMERS_STALE_SENT_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_STALE_SENT_SECONDS", "600"))
+HERMERS_PROFILE_MODE_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ENABLED", "1") != "0"
+HERMERS_PROFILE_MODE_ACTUATE_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTUATE", "1") != "0"
+HERMERS_PROFILE_MODE_START_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_START", "1") != "0"
+HERMERS_PROFILE_MODE_MANAGED_PROFILES = {
+    item.strip()
+    for item in os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_MANAGED", "catears").split(",")
+    if item.strip()
+}
+HERMERS_PROFILE_MODE_PROTECTED_PROFILES = {
+    item.strip()
+    for item in os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_PROTECTED", "catbody,catheart,main,cat_claw").split(",")
+    if item.strip()
+}
+HERMERS_PROFILE_COLD_IDLE_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_COLD_IDLE_SECONDS", str(30 * 60)))
+HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS", str(8 * 3600)))
+HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS", "600"))
 
 TMP_FILE_MAX_AGE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_TMP_MAX_AGE_SECONDS", "3600"))
 ORPHAN_RUN_LOG_MIN_AGE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_ORPHAN_RUN_LOG_MIN_AGE_SECONDS", "3600"))
@@ -1224,6 +1241,203 @@ def hermers_acp_workers(rows: List[Dict[str, str]]) -> List[Dict[str, Any]]:
     return workers
 
 
+def hermers_profile_agent_ids(profile: str) -> set[str]:
+    ids = {profile}
+    if profile.startswith("cat") and "_" not in profile:
+        rest = profile[3:]
+        if rest:
+            ids.add(f"cat_{rest}")
+    return ids
+
+
+def hermers_profile_workflow_activity(profiles: List[str]) -> Dict[str, Dict[str, Any]]:
+    activity: Dict[str, Dict[str, Any]] = {
+        profile: {
+            "profile": profile,
+            "probeOk": True,
+            "agentIds": sorted(hermers_profile_agent_ids(profile)),
+            "activeRuntimeCount": 0,
+            "activeDispatchCount": 0,
+            "lastActivityEpoch": None,
+            "lastActivityAt": None,
+            "sample": [],
+        }
+        for profile in profiles
+    }
+    if not WORKFLOW_DB.exists():
+        for item in activity.values():
+            item["probeOk"] = False
+            item["error"] = "workflow db missing"
+        return activity
+
+    def matches_profile(profile: str, row: Dict[str, Any]) -> bool:
+        agent_id = str(row.get("agent_id") or "")
+        adapter = str(row.get("adapter") or "")
+        text = f"{agent_id} {adapter}".lower()
+        if agent_id in hermers_profile_agent_ids(profile):
+            return True
+        return profile.lower() in text
+
+    def record(profile: str, row: Dict[str, Any], when_raw: Any, active: bool, kind: str) -> None:
+        item = activity.setdefault(profile, {"profile": profile})
+        when_epoch = parse_iso_epoch(when_raw)
+        if when_epoch is not None:
+            last_epoch = item.get("lastActivityEpoch")
+            if last_epoch is None or int(when_epoch) > int(last_epoch):
+                item["lastActivityEpoch"] = int(when_epoch)
+                item["lastActivityAt"] = when_raw
+        if active:
+            if kind == "runtime":
+                item["activeRuntimeCount"] = int(item.get("activeRuntimeCount") or 0) + 1
+            else:
+                item["activeDispatchCount"] = int(item.get("activeDispatchCount") or 0) + 1
+        sample = item.setdefault("sample", [])
+        if isinstance(sample, list) and len(sample) < 5:
+            sample.append({k: row.get(k) for k in ("kind", "status", "agent_id", "adapter", "started_at", "completed_at", "updated_at", "sent_at") if k in row})
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(str(WORKFLOW_DB))
+        conn.row_factory = sqlite3.Row
+        runtime_rows = conn.execute(
+            """
+            SELECT 'runtime' AS kind, agent_id, adapter, status, started_at, completed_at
+            FROM runtime_runs
+            WHERE runtime IN ('hermes_acp', 'hermes', 'hermers')
+            ORDER BY COALESCE(completed_at, started_at) DESC
+            LIMIT 500
+            """
+        ).fetchall()
+        for sqlite_row in runtime_rows:
+            row = dict(sqlite_row)
+            status = str(row.get("status") or "").lower()
+            active = status in {"queued", "pending", "sent", "started", "running", "in_progress"}
+            when_raw = row.get("completed_at") or row.get("started_at")
+            for profile in profiles:
+                if matches_profile(profile, row):
+                    record(profile, row, when_raw, active, "runtime")
+
+        dispatch_rows = conn.execute(
+            """
+            SELECT 'dispatch' AS kind, agent_id, runtime, status, updated_at, sent_at
+            FROM mixed_meeting_dispatches
+            WHERE runtime IN ('hermes_acp', 'hermes', 'hermers')
+            ORDER BY COALESCE(updated_at, sent_at) DESC
+            LIMIT 500
+            """
+        ).fetchall()
+        for sqlite_row in dispatch_rows:
+            row = dict(sqlite_row)
+            status = str(row.get("status") or "").lower()
+            active = status in {"queued", "pending", "sent", "started", "running", "in_progress"}
+            when_raw = row.get("updated_at") or row.get("sent_at")
+            for profile in profiles:
+                if matches_profile(profile, row):
+                    record(profile, row, when_raw, active, "dispatch")
+    except Exception as exc:
+        for item in activity.values():
+            item["probeOk"] = False
+            item["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+    return activity
+
+
+def build_hermers_profile_modes(
+    conn: sqlite3.Connection,
+    profiles: Dict[str, Any],
+    acp_workers: List[Dict[str, Any]],
+    workflow_activity: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    now_s = epoch()
+    profile_modes: Dict[str, Any] = {}
+    for profile, profile_snapshot in profiles.items():
+        service = profile_snapshot.get("service") if isinstance(profile_snapshot.get("service"), dict) else {}
+        active = bool(profile_snapshot.get("active"))
+        profile_workers = [item for item in acp_workers if item.get("profile") == profile]
+        workflow = workflow_activity.get(profile) or {}
+        workflow_probe_ok = bool(workflow.get("probeOk", True))
+        planned = db_get(conn, f"hermers_profile_mode:planned:{profile}", {}) or {}
+        planned_mode = str(planned.get("targetMode") or "") if isinstance(planned, dict) else ""
+        protected = profile in HERMERS_PROFILE_MODE_PROTECTED_PROFILES
+        managed = profile in HERMERS_PROFILE_MODE_MANAGED_PROFILES and not protected
+        active_work = bool(profile_workers) or int(workflow.get("activeRuntimeCount") or 0) > 0 or int(workflow.get("activeDispatchCount") or 0) > 0
+
+        last_activity_epoch = workflow.get("lastActivityEpoch")
+        if last_activity_epoch is None and active:
+            last_activity_epoch = parse_iso_epoch(service.get("ActiveEnterTimestamp"))
+        idle_seconds = max(0, now_s - int(last_activity_epoch)) if last_activity_epoch is not None else None
+
+        target_mode = "warm"
+        reason = "not-managed"
+        expected_active = True
+        if not HERMERS_PROFILE_MODE_ENABLED:
+            reason = "profile-mode-disabled"
+        elif protected:
+            reason = "protected-profile"
+        elif not managed:
+            reason = "not-managed"
+        elif not workflow_probe_ok:
+            reason = "workflow-activity-unavailable"
+        elif active_work:
+            target_mode = "hot"
+            reason = "active-work"
+        elif not active and planned_mode == "hibernate":
+            target_mode = "hibernate"
+            expected_active = False
+            reason = "planned-hibernate-inactive"
+        elif not active:
+            reason = "inactive-unplanned"
+        elif idle_seconds is not None and idle_seconds >= HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS:
+            target_mode = "hibernate"
+            expected_active = False
+            reason = "idle-hibernate-threshold"
+        elif idle_seconds is not None and idle_seconds >= HERMERS_PROFILE_COLD_IDLE_SECONDS:
+            target_mode = "cold"
+            reason = "idle-cold-threshold"
+        else:
+            reason = "recent-or-unknown-activity"
+
+        profile_modes[profile] = {
+            "profile": profile,
+            "managed": bool(managed),
+            "protected": bool(protected),
+            "active": active,
+            "activeWork": active_work,
+            "workerCount": len(profile_workers),
+            "targetMode": target_mode,
+            "expectedActive": expected_active,
+            "reason": reason,
+            "idleSeconds": idle_seconds,
+            "lastActivityEpoch": last_activity_epoch,
+            "lastActivityAt": workflow.get("lastActivityAt") or service.get("ActiveEnterTimestamp"),
+            "unit": profile_snapshot.get("unit"),
+            "workflow": workflow,
+        }
+
+    counts: Dict[str, int] = {}
+    for item in profile_modes.values():
+        mode = str(item.get("targetMode") or "unknown")
+        counts[mode] = counts.get(mode, 0) + 1
+    return {
+        "schemaVersion": 1,
+        "updatedAt": ts(),
+        "updatedAtEpoch": now_s,
+        "enabled": bool(HERMERS_PROFILE_MODE_ENABLED),
+        "actuateEnabled": bool(HERMERS_PROFILE_MODE_ACTUATE_ENABLED),
+        "startEnabled": bool(HERMERS_PROFILE_MODE_START_ENABLED),
+        "managedProfiles": sorted(HERMERS_PROFILE_MODE_MANAGED_PROFILES),
+        "protectedProfiles": sorted(HERMERS_PROFILE_MODE_PROTECTED_PROFILES),
+        "coldIdleSeconds": HERMERS_PROFILE_COLD_IDLE_SECONDS,
+        "hibernateIdleSeconds": HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS,
+        "actionCooldownSeconds": HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS,
+        "counts": counts,
+        "profiles": profile_modes,
+    }
+
+
 def hermers_workflow_summary() -> Dict[str, Any]:
     if not WORKFLOW_DB.exists():
         return {"dbFile": str(WORKFLOW_DB), "exists": False}
@@ -1289,7 +1503,7 @@ def hermers_workflow_summary() -> Dict[str, Any]:
     return summary
 
 
-def hermers_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     rows = ps_rows()
     profiles: Dict[str, Any] = {}
     down = []
@@ -1318,6 +1532,13 @@ def hermers_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
         }
 
     acp_workers = hermers_acp_workers(rows)
+    workflow_activity = hermers_profile_workflow_activity(HERMERS_PROFILES)
+    profile_modes = build_hermers_profile_modes(conn, profiles, acp_workers, workflow_activity)
+    mode_profiles = profile_modes.get("profiles") if isinstance(profile_modes.get("profiles"), dict) else {}
+    down = [
+        item for item in down
+        if bool((mode_profiles.get(str(item.get("profile"))) or {}).get("expectedActive", True))
+    ]
     orphan_workers = [
         item for item in acp_workers
         if item.get("orphan") and int(item.get("ageSeconds") or 0) >= HERMERS_ACP_ORPHAN_MIN_SECONDS
@@ -1364,6 +1585,21 @@ def hermers_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
         add_finding(findings, "hermers_stale_sent_dispatches", "high", "hermers", "Hermers dispatches are stuck in sent state without terminal runtime receipt", count=stale_sent_count, sample=workflow.get("staleSentSample") or [])
     if workflow.get("error"):
         add_finding(findings, "hermers_workflow_db_probe_failed", "warning", "hermers", "Hermers workflow DB probe failed", error=workflow.get("error"))
+    activity_probe_errors = [
+        {"profile": profile, "error": item.get("error")}
+        for profile, item in workflow_activity.items()
+        if isinstance(item, dict) and not bool(item.get("probeOk", True))
+    ]
+    if activity_probe_errors:
+        add_finding(
+            findings,
+            "hermers_profile_activity_probe_unavailable",
+            "warning",
+            "hermers",
+            "Hermers profile activity probe is unavailable; profile hibernation is blocked until idle evidence is reliable",
+            count=len(activity_probe_errors),
+            sample=activity_probe_errors[:10],
+        )
 
     return {
         "profiles": profiles,
@@ -1373,6 +1609,7 @@ def hermers_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
         "orphanAcpWorkers": orphan_workers,
         "longRunningAcpWorkers": long_workers,
         "workflow": workflow,
+        "profileModes": profile_modes,
         "reapOrphanAcpWorkersEnabled": HERMERS_ACP_ORPHAN_REAP_ENABLED,
         "gatewayRestartEnabled": HERMERS_GATEWAY_RESTART_ENABLED,
     }
@@ -2786,6 +3023,7 @@ def build_lane_policy(
     restart_storm: bool,
     cooldown_active: bool,
     recovery: Dict[str, Any],
+    hermers_profile_modes: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     gateway_unavailable = mode == "gateway-unreachable" or not gateway.get("active") or not gateway.get("portOk")
     resource_pressure = resource_pressure_active(keys) or mode == "resource-pressure"
@@ -2876,6 +3114,9 @@ def build_lane_policy(
     )
     hermers_observations = sorted(k for k in keys if k.startswith("hermers_") and k not in set(hermers_evidence))
     streak_counts = {key: int((streaks.get(key) or {}).get("count") or 0) for key in sorted(keys)}
+    profile_modes = hermers_profile_modes if isinstance(hermers_profile_modes, dict) else {}
+    profile_mode_profiles = profile_modes.get("profiles") if isinstance(profile_modes.get("profiles"), dict) else {}
+    profile_mode_counts = profile_modes.get("counts") if isinstance(profile_modes.get("counts"), dict) else {}
 
     cron_recovery = ((recovery.get("domains") or {}).get("cron") or {}) if isinstance(recovery, dict) else {}
     cron_healthy_streak = int(cron_recovery.get("healthyStreak") or 0)
@@ -2968,8 +3209,18 @@ def build_lane_policy(
                 "evidenceKeys": hermers_evidence,
                 "observationKeys": hermers_observations,
                 "streakCounts": {k: streak_counts[k] for k in hermers_evidence if k in streak_counts},
-                "governanceAction": "reap-orphan-acp-workers" if "hermers_acp_orphan_workers" in keys else "restart-gateway-disabled-observe" if "hermers_gateway_service_down" in keys else "observe",
+                "governanceAction": "reap-orphan-acp-workers" if "hermers_acp_orphan_workers" in keys else "profile-mode-adjust" if int(profile_mode_counts.get("hibernate") or 0) > 0 else "restart-gateway-disabled-observe" if "hermers_gateway_service_down" in keys else "observe",
                 "stabilizationGoal": "keep Hermers profile gateways, ACP workers, runtime receipts, and workflow-facing execution readiness healthy without masking runtime failures as workflow success",
+                "profileRuntimeModes": {
+                    "enabled": bool(profile_modes.get("enabled")),
+                    "actuateEnabled": bool(profile_modes.get("actuateEnabled")),
+                    "managedProfiles": profile_modes.get("managedProfiles") or [],
+                    "protectedProfiles": profile_modes.get("protectedProfiles") or [],
+                    "coldIdleSeconds": profile_modes.get("coldIdleSeconds"),
+                    "hibernateIdleSeconds": profile_modes.get("hibernateIdleSeconds"),
+                    "counts": profile_mode_counts,
+                    "profiles": profile_mode_profiles,
+                },
             },
         },
         "cron": {
@@ -3000,6 +3251,15 @@ def build_lane_policy(
             "reapOrphanAcpWorkersAllowed": bool(HERMERS_ACP_ORPHAN_REAP_ENABLED),
             "gatewayRestartAllowed": bool(HERMERS_GATEWAY_RESTART_ENABLED),
             "gatewayRestartDefault": "disabled",
+            "profileModeEnabled": bool(profile_modes.get("enabled")),
+            "profileModeActuateAllowed": bool(profile_modes.get("actuateEnabled")),
+            "profileModes": {
+                "managedProfiles": profile_modes.get("managedProfiles") or [],
+                "protectedProfiles": profile_modes.get("protectedProfiles") or [],
+                "coldIdleSeconds": profile_modes.get("coldIdleSeconds"),
+                "hibernateIdleSeconds": profile_modes.get("hibernateIdleSeconds"),
+                "counts": profile_mode_counts,
+            },
         },
     }
 
@@ -3050,6 +3310,8 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
     restart_reason = "no-actionable-streak"
     restart_blocked_reasons: List[str] = []
     gateway = snapshot.get("gateway") or {}
+    hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
+    hermers_profile_modes = hermers.get("profileModes") if isinstance(hermers.get("profileModes"), dict) else {}
     hard_fault_candidate = hot(streaks, "gateway_service_down") or hot(streaks, "gateway_port_down") or hot(streaks, "gateway_health_endpoint_failed")
     if hard_fault_candidate:
         restart_candidate = True
@@ -3164,6 +3426,7 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         restart_storm=bool(restart_storm),
         cooldown_active=bool(cooldown_active),
         recovery=recovery,
+        hermers_profile_modes=hermers_profile_modes,
     )
     policy = {
         "schemaVersion": 1,
@@ -3792,8 +4055,121 @@ def resource_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy:
     return actions
 
 
-def hermers_actuate(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
+def hermers_profile_mode_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
     actions: List[Dict[str, Any]] = []
+    if not HERMERS_PROFILE_MODE_ENABLED or not HERMERS_PROFILE_MODE_ACTUATE_ENABLED:
+        return actions
+    hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
+    modes = hermers.get("profileModes") if isinstance(hermers.get("profileModes"), dict) else {}
+    profiles = modes.get("profiles") if isinstance(modes.get("profiles"), dict) else {}
+    now_s = epoch()
+    for profile, item in profiles.items():
+        if profile in HERMERS_PROFILE_MODE_PROTECTED_PROFILES:
+            continue
+        if profile not in HERMERS_PROFILE_MODE_MANAGED_PROFILES:
+            continue
+        if item.get("activeWork"):
+            continue
+        target_mode = str(item.get("targetMode") or "warm")
+        active = bool(item.get("active"))
+        unit = str(item.get("unit") or f"hermes-gateway-{profile}.service")
+        action_key = f"hermers_profile_mode:{profile}:{target_mode}"
+        last_action = int(db_get(conn, action_key, 0) or 0)
+        if last_action and now_s - last_action < HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS:
+            continue
+        if target_mode == "hibernate" and active:
+            started = time.time()
+            try:
+                proc = run_user_cmd(["systemctl", "--user", "stop", unit], timeout=30)
+                duration_ms = int((time.time() - started) * 1000)
+                result = "ok" if proc.returncode == 0 else "failed"
+                actions.append(
+                    {
+                        "action": "set_hermers_profile_mode",
+                        "result": result,
+                        "profile": profile,
+                        "unit": unit,
+                        "targetMode": target_mode,
+                        "reason": item.get("reason"),
+                        "idleSeconds": item.get("idleSeconds"),
+                        "operation": "stop-user-service",
+                        "exitCode": proc.returncode,
+                        "durationMs": duration_ms,
+                        "stderr": proc.stderr[-1200:],
+                    }
+                )
+                db_set(conn, action_key, now_s)
+                if proc.returncode == 0:
+                    db_set(
+                        conn,
+                        f"hermers_profile_mode:planned:{profile}",
+                        {
+                            "profile": profile,
+                            "targetMode": target_mode,
+                            "unit": unit,
+                            "reason": item.get("reason"),
+                            "setAt": ts(),
+                            "setAtEpoch": now_s,
+                            "source": "cat-agents-stabilityd",
+                        },
+                    )
+                    with contextlib.suppress(Exception):
+                        run_user_cmd(["systemctl", "--user", "reset-failed", unit], timeout=10)
+            except Exception as exc:
+                db_set(conn, action_key, now_s)
+                actions.append(
+                    {
+                        "action": "set_hermers_profile_mode",
+                        "result": "failed",
+                        "profile": profile,
+                        "unit": unit,
+                        "targetMode": target_mode,
+                        "reason": item.get("reason"),
+                        "operation": "stop-user-service",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+        elif target_mode == "hot" and not active and HERMERS_PROFILE_MODE_START_ENABLED:
+            started = time.time()
+            try:
+                proc = run_user_cmd(["systemctl", "--user", "start", unit], timeout=30)
+                duration_ms = int((time.time() - started) * 1000)
+                result = "ok" if proc.returncode == 0 else "failed"
+                actions.append(
+                    {
+                        "action": "set_hermers_profile_mode",
+                        "result": result,
+                        "profile": profile,
+                        "unit": unit,
+                        "targetMode": target_mode,
+                        "reason": item.get("reason"),
+                        "operation": "start-user-service",
+                        "exitCode": proc.returncode,
+                        "durationMs": duration_ms,
+                        "stderr": proc.stderr[-1200:],
+                    }
+                )
+                db_set(conn, action_key, now_s)
+            except Exception as exc:
+                db_set(conn, action_key, now_s)
+                actions.append(
+                    {
+                        "action": "set_hermers_profile_mode",
+                        "result": "failed",
+                        "profile": profile,
+                        "unit": unit,
+                        "targetMode": target_mode,
+                        "reason": item.get("reason"),
+                        "operation": "start-user-service",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+    return actions
+
+
+def hermers_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
+    actions: List[Dict[str, Any]] = []
+    actions.extend(hermers_profile_mode_actuate(conn, snapshot))
     hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
     if not HERMERS_ACP_ORPHAN_REAP_ENABLED:
         return actions
@@ -3831,7 +4207,7 @@ def actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str
     for action in session_actuate(conn, snapshot, policy):
         action.update({"actionId": f"{action['action']}-{int(time.time() * 1000)}", "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd", "component": "session"})
         actions.append(action)
-    for action in hermers_actuate(snapshot, policy):
+    for action in hermers_actuate(conn, snapshot, policy):
         action.update({"actionId": f"{action['action']}-{int(time.time() * 1000)}", "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd", "component": "hermers"})
         actions.append(action)
     if policy.get("canRestartGateway"):
@@ -3884,7 +4260,7 @@ def collect_snapshot(conn: sqlite3.Connection) -> Tuple[Dict[str, Any], List[Dic
     snapshot["cron"] = cron_collect(findings)
     snapshot["session"] = session_collect(findings)
     snapshot["channel"] = channel_collect(findings)
-    snapshot["hermers"] = hermers_collect(findings)
+    snapshot["hermers"] = hermers_collect(conn, findings)
     snapshot["resource"] = resource_collect(findings)
     snapshot["config"] = config_collect(findings)
     snapshot["desiredState"] = desired_state_drift()
@@ -3920,6 +4296,7 @@ def run_once(conn: sqlite3.Connection, no_action: bool = False) -> Dict[str, Any
     write_json_atomic(POLICY_PATH, policy)
     write_json_atomic(LATEST_PATH, snapshot)
     write_json_atomic(LANE_POLICY_PATH, policy.get("lanes") or {})
+    write_json_atomic(HERMERS_PROFILE_MODES_PATH, ((snapshot.get("hermers") or {}).get("profileModes") or {}))
     write_json_atomic(CONTROL_PLANE_BACKPRESSURE_PATH, snapshot["controlPlane"])
     snapshot["workflowEvidence"] = write_workflow_stability_evidence(snapshot)
     write_legacy_watchdog_health(snapshot, policy)
@@ -4076,6 +4453,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("snapshot")
     sub.add_parser("policy")
     sub.add_parser("lanes")
+    sub.add_parser("profile-modes")
     sub.add_parser("desired-state")
     sub.add_parser("drift")
     sub.add_parser("findings")
@@ -4118,6 +4496,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if cmd == "lanes":
         lanes = load_json(LANE_POLICY_PATH, {}) or (load_json(POLICY_PATH, {}) or {}).get("lanes") or {}
         return print_json(lanes)
+    if cmd == "profile-modes":
+        return print_json(read_json_or_empty(HERMERS_PROFILE_MODES_PATH))
     if cmd == "desired-state":
         return print_json(load_desired_state())
     if cmd == "drift":

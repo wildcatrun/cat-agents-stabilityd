@@ -100,7 +100,7 @@ def parse_json_output(result: dict[str, Any], fallback: Any) -> Any:
 
 
 def stability_cli_args(action: str, args: dict[str, Any]) -> list[str]:
-    allowed = {"status", "snapshot", "policy", "lanes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook", "doctor", "repair", "once"}
+    allowed = {"status", "snapshot", "policy", "lanes", "profile-modes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook", "doctor", "repair", "once"}
     if action not in allowed:
         raise ValueError(f"unsupported stability action: {action}")
     cmd = [action]
@@ -148,6 +148,10 @@ def findings(args: dict[str, Any]) -> dict[str, Any]:
 
 def lanes(args: dict[str, Any]) -> dict[str, Any]:
     return stability_call({**args, "action": "lanes"})
+
+
+def profile_modes(args: dict[str, Any]) -> dict[str, Any]:
+    return stability_call({**args, "action": "profile-modes"})
 
 
 def actions(args: dict[str, Any]) -> dict[str, Any]:
@@ -216,6 +220,10 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "stability_lanes": {
         "description": "Return current cat-agents-stability lane policy.",
+        "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
+    },
+    "stability_profile_modes": {
+        "description": "Return Hermers profile runtime mode policy, including warm/cold/hibernate recommendations and managed/protected profile settings.",
         "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
     },
     "stability_actions": {
@@ -293,6 +301,8 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
                 payload = findings(arguments)
             elif name == "stability_lanes":
                 payload = lanes(arguments)
+            elif name == "stability_profile_modes":
+                payload = profile_modes(arguments)
             elif name == "stability_actions":
                 payload = actions(arguments)
             elif name == "stability_runbook":
