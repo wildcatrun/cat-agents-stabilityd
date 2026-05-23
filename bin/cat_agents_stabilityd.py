@@ -176,7 +176,10 @@ HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS = int(
 )
 HERMERS_PROFILE_PROTECTED_IDS = {
     item.strip()
-    for item in os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_PROTECTED_IDS", "main,cat_heart,catheart,cat_claw").split(",")
+    for item in os.environ.get(
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_PROTECTED_IDS",
+        os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_PROTECTED", "main,cat_heart,catheart,cat_claw"),
+    ).split(",")
     if item.strip()
 }
 

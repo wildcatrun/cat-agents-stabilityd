@@ -15,6 +15,8 @@ def load_stabilityd(tmp: str):
     os.environ["CAT_AGENTS_WORKFLOW_DB"] = str(Path(tmp) / "missing-tracking.db")
     os.environ.pop("CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_ALLOWLIST", None)
     os.environ.pop("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_MANAGED", None)
+    os.environ.pop("CAT_AGENTS_STABILITY_HERMERS_PROFILE_PROTECTED_IDS", None)
+    os.environ.pop("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_PROTECTED", None)
     os.environ.pop("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTUATE", None)
     module_path = Path(__file__).resolve().parents[1] / "bin" / "cat_agents_stabilityd.py"
     spec = importlib.util.spec_from_file_location("cat_agents_stabilityd_smoke", module_path)
@@ -43,6 +45,7 @@ def main() -> int:
         checks["protected_profile_blocked"] = not stabilityd.hermers_profile_lifecycle_allowed(
             "catheart", ["cat_heart"], protected=True
         )
+        checks["protected_default_contains_catheart"] = "catheart" in stabilityd.HERMERS_PROFILE_PROTECTED_IDS
 
         missing_profile = stabilityd.hermers_profile_safe_to_hibernate(
             "catears", {"safeToHibernate": True, "updated_at": stabilityd.ts()}, now_s

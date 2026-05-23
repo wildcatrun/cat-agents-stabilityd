@@ -296,6 +296,7 @@ Configuration:
 
 - `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ENABLED=1|0`
 - `CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_ALLOWLIST=catnose,catears` or another explicit stabilityd execution allowlist; empty by default, and `*` should be used only after a Human Gate/operator decision. Legacy `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_MANAGED` is accepted only as a compatibility alias.
+- `CAT_AGENTS_STABILITY_HERMERS_PROFILE_PROTECTED_IDS=main,cat_heart,catheart,cat_claw` for profiles or agent ids that stabilityd must never lifecycle-actuate. Legacy `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_PROTECTED` is accepted only as a compatibility alias.
 - `CAT_AGENTS_STABILITY_HERMERS_PROFILE_COLD_IDLE_SECONDS=1800`
 - `CAT_AGENTS_STABILITY_HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS=28800`
 
