@@ -26,7 +26,7 @@ WORKFLOW_DB = Path(
         str(HOME / "multi-agent-hedge-fund-framework" / "trading-agents-workflow" / "tracking.db"),
     )
 )
-DEFAULT_PROFILES = "catnose,catbody,catheart,catears,cateyes,catpenclaw"
+DEFAULT_PROFILES = ""
 
 
 def now_iso() -> str:
@@ -111,6 +111,100 @@ def profile_to_agent_id(profile: str) -> str:
     return profile
 
 
+def runtime_record_can_receive(record: dict[str, Any]) -> bool:
+    value = record.get("can_receive_dispatch")
+    if value is None:
+        return True
+    return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+def runtime_record_adapter_values(record: dict[str, Any]) -> set[str]:
+    return {
+        str(record.get("runtime") or ""),
+        str(record.get("platform") or ""),
+        str(record.get("execution_adapter") or ""),
+        str(record.get("workflow_ingress_adapter") or ""),
+    }
+
+
+def runtime_record_profile(record: dict[str, Any]) -> str:
+    endpoint = str(record.get("endpoint_ref") or "")
+    for prefix in ("hermers-profile:", "hermes-profile:", "profile:"):
+        if endpoint.startswith(prefix):
+            return endpoint.split(":", 1)[1].strip()
+    return ""
+
+
+def runtime_record_is_hermers_dispatch_profile(record: dict[str, Any]) -> bool:
+    values = runtime_record_adapter_values(record)
+    endpoint_profile = runtime_record_profile(record)
+    hermers_like = bool(
+        {"hermers", "hermes", "hermes_acp", "hermers_acp"} & values
+        or endpoint_profile
+    )
+    acp_like = bool(
+        {"acp", "hermes_acp", "hermers_acp"} & values
+        or endpoint_profile
+    )
+    return hermers_like and acp_like
+
+
+def profiles_from_runtime_registry() -> tuple[list[str], dict[str, Any]]:
+    meta: dict[str, Any] = {"source": "runtime_agents", "dbFile": str(WORKFLOW_DB), "exists": WORKFLOW_DB.exists()}
+    if not WORKFLOW_DB.exists():
+        meta["error"] = "workflow db missing"
+        return [], meta
+    try:
+        conn = sqlite3.connect(str(WORKFLOW_DB))
+        conn.row_factory = sqlite3.Row
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(runtime_agents)").fetchall()
+            if row["name"]
+        }
+        wanted = [
+            "agent_id",
+            "runtime",
+            "status",
+            "platform",
+            "workflow_ingress_adapter",
+            "execution_adapter",
+            "can_receive_dispatch",
+            "endpoint_ref",
+        ]
+        select_cols = [name for name in wanted if name in columns]
+        if not select_cols:
+            conn.close()
+            meta["error"] = "runtime_agents has no supported columns"
+            return [], meta
+        order_col = "agent_id" if "agent_id" in columns else "runtime" if "runtime" in columns else select_cols[0]
+        rows = conn.execute(
+            """
+            SELECT {columns}
+            FROM runtime_agents
+            ORDER BY {order_col}
+            """.format(columns=", ".join(select_cols), order_col=order_col)
+        ).fetchall()
+        conn.close()
+    except Exception as exc:
+        meta["error"] = f"{type(exc).__name__}: {exc}"
+        return [], meta
+    profiles: list[str] = []
+    for row in rows:
+        record = dict(row)
+        if str(record.get("status") or "") != "active":
+            continue
+        if not runtime_record_can_receive(record):
+            continue
+        if not runtime_record_is_hermers_dispatch_profile(record):
+            continue
+        profile = runtime_record_profile(record)
+        if profile and profile not in profiles:
+            profiles.append(profile)
+    meta["profileCount"] = len(profiles)
+    return profiles, meta
+
+
 def probe_profile(profile: str, rows: list[dict[str, str]]) -> dict[str, Any]:
     agent_id = profile_to_agent_id(profile)
     unit = f"hermes-gateway-{profile}.service"
@@ -161,13 +255,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Hermers read-only stability probe")
     parser.add_argument("--profiles", default=os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILES", DEFAULT_PROFILES))
     args = parser.parse_args()
-    profiles = [item.strip() for item in args.profiles.split(",") if item.strip()]
+    requested_profiles = [item.strip() for item in args.profiles.split(",") if item.strip()]
+    registry_profiles, registry_meta = profiles_from_runtime_registry()
+    profiles = requested_profiles or registry_profiles
     rows = ps_rows()
     results = [probe_profile(profile, rows) for profile in profiles]
     payload = {
         "checkedAt": now_iso(),
         "probe": "hermers_stability_probe",
         "readOnly": True,
+        "profileSource": "explicit" if requested_profiles else "runtime_agents",
+        "runtimeRegistry": registry_meta,
         "profileCount": len(results),
         "readyCount": sum(1 for item in results if item.get("ready")),
         "profiles": results,

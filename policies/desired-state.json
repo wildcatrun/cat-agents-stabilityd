@@ -50,6 +50,8 @@
     ]
   },
   "runtimeRegistry": {
+    "authoritativeSource": "trading-agents-workflow.runtime_agents",
+    "membershipPolicy": "observe-and-validate-invariants-only",
     "requiredRecords": [
       {
         "agentId": "main",
@@ -95,151 +97,102 @@
       },
       {
         "agentId": "cat_body",
-        "runtime": "hermes_acp",
-        "preferredRuntime": "hermes_acp",
+        "preferredRuntime": "hermers",
         "allowedRuntimes": [
-          "hermes_acp",
           "hermers",
-          "hermes"
+          "hermes",
+          "hermes_acp"
         ],
         "status": "active",
         "endpointRef": "hermes-profile:catbody",
-        "preferredEndpointRef": "hermes-profile:catbody",
         "allowedEndpointRefs": [
           "hermes-profile:catbody",
           "hermers-profile:catbody"
-        ]
+        ],
+        "preferredEndpointRef": "hermes-profile:catbody"
       },
       {
         "agentId": "cat_ears",
-        "runtime": "hermes_acp",
-        "preferredRuntime": "hermes_acp",
+        "preferredRuntime": "hermers",
         "allowedRuntimes": [
-          "hermes_acp",
           "hermers",
-          "hermes"
+          "hermes",
+          "hermes_acp"
         ],
         "status": "active",
         "endpointRef": "hermes-profile:catears",
-        "preferredEndpointRef": "hermes-profile:catears",
         "allowedEndpointRefs": [
           "hermes-profile:catears",
           "hermers-profile:catears"
-        ]
+        ],
+        "preferredEndpointRef": "hermes-profile:catears"
       },
       {
         "agentId": "cat_eyes",
-        "runtime": "hermes_acp",
-        "preferredRuntime": "hermes_acp",
+        "preferredRuntime": "hermers",
         "allowedRuntimes": [
-          "hermes_acp",
           "hermers",
-          "hermes"
+          "hermes",
+          "hermes_acp"
         ],
         "status": "active",
         "endpointRef": "hermes-profile:cateyes",
-        "preferredEndpointRef": "hermes-profile:cateyes",
         "allowedEndpointRefs": [
           "hermes-profile:cateyes",
           "hermers-profile:cateyes"
-        ]
+        ],
+        "preferredEndpointRef": "hermes-profile:cateyes"
       },
       {
         "agentId": "cat_heart",
-        "runtime": "hermes_acp",
-        "preferredRuntime": "hermes_acp",
+        "preferredRuntime": "hermers",
         "allowedRuntimes": [
-          "hermes_acp",
           "hermers",
-          "hermes"
+          "hermes",
+          "hermes_acp"
         ],
         "status": "active",
         "endpointRef": "hermes-profile:catheart",
-        "preferredEndpointRef": "hermes-profile:catheart",
         "allowedEndpointRefs": [
           "hermes-profile:catheart",
           "hermers-profile:catheart"
-        ]
+        ],
+        "preferredEndpointRef": "hermes-profile:catheart"
       },
       {
         "agentId": "cat_nose",
-        "runtime": "hermes_acp",
-        "preferredRuntime": "hermes_acp",
+        "preferredRuntime": "hermers",
         "allowedRuntimes": [
-          "hermes_acp",
           "hermers",
-          "hermes"
+          "hermes",
+          "hermes_acp"
         ],
         "status": "active",
         "endpointRef": "hermes-profile:catnose",
-        "preferredEndpointRef": "hermes-profile:catnose",
         "allowedEndpointRefs": [
           "hermes-profile:catnose",
           "hermers-profile:catnose"
-        ]
+        ],
+        "preferredEndpointRef": "hermes-profile:catnose"
       },
       {
         "agentId": "cat_penclaw",
-        "runtime": "hermes_acp",
-        "preferredRuntime": "hermes_acp",
+        "preferredRuntime": "hermers",
         "allowedRuntimes": [
-          "hermes_acp",
           "hermers",
-          "hermes"
+          "hermes",
+          "hermes_acp"
         ],
         "status": "active",
         "endpointRef": "hermes-profile:catpenclaw",
-        "preferredEndpointRef": "hermes-profile:catpenclaw",
         "allowedEndpointRefs": [
           "hermes-profile:catpenclaw",
           "hermers-profile:catpenclaw"
-        ]
+        ],
+        "preferredEndpointRef": "hermes-profile:catpenclaw"
       }
     ],
-    "temporaryAllowedRecords": [
-      {
-        "agentId": "cat_body",
-        "runtime": "openclaw_route_shell",
-        "status": "active",
-        "endpointRef": "openclaw-agent:cat_body",
-        "allowedUntil": "explicit Hermers IM cutover"
-      },
-      {
-        "agentId": "cat_ears",
-        "runtime": "openclaw_route_shell",
-        "status": "active",
-        "endpointRef": "openclaw-agent:cat_ears",
-        "allowedUntil": "explicit Hermers IM cutover"
-      },
-      {
-        "agentId": "cat_eyes",
-        "runtime": "openclaw_route_shell",
-        "status": "active",
-        "endpointRef": "openclaw-agent:cat_eyes",
-        "allowedUntil": "explicit Hermers IM cutover"
-      },
-      {
-        "agentId": "cat_heart",
-        "runtime": "openclaw_route_shell",
-        "status": "active",
-        "endpointRef": "openclaw-agent:cat_heart",
-        "allowedUntil": "explicit Hermers IM cutover"
-      },
-      {
-        "agentId": "cat_nose",
-        "runtime": "openclaw_route_shell",
-        "status": "active",
-        "endpointRef": "openclaw-agent:cat_nose",
-        "allowedUntil": "explicit Hermers IM cutover"
-      },
-      {
-        "agentId": "cat_penclaw",
-        "runtime": "openclaw_route_shell",
-        "status": "active",
-        "endpointRef": "openclaw-agent:cat_penclaw",
-        "allowedUntil": "explicit Hermers IM cutover"
-      }
-    ],
+    "temporaryAllowedRecords": [],
     "forbiddenAgentIds": [
       "catclaw"
     ],

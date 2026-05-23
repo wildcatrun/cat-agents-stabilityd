@@ -107,9 +107,9 @@ Required governance controls:
 - Treat Hermers as a first-class runtime domain, not an OpenClaw child process and not a CLI fallback.
 - Keep route-shell as an ingress and audit shell only. It may acknowledge receipt with `trace_id`, but it cannot satisfy formal agent-result semantics.
 - For `workflow_ingress_adapter=acp`, fail closed when ACP is unavailable. CLI can run only when registry explicitly selects the CLI adapter or a separately governed fallback is approved.
-- Keep cron intent and heartbeat governance in `trading-agents-workflow` unless a specific Hermers-local cron is explicitly registered as profile-internal. Profile-local cron output must still flow through workflow/messageflow receipts before it is treated as system truth.
+- Keep workflow-level schedule intent, evidence expectations, receipt requirements, and heartbeat governance in `trading-agents-workflow`. Runtime-local cron execution remains owned by the runtime platform; its outputs must flow back through workflow/messageflow receipts before they are treated as system truth.
 - Read `trading-agents-workflow` runtime receipts as a Hermers readiness signal: a single recent `runtime_runs.status=failed` becomes a Hermers observation with sample dispatch evidence, while repeated failures crossing the burst threshold become Hermers pressure.
-- Use process-group lifecycle control for ACP workers. Timeout must terminate the whole worker group and then verify that no orphan ACP child remains.
+- Observe ACP worker orphaning as runtime evidence. Stabilityd may reap eligible orphan ACP workers after policy approval and PID/cmd/profile revalidation, because orphan workers can keep pressure high after the owning runtime path is already gone.
 - Use three-layer health:
   - liveness: service/process/PID/cgroup exists
   - readiness: ACP backend, profile home, cwd, provider, queue acceptance, and small non-side-effect check are valid
@@ -121,17 +121,26 @@ Required governance controls:
 
 Cat Brain active governance role:
 
-- `cat-agents-stabilityd` supplies mechanical facts, policy, lane state, and low-risk mechanical actions. It does not replace governance judgment.
-- Cat Brain `main` is the active cat-agents administrator, governance officer, and Incident Commander. Its 30min heartbeat, 4h report, and daily governance report must consume `cat-agents-stabilityd` status, lanes, findings, actions, and workflow readiness as evidence.
+- `cat-agents-stabilityd` supplies mechanical facts, policy, lane state, repair candidates, runbook evidence, Human Gate packages, and controlled external repairs. It does not replace governance judgment, but it must remain capable of reducing mechanical pressure when agent runtimes are too degraded to repair themselves.
+- Stabilityd direct actuator authority is policy-gated, not removed. Light pressure can become structured repair candidates for Cat Brain; severe cron/session/worker/profile/Gateway pressure can be repaired by stabilityd itself with evidence refs, protected-member checks, cooldown/restart-storm gates, rollback notes, and action ledger entries.
+- Cat Brain `main` is the active cat-agents administrator, governance officer, Incident Commander, and runtime-level repair coordinator. Its 30min heartbeat, 4h report, daily governance report, and explicit workflow tasks must consume `cat-agents-stabilityd` status, lanes, findings, actions, repair candidates, and workflow readiness as evidence.
+- Cat Brain may act as the repair entrypoint for runtime-level fixes, but it must do so through the owning runtime adapter, `runtime_agents` registry, workflow receipt, and authorization/Human Gate rules. It is the governed runtime repair coordinator; stabilityd is the diagnostic/evidence plane and external repair actuator for cron/session/worker/profile/Gateway pressure.
 - Cat Brain must create or update incident state when Hermers is degraded, ACP is unavailable, stale dispatches persist, runtime output is incomplete, or outbound delivery is missing.
-- Cat Brain may ask Cat Claw to report to Flashcat or open Human Gate when the required action crosses operational authority. It must not restart Gateway/Hermers, rewrite profile config, or migrate cron ownership without explicit authorization.
+- Cat Brain may ask Cat Claw to report to Flashcat or open Human Gate when the required action crosses operational authority. It must not impersonate the backend service layer to restart Gateway/Hermers from inside runtime, rewrite profile config, kill workers, reset sessions, or migrate cron ownership without explicit authorization and rollback evidence.
 - Governance quality is multi-layered:
   - systemd/user services provide process liveness and bounded restart semantics
-  - `cat-agents-stabilityd` provides cross-runtime mechanical stability facts
+  - `cat-agents-stabilityd` provides cross-runtime mechanical stability facts, repair candidates, and policy-gated external repairs
   - `trading-agents-workflow` provides durable dispatch/messageflow/receipt closure
-  - Cat Brain provides semantic governance, incident command, and evidence sufficiency
+  - Cat Brain provides semantic governance, incident command, repair coordination, and evidence sufficiency
   - Cat Claw provides secretary review, Human Gate packaging, and user-facing delivery receipt
   - Codex provides Flashcat's control panel, deployment discipline, and high-impact ops guardrail
+
+2026-05-23 operator judgment warning:
+
+- Flashcat explicitly identified a mistaken judgment during this governance cycle: because stabilityd had kept the system stable for a long period, it became easy to forget the pre-stabilityd failure mode where frequent cron/session/channel/runtime pressure could make Cat Brain itself ineffective.
+- This is a standing caution, not a blame note. Stable operation is often proof that the external control plane is working, not proof that it can be removed.
+- Any future request, even from Flashcat, to remove, disable, or delegate stabilityd deep governance must first answer the runtime-incapacitation question: if Cat Brain, Hermers profiles, OpenClaw sessions, or workflow workers are already overloaded or unavailable, which external actor will reduce mechanical pressure?
+- If the proposed answer depends only on Cat Brain/runtime/workflow self-repair, the change is unsafe. Keep stabilityd's external repair layer or design an equivalent out-of-band replacement before reducing authority.
 
 ## Core Governance Principle
 
@@ -252,9 +261,10 @@ Actuators:
 
 Hermers runtime governance boundary:
 
-- Allowed by default: record findings, classify stale dispatch/messageflow state, and terminate orphan ACP worker process groups when owner liveness and timeout evidence are clear.
-- Profile runtime mode is observe-only. `cat-agents-stabilityd` records warm/cold/hibernate observations but must not start or stop Hermers profile services.
-- Disabled by default: restart Hermers gateways, rewrite profile config, migrate cron ownership, or switch runtime adapter. These require explicit operator/Human Gate authorization.
+- Allowed by default: record findings, classify stale dispatch/messageflow state, reap eligible orphan ACP workers, and perform policy-gated Hermers profile lifecycle repair through the Hermers profile-scoped CLI adapter for registry-derived managed profiles.
+- Profile runtime mode is stabilityd-coordinated, not a separate agent runtime controller. `cat-agents-stabilityd` records warm/cold/hibernate observations and may request Hermers profile gateway stop/start only through `hermes -p <profile> gateway stop|start` when the profile is registry-derived, explicitly lifecycle-allowlisted for stabilityd execution, unprotected, idle, has no active workflow/runtime evidence, has fresh profile-matching runtime-owned `safeToHibernate` evidence before stop, and passes action cooldown. Profile lifecycle execution defaults to observe-only unless `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTUATE=1` is explicitly set; the lifecycle allowlist defaults to empty and must be set with `CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_ALLOWLIST`. This allowlist is only a stabilityd blast-radius limiter, not a cat-system membership or residency policy source.
+- Hermers Gateway restart is a service-level actuator inside the Hermers adapter boundary. `cat-agents-stabilityd.service` may request `hermes -p <profile> gateway restart` when the restart actuator is enabled and cooldown/restart-history gates pass.
+- Disabled by default: rewrite profile config, migrate cron ownership, switch runtime adapter, or start/stop profiles outside the Hermers profile-scoped adapter and stabilityd profile-mode policy. These require explicit operator/Human Gate authorization.
 
 ## Hermers Profile Runtime Modes
 
@@ -262,30 +272,30 @@ Hermers runtime governance boundary:
 
 - The 4C/8G development server did not show CPU saturation or kernel OOM. The risk was memory commitment and swap pressure from multiple long-lived Hermers profile gateways plus OpenClaw Gateway.
 - Stopping one low-priority profile (`catears`) released roughly 0.9-1.1 GiB of usable headroom and reduced swap pressure without restarting Gateway or touching active trading workflow state.
-- The stop action was issued by `cat-agents-stabilityd` through `systemctl --user stop`, not by Hermers itself. Treat this as a stabilityd actuator, not a Hermers-native lifecycle decision.
+- The original stop action was issued by `cat-agents-stabilityd` through `systemctl --user stop`, not by Hermers itself. That path is now treated as a boundary mistake for profile lifecycle work. Future profile lifecycle actions must go through the Hermers profile-scoped adapter (`hermes -p <profile> gateway stop|start|restart`) or remain blocked as repair candidates until Hermers exposes a stronger native warm/cold/hibernate API.
 - Workflow runtime/dispatch evidence is not sufficient proof that a Hermers profile is idle. Telegram ingress, profile-local cron, and runtime-owned queues can create useful work without a current `trading-agents-workflow` dispatch row.
-- The profile-mode actuator is therefore retired. Future residency changes must be implemented inside the owning runtime platform, or performed as explicit operator action with runtime-native evidence and rollback notes.
+- The profile-mode actuator is retained as an external stability repair path because it can still act when agent runtimes are under pressure. It must remain registry-first, protected-member aware, cooldown-limited, evidence-driven, and routed through the owning runtime adapter rather than direct platform bypass.
 
 Runtime mode definitions:
 
 - `hot`: profile has active ACP workers, active workflow runtime rows, or active dispatch evidence. It must not be stopped.
 - `warm`: profile service is expected active and no cold/hibernate observation is present.
-- `cold`: profile has been idle beyond the cold threshold. This is an observation only.
-- `hibernate`: observation that the profile appears idle beyond the hibernate threshold. This is not authority for stabilityd to stop the user service, and it does not suppress service-down readiness findings by itself.
+- `cold`: profile has been idle beyond the cold threshold. This constrains readiness/admission evidence but does not stop the service by itself.
+- `hibernate`: observation that the profile appears idle beyond the hibernate threshold. It becomes authority to request Hermers profile gateway stop only when the profile is registry-derived, managed, unprotected, has no active work evidence, and the runtime-owned state explicitly reports fresh, profile-matching `safeToHibernate=true`; it does not suppress service-down readiness findings by itself.
 
 Profile observation source:
 
 - Cat-system member observation starts from `trading-agents-workflow.runtime_agents`, not from a Hermers-only list.
-- Hermers profile observations are derived from active `runtime_agents` records whose runtime is `hermers`, `hermes`, or `hermes_acp` and whose `endpoint_ref` is `hermes-profile:<profile>`.
-- `CAT_AGENTS_STABILITY_HERMERS_PROFILES` is only a diagnostic fallback when the workflow registry is unavailable or empty. A fallback finding must be emitted; it is not a governance source of truth.
+- Hermers profile observations are derived primarily from active `runtime_agents` records with `platform=hermers`, an explicit workflow ingress adapter such as `acp`, dispatch eligibility, and an endpoint reference such as `hermes-profile:<profile>`. Legacy `runtime=hermers`, `runtime=hermes`, `runtime=hermes_acp`, or `hermers-profile:<profile>` endpoint aliases are read compatibility signals only; desired-state may accept them as migration-compatible observations, but `preferredEndpointRef` remains the canonical `hermes-profile:<profile>` target.
+- If the workflow registry is unavailable or empty, stabilityd emits a registry-unavailable finding and does not synthesize a Hermers member list.
 - Cold threshold defaults to 30 minutes idle.
 - Hibernate threshold defaults to 8 hours idle.
-- `cold` and `hibernate` are advisory observations in the current implementation.
+- `cold` and `hibernate` are readiness observations for workflow. For stabilityd they are repair candidates; actual stop/start execution still requires the profile-mode gates and the Hermers profile-scoped lifecycle adapter.
 
 Configuration:
 
 - `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ENABLED=1|0`
-- `CAT_AGENTS_STABILITY_HERMERS_PROFILES=...`, fallback-only diagnostic list
+- `CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_ALLOWLIST=catnose,catears` or another explicit stabilityd execution allowlist; empty by default, and `*` should be used only after a Human Gate/operator decision. Legacy `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_MANAGED` is accepted only as a compatibility alias.
 - `CAT_AGENTS_STABILITY_HERMERS_PROFILE_COLD_IDLE_SECONDS=1800`
 - `CAT_AGENTS_STABILITY_HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS=28800`
 
@@ -299,20 +309,20 @@ Unified agent lifecycle policy:
 
 - `trading-agents-workflow` is a workflow scheduler and evidence plane, not the runtime platform for cat-system members.
 - Cat-system members run inside OpenClaw, Hermers/Hermes, Codex, or other registered runtimes. Runtime residency is owned by those platforms.
-- Unified lifecycle language is governance vocabulary for readiness, dispatch admission, receipt, and Human Gate evidence. It must map to runtime-domain observations and runtime-native controls instead of introducing a third agent-level actuator.
+- Unified lifecycle language is governance vocabulary for readiness, dispatch admission, receipt, Human Gate evidence, and stabilityd external repair. It must map to runtime-domain observations and policy-gated stabilityd/runtime controls instead of creating platform-local membership policy.
 - Hermers/Hermes, OpenClaw, Codex, and future runtimes are platform adapters under the global `runtime_agents` registry. They must not define separate cat-system member policy from their own local profile lists.
-- Runtime-specific checks can inspect service names, profile files, cron state, sessions, or ACP workers, but only after the target members are selected from the global registry or after emitting a fallback-warning finding.
-- Protected member requirements such as `main`, `catheart` / `cat_heart`, and `cat_claw` should be expressed as runtime-specific protection policy, not by workflow/stabilityd forcibly managing their execution environment.
+- Runtime-specific checks can inspect service names, profile files, cron state, sessions, or ACP workers only after the target members are selected from the global registry.
+- Protected member requirements such as `main`, `catheart` / `cat_heart`, and `cat_claw` must be enforced by stabilityd and runtime-specific protection policy; workflow must not override them, and stabilityd profile lifecycle actions must skip them.
 
 Safety rules:
 
-- Never infer that every profile is safe to hibernate. Warm/cold/hibernate output is observation only unless the owning runtime platform supplies its own control mechanism and evidence.
+- Never infer that every profile is safe to hibernate. Warm/cold/hibernate execution requires registry-derived membership, an explicit stabilityd lifecycle allowlist entry, protected-member exclusion, no active workers/runtime rows/dispatch evidence, reliable activity probe, fresh profile-matching runtime-owned `safeToHibernate=true`, explicit actuator enablement, and action cooldown.
 - Never stop a profile with active ACP workers, active workflow runtime rows, active dispatch evidence, pending Telegram ingress, profile-local cron work, or runtime-owned queue work.
 - Absence of workflow activity is not proof of runtime idleness. It is only one signal.
-- Workflow activity probe failure blocks hibernation. If the workflow DB is missing, locked, schema-drifted, or unreadable, stabilityd keeps managed profiles expected-active and emits an activity-probe finding instead of reclaiming them.
+- Workflow activity probe failure blocks lifecycle conclusions. If the workflow DB or `runtime_agents` registry is missing, locked, schema-drifted, or unreadable, stabilityd emits a registry/probe finding and does not make member lifecycle claims.
 - A service being inactive is not by itself proof of intentional hibernation. `cat-agents-stabilityd` must not suppress `hermers_gateway_service_down` from its own historical hibernate records.
-- Do not use systemd hard memory caps or Node heap caps as the first response when the problem is agent runtime residency. Prefer profile lifecycle, admission control, and session/context externalization first.
-- Human/operator-critical roles stay resident unless Flashcat explicitly changes their protection class.
+- Do not use systemd hard memory caps or Node heap caps as the first response when the problem is agent runtime residency. Prefer runtime-native lifecycle evidence, workflow admission control, and session/context externalization first.
+- Human/operator-critical residency or protection requirements must be expressed through `runtime_agents`, runtime-owned policy, or explicit Flashcat instruction, not through stabilityd-local profile classes.
 
 ## State Machine
 
@@ -362,8 +372,9 @@ Rules:
 
 - Any missing policy is treated as deny.
 - Any expired policy is treated as deny.
-- Cron mutation, session reset, and gateway restart require explicit true fields.
-- Gateway restarts must be performed only by `systemctl restart openclaw-gateway.service`.
+- Cron stale/lease repair, eligible session reset, orphan worker termination, Hermers-adapter profile lifecycle actions, and Gateway restart are inside the controlled stabilityd actuator boundary when policy gates allow them.
+- Gateway restart is inside the controlled service-level actuator boundary for OpenClaw Gateway and Hermers Gateway, subject to explicit policy, evidence, cooldown, restart-storm/history gates, action ledger, and post-check evidence.
+- Runtime config edits, model routing changes, profile config rewrites, membership changes, and trading-side effects remain outside stabilityd's automatic actuator boundary.
 
 ## Recovery Policy
 
@@ -720,7 +731,7 @@ Soft pressure actions:
 - Write backpressure state for cooperative jobs to read.
 - Prefer subagent/systemd isolation for heavy control-plane reports over running them inside the same direct-response lane.
 - As a last-resort rescue path, allow one controlled Gateway restart only when soft-pressure governance has clearly failed and the system has remained at collapse edge for a sustained window.
-- Treat Hermers profile `warm -> cold -> hibernate` as an observation stream before treating memory pressure as a Gateway restart problem; actual profile residency changes belong to the owning runtime platform or an explicit operator action.
+- Treat Hermers profile `warm -> cold -> hibernate` as a profile-mode governance stream before treating memory pressure as a Gateway restart problem; stabilityd may request residency changes only through the Hermers profile-scoped adapter for managed, unprotected, registry-derived profiles with runtime-owned hibernate safety evidence.
 - Keep active development profiles protected; if a profile is doing visible work, stabilityd may observe it but must not reclaim it as memory headroom.
 
 Action ladder:
@@ -921,10 +932,10 @@ Exit conditions:
 
 Current implementation boundary:
 
-- Gateway restart is disabled by systemd drop-in while this policy is observed.
-- The code-level default is hard-fault-only Gateway restart.
-- Ordinary soft restart paths exist only behind `OPENCLAW_STABILITY_SOFT_RESTART_GATEWAY=1` and should remain disabled unless a future runbook proves a specific safe case.
-- Soft-pressure rescue restart is separate from ordinary soft restart. It is allowed only as an extreme fallback and is currently still blocked operationally by the systemd drop-in until the first review decides whether to re-enable Gateway restart authority.
+- Gateway restart is inside the stabilityd service-level actuator boundary, because the Gateway runs outside the agent runtime and runtime self-restart is a higher-risk control path.
+- The OpenClaw Gateway restart actuator is enabled by code default and can still be disabled by deployment environment with `OPENCLAW_STABILITY_RESTART_GATEWAY=0`; valid `canRestartGateway` policy executes `systemctl restart openclaw-gateway.service`.
+- Hermers Gateway restart is similarly policy-gated by `CAT_AGENTS_STABILITY_RESTART_HERMERS_GATEWAY=1` / `OPENCLAW_STABILITY_RESTART_HERMERS_GATEWAY=1`, only targets registered Hermers profiles through `hermes -p <profile> gateway restart`, and records its own cooldown/restart-history window.
+- Ordinary soft restart and soft-pressure rescue signals remain gated; they may execute only when the specific restart policy allows them and global cooldown/restart-history checks pass.
 - `control-plane-backpressure.json` is the first cooperative soft-pressure interface. It should evolve into a small runtime contract used by heavy jobs, not a broad monitoring dump.
 
 Current implementation gap:
@@ -1023,7 +1034,7 @@ The daemon was corrected to:
 
 This correction is important: action ledger entries should represent meaningful attempted recovery, not repeated scans of stale log lines.
 
-### First Controlled Restart
+### Historical Controlled Restart
 
 After legacy controller cooldown expired, the new daemon executed one controlled Gateway restart:
 
@@ -1041,7 +1052,7 @@ Post-restart verification:
 - `openclaw-gateway-watchdog.service` disabled/inactive.
 - Legacy guard/controller timers disabled/inactive.
 
-The restart established the intended behavior: restarts are now centralized, rate-limited, audited, and performed through systemd.
+This event remains the intended service-layer pattern: Gateway restarts are centralized in `cat-agents-stabilityd.service`, rate-limited, audited, and performed through systemd when the restart actuator is enabled and policy gates pass.
 
 ### Current Health Interpretation
 

@@ -35,6 +35,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 HOME = Path(os.environ.get("OPENCLAW_HOME_DIR", "/home/flashcat"))
 OPENCLAW = HOME / ".openclaw"
 HERMES_HOME = HOME / ".hermes"
+HERMES_CLI = os.environ.get("CAT_AGENTS_STABILITY_HERMES_CLI", str(HOME / ".local/bin/hermes"))
 
 
 def default_workflow_root() -> Path:
@@ -136,14 +137,7 @@ RESOURCE_HUMAN_GATE_REFRESH_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_RES
 BACKUP_HEADROOM_WARN_RATIO = float(os.environ.get("OPENCLAW_STABILITY_BACKUP_HEADROOM_WARN_RATIO", "1.20"))
 BACKUP_KEEP_COUNT = int(os.environ.get("OPENCLAW_STABILITY_BACKUP_KEEP_COUNT", "3"))
 
-HERMERS_PROFILE_FALLBACKS = [
-    item.strip()
-    for item in os.environ.get(
-        "CAT_AGENTS_STABILITY_HERMERS_PROFILES",
-        os.environ.get("OPENCLAW_STABILITY_HERMERS_PROFILES", "catnose,catbody,catheart,catears,cateyes,catpenclaw"),
-    ).split(",")
-    if item.strip()
-]
+HERMERS_PROFILE_FALLBACKS: List[str] = []
 HERMERS_ACP_ORPHAN_REAP_ENABLED = os.environ.get(
     "CAT_AGENTS_STABILITY_REAP_HERMERS_ACP_ORPHANS",
     os.environ.get("OPENCLAW_STABILITY_REAP_HERMERS_ACP_ORPHANS", "1"),
@@ -152,14 +146,39 @@ HERMERS_GATEWAY_RESTART_ENABLED = os.environ.get(
     "CAT_AGENTS_STABILITY_RESTART_HERMERS_GATEWAY",
     os.environ.get("OPENCLAW_STABILITY_RESTART_HERMERS_GATEWAY", "0"),
 ) == "1"
+HERMERS_GATEWAY_RESTART_LIMIT = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_GATEWAY_RESTART_LIMIT", str(MAX_RESTARTS_PER_WINDOW)))
 HERMERS_ACP_ORPHAN_MIN_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_ACP_ORPHAN_SECONDS", "120"))
 HERMERS_ACP_LONG_RUNNING_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_ACP_LONG_SECONDS", "600"))
 HERMERS_FAILURE_WINDOW_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_FAILURE_WINDOW_SECONDS", "1800"))
 HERMERS_FAILURE_BURST_THRESHOLD = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_FAILURE_BURST", "5"))
 HERMERS_STALE_SENT_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_STALE_SENT_SECONDS", "600"))
 HERMERS_PROFILE_MODE_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ENABLED", "1") != "0"
+HERMERS_PROFILE_MODE_ACTUATE_ENABLED = os.environ.get(
+    "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTUATE",
+    os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_ACTUATE", "0"),
+) != "0"
+HERMERS_PROFILE_MODE_START_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_START", "1") != "0"
+HERMERS_PROFILE_LIFECYCLE_ALLOWLIST = {
+    item.strip()
+    for item in os.environ.get(
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_ALLOWLIST",
+        os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_MANAGED", ""),
+    ).split(",")
+    if item.strip()
+}
 HERMERS_PROFILE_COLD_IDLE_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_COLD_IDLE_SECONDS", str(30 * 60)))
 HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS", str(8 * 3600)))
+HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS = int(
+    os.environ.get(
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS",
+        os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS", "600"),
+    )
+)
+HERMERS_PROFILE_PROTECTED_IDS = {
+    item.strip()
+    for item in os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_PROTECTED_IDS", "main,cat_heart,catheart,cat_claw").split(",")
+    if item.strip()
+}
 
 TMP_FILE_MAX_AGE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_TMP_MAX_AGE_SECONDS", "3600"))
 ORPHAN_RUN_LOG_MIN_AGE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_ORPHAN_RUN_LOG_MIN_AGE_SECONDS", "3600"))
@@ -169,6 +188,7 @@ LEASE_REAP_ENABLED = os.environ.get("OPENCLAW_STABILITY_REAP_LEASES", "1") != "0
 SESSION_RESET_ENABLED = os.environ.get("OPENCLAW_STABILITY_RESET_SESSIONS", "1") != "0"
 CRON_MUTATION_ENABLED = os.environ.get("OPENCLAW_STABILITY_MUTATE_CRON", "1") != "0"
 GATEWAY_RESTART_ENABLED = os.environ.get("OPENCLAW_STABILITY_RESTART_GATEWAY", "1") != "0"
+GATEWAY_RESTART_ACTUATOR_SUPPORTED = True
 SOFT_GATEWAY_RESTART_ENABLED = os.environ.get("OPENCLAW_STABILITY_SOFT_RESTART_GATEWAY", "0") == "1"
 SOFT_RESCUE_RESTART_ENABLED = os.environ.get("OPENCLAW_STABILITY_SOFT_RESCUE_RESTART", "1") != "0"
 SOFT_RESCUE_STREAK_THRESHOLD = int(os.environ.get("OPENCLAW_STABILITY_SOFT_RESCUE_STREAK", "20"))
@@ -386,6 +406,13 @@ def run_user_cmd(cmd: List[str], timeout: int = 10) -> subprocess.CompletedProce
     return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, env=env)
 
 
+def run_hermes_profile_gateway_cmd(profile: str, command: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    if command not in {"start", "stop", "restart", "status"}:
+        raise ValueError(f"unsupported Hermers gateway command: {command}")
+    cmd = [HERMES_CLI, "-p", profile, "gateway", command]
+    return run_user_cmd(cmd, timeout=timeout)
+
+
 def command_probe(cmd: List[str], timeout: int = 5, max_chars: int = 16_000) -> Dict[str, Any]:
     started = time.time()
     try:
@@ -579,12 +606,39 @@ def workflow_runtime_registry_records() -> Dict[str, Any]:
             payload["error"] = "runtime_agents table not found"
             conn.close()
             return payload
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(runtime_agents)").fetchall()
+            if row["name"]
+        }
+        wanted = [
+            "agent_key",
+            "agent_id",
+            "runtime",
+            "display_name",
+            "role",
+            "status",
+            "platform",
+            "execution_adapter",
+            "workflow_ingress_adapter",
+            "can_receive_dispatch",
+            "endpoint_ref",
+            "updated_at",
+        ]
+        select_cols = [name for name in wanted if name in columns]
+        if not select_cols:
+            payload["error"] = "runtime_agents has no supported columns"
+            conn.close()
+            return payload
+        order_cols = [name for name in ("agent_id", "runtime") if name in columns]
+        if not order_cols:
+            order_cols = [select_cols[0]]
         rows = conn.execute(
             """
-            SELECT agent_id, runtime, display_name, role, status, endpoint_ref, updated_at
+            SELECT {columns}
             FROM runtime_agents
-            ORDER BY agent_id, runtime
-            """
+            ORDER BY {order_cols}
+            """.format(columns=", ".join(select_cols), order_cols=", ".join(order_cols))
         ).fetchall()
         payload["records"] = [dict(row) for row in rows]
         conn.close()
@@ -1207,7 +1261,8 @@ def hermers_gateway_processes(rows: List[Dict[str, str]], profile: str) -> List[
 
 def hermers_acp_workers(rows: List[Dict[str, str]], known_profiles: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
     workers = []
-    known = {str(item) for item in (known_profiles or HERMERS_PROFILE_FALLBACKS) if str(item)}
+    known_source = HERMERS_PROFILE_FALLBACKS if known_profiles is None else known_profiles
+    known = {str(item) for item in known_source if str(item)}
     for row in rows:
         cmd = row.get("cmd", "")
         if " acp" not in cmd or "/hermes" not in cmd or " --accept-hooks" not in cmd:
@@ -1229,12 +1284,45 @@ def hermers_acp_workers(rows: List[Dict[str, str]], known_profiles: Optional[Ite
 
 
 def hermers_profile_agent_ids(profile: str) -> set[str]:
-    ids = {profile}
-    if profile.startswith("cat") and "_" not in profile:
-        rest = profile[3:]
-        if rest:
-            ids.add(f"cat_{rest}")
-    return ids
+    return set()
+
+
+def runtime_record_can_receive(record: Dict[str, Any]) -> bool:
+    value = record.get("can_receive_dispatch")
+    if value is None:
+        return True
+    return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+def runtime_record_adapter_values(record: Dict[str, Any]) -> set[str]:
+    return {
+        str(record.get("runtime") or ""),
+        str(record.get("platform") or ""),
+        str(record.get("execution_adapter") or ""),
+        str(record.get("workflow_ingress_adapter") or ""),
+    }
+
+
+def runtime_record_hermers_profile(record: Dict[str, Any]) -> str:
+    endpoint_ref = str(record.get("endpoint_ref") or "")
+    for prefix in ("hermers-profile:", "hermes-profile:", "profile:"):
+        if endpoint_ref.startswith(prefix):
+            return endpoint_ref.split(":", 1)[1].strip()
+    return ""
+
+
+def runtime_record_is_hermers_dispatch_profile(record: Dict[str, Any]) -> bool:
+    values = runtime_record_adapter_values(record)
+    endpoint_profile = runtime_record_hermers_profile(record)
+    hermers_like = bool(
+        {"hermers", "hermes", "hermes_acp", "hermers_acp"} & values
+        or endpoint_profile
+    )
+    acp_like = bool(
+        {"acp", "hermes_acp", "hermers_acp"} & values
+        or endpoint_profile
+    )
+    return hermers_like and acp_like
 
 
 def hermers_profiles_from_runtime_registry(findings: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
@@ -1244,17 +1332,23 @@ def hermers_profiles_from_runtime_registry(findings: List[Dict[str, Any]]) -> Tu
     for record in records:
         if not isinstance(record, dict):
             continue
-        runtime = str(record.get("runtime") or "")
         status = str(record.get("status") or "")
-        endpoint_ref = str(record.get("endpoint_ref") or "")
-        if runtime not in {"hermes_acp", "hermes", "hermers"}:
+        if status != "active":
             continue
-        if status in {"retired", "inactive", "disabled"}:
+        if not runtime_record_can_receive(record):
             continue
-        if not endpoint_ref.startswith("hermes-profile:"):
+        if not runtime_record_is_hermers_dispatch_profile(record):
             continue
-        profile = endpoint_ref.split(":", 1)[1].strip()
+        profile = runtime_record_hermers_profile(record)
         if not profile:
+            add_finding(
+                findings,
+                "hermers_profile_endpoint_unparseable",
+                "warning",
+                "hermers",
+                "Active Hermers dispatch-capable runtime_agents row has no parseable runtime-owned profile endpoint",
+                record=record,
+            )
             continue
         item = profiles.setdefault(
             profile,
@@ -1268,7 +1362,6 @@ def hermers_profiles_from_runtime_registry(findings: List[Dict[str, Any]]) -> Tu
         agent_id = str(record.get("agent_id") or "")
         if agent_id:
             item["agentIds"].add(agent_id)
-        item["agentIds"].update(hermers_profile_agent_ids(profile))
         item["registryRecords"].append(record)
 
     if profiles:
@@ -1281,30 +1374,21 @@ def hermers_profiles_from_runtime_registry(findings: List[Dict[str, Any]]) -> Tu
             "profileCount": len(profiles),
         }
 
-    fallback = {
-        profile: {
-            "profile": profile,
-            "agentIds": sorted(hermers_profile_agent_ids(profile)),
-            "registryRecords": [],
-            "source": "fallback",
-        }
-        for profile in HERMERS_PROFILE_FALLBACKS
-    }
     reason = registry.get("error") or "no active hermers profiles found in runtime_agents"
     add_finding(
         findings,
-        "hermers_profile_registry_fallback",
+        "hermers_profile_registry_unavailable",
         "warning",
         "hermers",
-        "Hermers profile observation fell back to legacy profile list instead of runtime_agents",
+        "Hermers profile observation did not derive any dispatch-capable profile from runtime_agents",
         reason=reason,
         dbFile=registry.get("dbFile"),
     )
-    return fallback, {
-        "source": "fallback",
+    return {}, {
+        "source": "runtime_agents",
         "dbFile": registry.get("dbFile"),
         "reason": reason,
-        "profileCount": len(fallback),
+        "profileCount": 0,
     }
 
 
@@ -1313,7 +1397,7 @@ def hermers_profile_workflow_activity(profile_records: Dict[str, Dict[str, Any]]
         profile: {
             "profile": profile,
             "probeOk": True,
-            "agentIds": sorted(set(item.get("agentIds") or []) | hermers_profile_agent_ids(profile)),
+            "agentIds": sorted(set(item.get("agentIds") or [])),
             "activeRuntimeCount": 0,
             "activeDispatchCount": 0,
             "lastActivityEpoch": None,
@@ -1331,11 +1415,14 @@ def hermers_profile_workflow_activity(profile_records: Dict[str, Dict[str, Any]]
     def matches_profile(profile: str, row: Dict[str, Any]) -> bool:
         agent_id = str(row.get("agent_id") or "")
         adapter = str(row.get("adapter") or "")
+        acp_agent = str(row.get("acp_agent") or "")
+        payload_json = str(row.get("payload_json") or "")
         agent_ids = set(activity.get(profile, {}).get("agentIds") or [])
-        text = f"{agent_id} {adapter}".lower()
         if agent_id in agent_ids:
             return True
-        return profile.lower() in text
+        if acp_agent == profile or acp_agent.endswith(f" -p {profile} acp --accept-hooks"):
+            return True
+        return f'"profile": "{profile}"' in payload_json or f'"profile":"{profile}"' in payload_json
 
     def record(profile: str, row: Dict[str, Any], when_raw: Any, active: bool, kind: str) -> None:
         item = activity.setdefault(profile, {"profile": profile})
@@ -1360,7 +1447,7 @@ def hermers_profile_workflow_activity(profile_records: Dict[str, Dict[str, Any]]
         conn.row_factory = sqlite3.Row
         runtime_rows = conn.execute(
             """
-            SELECT 'runtime' AS kind, agent_id, adapter, status, started_at, completed_at
+            SELECT 'runtime' AS kind, agent_id, adapter, acp_agent, status, started_at, completed_at, payload_json
             FROM runtime_runs
             WHERE runtime IN ('hermes_acp', 'hermes', 'hermers')
             ORDER BY COALESCE(completed_at, started_at) DESC
@@ -1378,7 +1465,7 @@ def hermers_profile_workflow_activity(profile_records: Dict[str, Dict[str, Any]]
 
         dispatch_rows = conn.execute(
             """
-            SELECT 'dispatch' AS kind, agent_id, runtime, status, updated_at, sent_at
+            SELECT 'dispatch' AS kind, agent_id, runtime, status, updated_at, sent_at, payload_json
             FROM mixed_meeting_dispatches
             WHERE runtime IN ('hermes_acp', 'hermes', 'hermers')
             ORDER BY COALESCE(updated_at, sent_at) DESC
@@ -1404,6 +1491,59 @@ def hermers_profile_workflow_activity(profile_records: Dict[str, Dict[str, Any]]
     return activity
 
 
+def hermers_profile_is_protected(profile: str, agent_ids: Iterable[str]) -> bool:
+    candidates = {profile, *[str(agent_id) for agent_id in agent_ids if str(agent_id)]}
+    return bool(candidates & HERMERS_PROFILE_PROTECTED_IDS)
+
+
+def hermers_profile_lifecycle_allowed(profile: str, agent_ids: Iterable[str], protected: bool) -> bool:
+    if protected:
+        return False
+    candidates = {profile, *[str(agent_id) for agent_id in agent_ids if str(agent_id)]}
+    return "*" in HERMERS_PROFILE_LIFECYCLE_ALLOWLIST or bool(candidates & HERMERS_PROFILE_LIFECYCLE_ALLOWLIST)
+
+
+def hermers_profile_safe_to_hibernate(profile: str, state: Dict[str, Any], now_s: int) -> Tuple[bool, str]:
+    if not isinstance(state, dict):
+        return False, "missing-runtime-state"
+    state_profile = str(state.get("profile") or state.get("profileId") or state.get("profile_id") or "")
+    if not state_profile:
+        return False, "runtime-state-profile-missing"
+    if state_profile != profile:
+        return False, "runtime-state-profile-mismatch"
+    timestamp_candidates = [
+        state.get("safeToHibernateAt"),
+        state.get("safe_to_hibernate_at"),
+        state.get("updated_at"),
+        state.get("updatedAt"),
+        (state.get("stability") or {}).get("safeToHibernateAt") if isinstance(state.get("stability"), dict) else None,
+        (state.get("stability") or {}).get("safe_to_hibernate_at") if isinstance(state.get("stability"), dict) else None,
+        (state.get("stability") or {}).get("updated_at") if isinstance(state.get("stability"), dict) else None,
+        (state.get("stability") or {}).get("updatedAt") if isinstance(state.get("stability"), dict) else None,
+        (state.get("idle") or {}).get("safeToHibernateAt") if isinstance(state.get("idle"), dict) else None,
+        (state.get("idle") or {}).get("safe_to_hibernate_at") if isinstance(state.get("idle"), dict) else None,
+        (state.get("idle") or {}).get("updated_at") if isinstance(state.get("idle"), dict) else None,
+        (state.get("idle") or {}).get("updatedAt") if isinstance(state.get("idle"), dict) else None,
+    ]
+    updated_epoch = next((parse_iso_epoch(value) for value in timestamp_candidates if parse_iso_epoch(value)), None)
+    max_age = HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS
+    if updated_epoch is None:
+        return False, "runtime-safe-to-hibernate-timestamp-missing"
+    if now_s - int(updated_epoch) > max_age:
+        return False, "runtime-safe-to-hibernate-stale"
+    candidates = [
+        state.get("safeToHibernate"),
+        state.get("safe_to_hibernate"),
+        (state.get("stability") or {}).get("safeToHibernate") if isinstance(state.get("stability"), dict) else None,
+        (state.get("stability") or {}).get("safe_to_hibernate") if isinstance(state.get("stability"), dict) else None,
+        (state.get("idle") or {}).get("safeToHibernate") if isinstance(state.get("idle"), dict) else None,
+        (state.get("idle") or {}).get("safe_to_hibernate") if isinstance(state.get("idle"), dict) else None,
+    ]
+    if any(value is True for value in candidates):
+        return True, "runtime-safe-to-hibernate"
+    return False, "runtime-safe-to-hibernate-missing"
+
+
 def build_hermers_profile_modes(
     conn: sqlite3.Connection,
     profiles: Dict[str, Any],
@@ -1416,49 +1556,73 @@ def build_hermers_profile_modes(
     profile_modes: Dict[str, Any] = {}
     for profile, profile_snapshot in profiles.items():
         service = profile_snapshot.get("service") if isinstance(profile_snapshot.get("service"), dict) else {}
+        state = profile_snapshot.get("state") if isinstance(profile_snapshot.get("state"), dict) else {}
         active = bool(profile_snapshot.get("active"))
         registry_item = profile_registry.get(profile) if isinstance(profile_registry.get(profile), dict) else {}
         profile_workers = [item for item in acp_workers if item.get("profile") == profile]
         workflow = workflow_activity.get(profile) or {}
+        agent_ids = sorted(set(registry_item.get("agentIds") or []) | set(workflow.get("agentIds") or []))
+        protected = hermers_profile_is_protected(profile, agent_ids)
+        lifecycle_allowed = hermers_profile_lifecycle_allowed(profile, agent_ids, protected)
+        planned = db_get(conn, f"hermers_profile_mode:planned:{profile}", {}) or {}
+        planned_mode = str(planned.get("targetMode") or planned.get("observedMode") or "") if isinstance(planned, dict) else ""
         workflow_probe_ok = bool(workflow.get("probeOk", True))
         active_work = bool(profile_workers) or int(workflow.get("activeRuntimeCount") or 0) > 0 or int(workflow.get("activeDispatchCount") or 0) > 0
+        safe_to_hibernate, safe_reason = hermers_profile_safe_to_hibernate(profile, state, now_s)
 
         last_activity_epoch = workflow.get("lastActivityEpoch")
         if last_activity_epoch is None and active:
             last_activity_epoch = parse_iso_epoch(service.get("ActiveEnterTimestamp"))
         idle_seconds = max(0, now_s - int(last_activity_epoch)) if last_activity_epoch is not None else None
 
-        target_mode = "warm"
-        reason = "warm"
+        observed_mode = "warm"
+        reason = "lifecycle-not-allowlisted"
         expected_active = True
         if not HERMERS_PROFILE_MODE_ENABLED:
             reason = "profile-mode-disabled"
+        elif protected:
+            reason = "protected-profile"
+        elif not lifecycle_allowed:
+            reason = "lifecycle-not-allowlisted"
         elif not workflow_probe_ok:
             reason = "workflow-activity-unavailable"
         elif active_work:
-            target_mode = "hot"
+            observed_mode = "hot"
             reason = "active-work"
+        elif not active and planned_mode == "hibernate":
+            observed_mode = "hibernate"
+            expected_active = False
+            reason = "planned-hibernate-inactive"
         elif not active:
             reason = "inactive-unplanned"
         elif idle_seconds is not None and idle_seconds >= HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS:
-            target_mode = "hibernate"
+            observed_mode = "hibernate"
+            expected_active = False
             reason = "idle-hibernate-threshold"
         elif idle_seconds is not None and idle_seconds >= HERMERS_PROFILE_COLD_IDLE_SECONDS:
-            target_mode = "cold"
+            observed_mode = "cold"
             reason = "idle-cold-threshold"
         else:
             reason = "recent-or-unknown-activity"
 
         profile_modes[profile] = {
             "profile": profile,
-            "agentIds": sorted(set(registry_item.get("agentIds") or []) | set(workflow.get("agentIds") or [])),
+            "agentIds": agent_ids,
             "registrySource": registry_item.get("source") or registry_meta.get("source"),
             "registryRecords": registry_item.get("registryRecords") or [],
+            "managed": bool(lifecycle_allowed),
+            "lifecycleAllowedByStabilityd": bool(lifecycle_allowed),
+            "protected": bool(protected),
             "active": active,
             "activeWork": active_work,
             "workerCount": len(profile_workers),
-            "targetMode": target_mode,
+            "observedMode": observed_mode,
+            "readinessObservation": observed_mode,
+            "targetMode": observed_mode,
             "expectedActive": expected_active,
+            "safeToHibernate": bool(safe_to_hibernate),
+            "safeToHibernateReason": safe_reason,
+            "lifecycleActionAllowed": bool(safe_to_hibernate or observed_mode == "hot"),
             "reason": reason,
             "idleSeconds": idle_seconds,
             "lastActivityEpoch": last_activity_epoch,
@@ -1469,20 +1633,24 @@ def build_hermers_profile_modes(
 
     counts: Dict[str, int] = {}
     for item in profile_modes.values():
-        mode = str(item.get("targetMode") or "unknown")
+        mode = str(item.get("observedMode") or "unknown")
         counts[mode] = counts.get(mode, 0) + 1
     return {
         "schemaVersion": 1,
         "updatedAt": ts(),
         "updatedAtEpoch": now_s,
         "enabled": bool(HERMERS_PROFILE_MODE_ENABLED),
-        "actuateEnabled": False,
-        "startEnabled": False,
-        "controlMode": "observe-only",
+        "actuateEnabled": bool(HERMERS_PROFILE_MODE_ACTUATE_ENABLED),
+        "startEnabled": bool(HERMERS_PROFILE_MODE_START_ENABLED),
+        "controlMode": "stabilityd-coordinated-hermers-adapter" if HERMERS_PROFILE_MODE_ACTUATE_ENABLED else "observe-only",
+        "lifecycleAllowlist": sorted(HERMERS_PROFILE_LIFECYCLE_ALLOWLIST),
+        "managedIds": sorted(HERMERS_PROFILE_LIFECYCLE_ALLOWLIST),
+        "protectedIds": sorted(HERMERS_PROFILE_PROTECTED_IDS),
         "registrySource": registry_meta.get("source"),
         "registry": registry_meta,
         "coldIdleSeconds": HERMERS_PROFILE_COLD_IDLE_SECONDS,
         "hibernateIdleSeconds": HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS,
+        "actionCooldownSeconds": HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS,
         "counts": counts,
         "profiles": profile_modes,
     }
@@ -1585,11 +1753,6 @@ def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) ->
     acp_workers = hermers_acp_workers(rows, profile_registry.keys())
     workflow_activity = hermers_profile_workflow_activity(profile_registry)
     profile_modes = build_hermers_profile_modes(conn, profiles, acp_workers, workflow_activity, profile_registry, registry_meta)
-    mode_profiles = profile_modes.get("profiles") if isinstance(profile_modes.get("profiles"), dict) else {}
-    down = [
-        item for item in down
-        if bool((mode_profiles.get(str(item.get("profile"))) or {}).get("expectedActive", True))
-    ]
     orphan_workers = [
         item for item in acp_workers
         if item.get("orphan") and int(item.get("ageSeconds") or 0) >= HERMERS_ACP_ORPHAN_MIN_SECONDS
@@ -1602,8 +1765,18 @@ def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) ->
     recent_failure_count = int(workflow.get("recentFailureCount") or 0)
     stale_sent_count = int(workflow.get("staleSentCount") or 0)
 
-    if down:
-        add_finding(findings, "hermers_gateway_service_down", "critical", "hermers", "Hermers gateway user services are not active", count=len(down), sample=down[:10])
+    unexpected_down = [
+        item for item in down
+        if bool(((profile_modes.get("profiles") or {}).get(item.get("profile")) or {}).get("expectedActive", True))
+    ]
+    expected_inactive = [
+        item for item in down
+        if not bool(((profile_modes.get("profiles") or {}).get(item.get("profile")) or {}).get("expectedActive", True))
+    ]
+    if unexpected_down:
+        add_finding(findings, "hermers_gateway_service_down", "critical", "hermers", "Hermers gateway user services are not active", count=len(unexpected_down), sample=unexpected_down[:10])
+    if expected_inactive:
+        add_finding(findings, "hermers_gateway_expected_inactive", "info", "hermers", "Hermers gateway user services are inactive by profile-mode policy", count=len(expected_inactive), sample=expected_inactive[:10])
     if pid_mismatches:
         add_finding(findings, "hermers_gateway_state_pid_mismatch", "warning", "hermers", "Hermers gateway state pid differs from systemd main pid", count=len(pid_mismatches), sample=pid_mismatches[:10])
     if orphan_workers:
@@ -1647,7 +1820,7 @@ def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) ->
             "hermers_profile_activity_probe_unavailable",
             "warning",
             "hermers",
-            "Hermers profile activity probe is unavailable; profile hibernation is blocked until idle evidence is reliable",
+            "Hermers profile activity probe is unavailable; idle/readiness observations are incomplete",
             count=len(activity_probe_errors),
             sample=activity_probe_errors[:10],
         )
@@ -1662,8 +1835,8 @@ def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) ->
         "longRunningAcpWorkers": long_workers,
         "workflow": workflow,
         "profileModes": profile_modes,
-        "reapOrphanAcpWorkersEnabled": HERMERS_ACP_ORPHAN_REAP_ENABLED,
-        "gatewayRestartEnabled": HERMERS_GATEWAY_RESTART_ENABLED,
+        "reapOrphanAcpWorkersEnabled": bool(HERMERS_ACP_ORPHAN_REAP_ENABLED),
+        "gatewayRestartEnabled": bool(HERMERS_GATEWAY_RESTART_ENABLED),
     }
 
 
@@ -3008,6 +3181,33 @@ def record_restart_time(conn: sqlite3.Connection) -> None:
     db_set(conn, "stabilityd_last_gateway_restart_at", now_s)
 
 
+def recent_hermers_gateway_restart_history(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    history = db_get(conn, "stabilityd_hermers_gateway_restart_history", []) or []
+    cutoff = epoch() - RESTART_WINDOW_SECONDS
+    normalized = []
+    for item in history:
+        try:
+            if isinstance(item, dict):
+                ts_epoch = int(item.get("tsEpoch") or 0)
+                profile = str(item.get("profile") or "")
+            else:
+                ts_epoch = int(item or 0)
+                profile = ""
+        except Exception:
+            continue
+        if ts_epoch >= cutoff:
+            normalized.append({"tsEpoch": ts_epoch, "profile": profile})
+    return normalized
+
+
+def record_hermers_gateway_restart_time(conn: sqlite3.Connection, profile: str) -> None:
+    history = recent_hermers_gateway_restart_history(conn)
+    now_s = epoch()
+    history.append({"tsEpoch": now_s, "profile": profile})
+    db_set(conn, "stabilityd_hermers_gateway_restart_history", history)
+    db_set(conn, "stabilityd_last_hermers_gateway_restart_at", now_s)
+
+
 def hot(streaks: Dict[str, Any], key: str) -> bool:
     return int(streaks.get(key, {}).get("count") or 0) >= ACTION_STREAK_THRESHOLD
 
@@ -3261,7 +3461,7 @@ def build_lane_policy(
                 "evidenceKeys": hermers_evidence,
                 "observationKeys": hermers_observations,
                 "streakCounts": {k: streak_counts[k] for k in hermers_evidence if k in streak_counts},
-                "governanceAction": "reap-orphan-acp-workers" if "hermers_acp_orphan_workers" in keys else "profile-mode-observe" if int(profile_mode_counts.get("hibernate") or 0) > 0 else "restart-gateway-disabled-observe" if "hermers_gateway_service_down" in keys else "observe",
+                "governanceAction": "reap-orphan-acp-workers" if "hermers_acp_orphan_workers" in keys and HERMERS_ACP_ORPHAN_REAP_ENABLED else "operator-review-orphan-acp-workers" if "hermers_acp_orphan_workers" in keys else "profile-mode-adjust" if int(profile_mode_counts.get("hibernate") or 0) > 0 and HERMERS_PROFILE_MODE_ACTUATE_ENABLED else "profile-readiness-observe" if int(profile_mode_counts.get("hibernate") or 0) > 0 else ("restart-hermers-gateway" if HERMERS_GATEWAY_RESTART_ENABLED else "restart-hermers-gateway-disabled-observe") if "hermers_gateway_service_down" in keys else "observe",
                 "stabilizationGoal": "keep Hermers profile gateways, ACP workers, runtime receipts, and workflow-facing execution readiness healthy without masking runtime failures as workflow success",
                 "profileRuntimeModes": {
                     "enabled": bool(profile_modes.get("enabled")),
@@ -3302,7 +3502,7 @@ def build_lane_policy(
             "pressure": bool(hermers_pressure),
             "reapOrphanAcpWorkersAllowed": bool(HERMERS_ACP_ORPHAN_REAP_ENABLED),
             "gatewayRestartAllowed": bool(HERMERS_GATEWAY_RESTART_ENABLED),
-            "gatewayRestartDefault": "disabled",
+            "gatewayRestartDefault": "policy-gated" if HERMERS_GATEWAY_RESTART_ENABLED else "disabled",
             "profileModeEnabled": bool(profile_modes.get("enabled")),
             "profileModeActuateAllowed": bool(profile_modes.get("actuateEnabled")),
             "profileModes": {
@@ -3364,6 +3564,42 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
     gateway = snapshot.get("gateway") or {}
     hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
     hermers_profile_modes = hermers.get("profileModes") if isinstance(hermers.get("profileModes"), dict) else {}
+    hermers_profile_mode_items = hermers_profile_modes.get("profiles") if isinstance(hermers_profile_modes.get("profiles"), dict) else {}
+    hermers_profiles = hermers.get("profiles") if isinstance(hermers.get("profiles"), dict) else {}
+    hermers_gateway_restart_profiles = [
+        {"profile": str(profile), "unit": str((item or {}).get("unit") or f"hermes-gateway-{profile}.service")}
+        for profile, item in sorted(hermers_profiles.items())
+        if isinstance(item, dict) and not bool(item.get("active"))
+        and bool((hermers_profile_mode_items.get(profile) or {}).get("expectedActive", True))
+    ]
+    hermers_last_restart = int(db_get(conn, "stabilityd_last_hermers_gateway_restart_at", 0) or 0)
+    hermers_cooldown_until = hermers_last_restart + RESTART_COOLDOWN_SECONDS if hermers_last_restart else 0
+    hermers_cooldown_active = hermers_cooldown_until > now_s
+    hermers_restart_history = recent_hermers_gateway_restart_history(conn)
+    hermers_restart_storm = len(hermers_restart_history) >= MAX_RESTARTS_PER_WINDOW
+    hermers_restart_candidate = bool(hermers_gateway_restart_profiles and hot(streaks, "hermers_gateway_service_down"))
+    hermers_restart_remaining = max(0, MAX_RESTARTS_PER_WINDOW - len(hermers_restart_history))
+    hermers_restart_limit = min(HERMERS_GATEWAY_RESTART_LIMIT, hermers_restart_remaining)
+    hermers_restart_blocked_reasons: List[str] = []
+    if hermers_restart_candidate:
+        if hermers_restart_storm:
+            hermers_restart_blocked_reasons.append("restart-storm")
+        elif hermers_cooldown_active:
+            hermers_restart_blocked_reasons.append("cooldown")
+        if not HERMERS_GATEWAY_RESTART_ENABLED:
+            hermers_restart_blocked_reasons.append("restart-actuator-disabled")
+        if HERMERS_GATEWAY_RESTART_LIMIT <= 0:
+            hermers_restart_blocked_reasons.append("restart-limit-zero")
+        elif hermers_restart_limit <= 0:
+            hermers_restart_blocked_reasons.append("restart-budget-exhausted")
+    can_restart_hermers_gateway = bool(hermers_restart_candidate and HERMERS_GATEWAY_RESTART_ENABLED and not hermers_restart_blocked_reasons)
+    hermers_restart_decisions = hermers_gateway_restart_profiles[:hermers_restart_limit] if can_restart_hermers_gateway else []
+    if hermers_restart_storm and not restart_storm:
+        mode = "restart-storm"
+        severity = "critical"
+        reasons.append("hermers_restart_storm")
+    elif hermers_cooldown_active and mode in {"hermers-unavailable", "hermers-degraded"}:
+        mode = "cooldown"
     hard_fault_candidate = hot(streaks, "gateway_service_down") or hot(streaks, "gateway_port_down") or hot(streaks, "gateway_health_endpoint_failed")
     if hard_fault_candidate:
         restart_candidate = True
@@ -3430,7 +3666,9 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
 
     if restart_candidate and not GATEWAY_RESTART_ENABLED:
         restart_blocked_reasons.append("restart-actuator-disabled")
-    can_restart = bool(restart_candidate and GATEWAY_RESTART_ENABLED and not restart_blocked_reasons)
+    if restart_candidate and not GATEWAY_RESTART_ACTUATOR_SUPPORTED:
+        restart_blocked_reasons.append("restart-actuator-unavailable")
+    can_restart = bool(restart_candidate and GATEWAY_RESTART_ENABLED and GATEWAY_RESTART_ACTUATOR_SUPPORTED and not restart_blocked_reasons)
 
     can_mutate_cron = CRON_MUTATION_ENABLED and not restart_storm and not can_restart and mode not in {"gateway-unreachable", "channel-stalled", "resource-pressure", "restart-storm"}
     can_reset_session = SESSION_RESET_ENABLED and not restart_storm and mode not in {"gateway-unreachable", "resource-pressure", "restart-storm"}
@@ -3440,7 +3678,11 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
     )
     control_plane_defer_until = 0
     if should_defer_control_plane_heavy:
-        control_plane_defer_until = max(cooldown_until if cooldown_active else 0, now_s + CONTROL_PLANE_BACKPRESSURE_SECONDS)
+        control_plane_defer_until = max(
+            cooldown_until if cooldown_active else 0,
+            hermers_cooldown_until if hermers_cooldown_active else 0,
+            now_s + CONTROL_PLANE_BACKPRESSURE_SECONDS,
+        )
     gateway_unavailable = mode == "gateway-unreachable" or not gateway.get("active") or not gateway.get("portOk")
     resource_pressure = resource_pressure_active(keys) or mode == "resource-pressure"
     recovery = update_lane_recovery(
@@ -3476,7 +3718,7 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         should_defer_control_plane_heavy=bool(should_defer_control_plane_heavy),
         control_plane_defer_until=control_plane_defer_until,
         restart_storm=bool(restart_storm),
-        cooldown_active=bool(cooldown_active),
+        cooldown_active=bool(cooldown_active or hermers_cooldown_active),
         recovery=recovery,
         hermers_profile_modes=hermers_profile_modes,
     )
@@ -3490,6 +3732,17 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         "canMutateCronState": bool(can_mutate_cron),
         "canResetSession": bool(can_reset_session),
         "gatewayRestartEnabled": bool(GATEWAY_RESTART_ENABLED),
+        "gatewayRestartActuatorSupported": bool(GATEWAY_RESTART_ACTUATOR_SUPPORTED),
+        "hermersGatewayRestartEnabled": bool(HERMERS_GATEWAY_RESTART_ENABLED),
+        "hermersGatewayRestartCandidate": bool(hermers_restart_candidate),
+        "hermersGatewayRestartBlockedReasons": hermers_restart_blocked_reasons,
+        "canRestartHermersGateway": bool(can_restart_hermers_gateway),
+        "canReapHermersOrphanWorkers": bool(HERMERS_ACP_ORPHAN_REAP_ENABLED),
+        "hermersGatewayRestartLimit": HERMERS_GATEWAY_RESTART_LIMIT,
+        "hermersGatewayRestartRemaining": hermers_restart_remaining,
+        "hermersGatewayRestartProfiles": hermers_restart_decisions,
+        "hermersGatewayRestartCandidateProfiles": hermers_gateway_restart_profiles,
+        "hermersGatewayRestartReason": "hermers-gateway-service-down" if hermers_restart_candidate else "no-actionable-streak",
         "restartCandidate": bool(restart_candidate),
         "restartBlockedReasons": restart_blocked_reasons,
         "restartBlockedReason": ",".join(restart_blocked_reasons),
@@ -3506,6 +3759,11 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         "restartStormClearsAtEpoch": restart_storm_clears_at,
         "recentRestartCount": len(restart_history),
         "restartHistorySource": "cat-agents-stabilityd-owned-restarts-only",
+        "hermersRestartStorm": bool(hermers_restart_storm),
+        "hermersRestartStormClearsAtEpoch": min(item["tsEpoch"] for item in hermers_restart_history) + RESTART_WINDOW_SECONDS if hermers_restart_storm and hermers_restart_history else 0,
+        "hermersGatewayCooldownUntilEpoch": hermers_cooldown_until if hermers_cooldown_active else 0,
+        "recentHermersGatewayRestartCount": len(hermers_restart_history),
+        "hermersRestartHistorySource": "cat-agents-stabilityd-owned-hermers-gateway-restarts-only",
         "restartWindowSeconds": RESTART_WINDOW_SECONDS,
         "maxRestarts": MAX_RESTARTS_PER_WINDOW,
         "lanes": lanes,
@@ -3698,6 +3956,15 @@ def cron_actuate(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[
     if repair_queue.get("pendingCount") or repair_queue.get("updatedPendingEntries"):
         actions.append({"action": "update_repair_queue_status", "result": "ok", "repairQueue": repair_queue})
     if not policy.get("canMutateCronState"):
+        if (snapshot.get("cron") or {}).get("staleRunning") or (snapshot.get("cron") or {}).get("expiredLeases"):
+            actions.append(
+                {
+                    "action": "observe_cron_repair_candidates",
+                    "result": "mutation_blocked_by_policy",
+                    "staleRunningCount": len((snapshot.get("cron") or {}).get("staleRunning") or []),
+                    "expiredLeaseCount": len((snapshot.get("cron") or {}).get("expiredLeases") or []),
+                }
+            )
         return actions
     cron = snapshot.get("cron") or {}
     data = load_jobs()
@@ -3736,10 +4003,23 @@ def cron_actuate(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[
             job_id = item.get("jobId")
             if not lease_path.exists() or not job_id:
                 continue
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            lease_backup_path = None
+            run_backup_path = None
+            backup_dir = CRON_DIR / "snapshots" / "lease-reap"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            with contextlib.suppress(Exception):
+                lease_backup = backup_dir / f"{lease_path.name}.before-reap-{stamp}.bak"
+                shutil.copy2(lease_path, lease_backup)
+                lease_backup_path = str(lease_backup)
             run_path = RUNS_BY_RUN_DIR / f"{run_id}.json" if run_id else None
             if run_path and run_path.exists():
                 run_record = load_json(run_path, {}) or {}
                 if run_record.get("status") == "running":
+                    with contextlib.suppress(Exception):
+                        run_backup = backup_dir / f"{run_path.name}.before-reap-{stamp}.bak"
+                        shutil.copy2(run_path, run_backup)
+                        run_backup_path = str(run_backup)
                     finished = now_ms()
                     started = int(run_record.get("startedAtMs", finished) or finished)
                     run_record["status"] = "orphaned"
@@ -3762,7 +4042,16 @@ def cron_actuate(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[
             with contextlib.suppress(Exception):
                 lease_path.unlink(missing_ok=True)
             repair = enqueue_repair_request(str(job_id), "lease_expired", "cat-agents-stabilityd", run_id=str(run_id) if run_id else None, gate=gate)
-            reaped.append({"jobId": job_id, "runId": run_id, "leasePath": str(lease_path), "repairRequestPath": repair})
+            reaped.append(
+                {
+                    "jobId": job_id,
+                    "runId": run_id,
+                    "leasePath": str(lease_path),
+                    "leaseBackupPath": lease_backup_path,
+                    "runBackupPath": run_backup_path,
+                    "repairRequestPath": repair,
+                }
+            )
         if reaped:
             actions.append({"action": "reap_expired_leases", "result": "ok", "reaped": reaped})
     return actions
@@ -3820,6 +4109,15 @@ def reset_session(session_key: str, reason: str, conn: sqlite3.Connection) -> Di
 def session_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
     actions: List[Dict[str, Any]] = []
     if not policy.get("canResetSession"):
+        if (snapshot.get("session") or {}).get("resetCandidates"):
+            actions.append(
+                {
+                    "action": "observe_session_repair_candidates",
+                    "result": "reset_blocked_by_policy",
+                    "candidateCount": len((snapshot.get("session") or {}).get("resetCandidates") or []),
+                    "sample": ((snapshot.get("session") or {}).get("resetCandidates") or [])[:10],
+                }
+            )
         return actions
     candidates = (snapshot.get("session") or {}).get("resetCandidates") or []
     results = []
@@ -3871,6 +4169,116 @@ def gateway_restart(conn: sqlite3.Connection, reason: str) -> Dict[str, Any]:
             "component": "gateway",
             "action": "restart_gateway",
             "result": "failed",
+            "reason": reason,
+            "exitCode": -1,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def hermers_gateway_restart(conn: sqlite3.Connection, profile: str, unit: str, reason: str) -> Dict[str, Any]:
+    action_id = f"hermers-gateway-restart-{profile}-{int(time.time())}"
+    if not re.match(r"^[A-Za-z0-9_.@-]+$", profile):
+        return {
+            "actionId": action_id,
+            "ts": ts(),
+            "tsEpoch": epoch(),
+            "source": "cat-agents-stabilityd",
+            "component": "hermers",
+            "action": "restart_hermers_gateway",
+            "result": "blocked",
+            "profile": profile,
+            "unit": unit,
+            "reason": reason,
+            "blockedReason": "invalid-profile",
+        }
+    expected_unit = f"hermes-gateway-{profile}.service"
+    if unit != expected_unit:
+        return {
+            "actionId": action_id,
+            "ts": ts(),
+            "tsEpoch": epoch(),
+            "source": "cat-agents-stabilityd",
+            "component": "hermers",
+            "action": "restart_hermers_gateway",
+            "result": "blocked",
+            "profile": profile,
+            "unit": unit,
+            "reason": reason,
+            "blockedReason": "unit-profile-mismatch",
+            "expectedUnit": expected_unit,
+        }
+    last_key = f"hermers_gateway_restart:{profile}"
+    last_restart = int(db_get(conn, last_key, 0) or 0)
+    now_s = epoch()
+    restart_history = recent_hermers_gateway_restart_history(conn)
+    if len(restart_history) >= MAX_RESTARTS_PER_WINDOW:
+        return {
+            "actionId": action_id,
+            "ts": ts(),
+            "tsEpoch": now_s,
+            "source": "cat-agents-stabilityd",
+            "component": "hermers",
+            "action": "restart_hermers_gateway",
+            "result": "blocked",
+            "profile": profile,
+            "unit": unit,
+            "reason": reason,
+            "blockedReason": "restart-storm",
+            "recentRestartCount": len(restart_history),
+            "maxRestarts": MAX_RESTARTS_PER_WINDOW,
+        }
+    if last_restart and now_s - last_restart < RESTART_COOLDOWN_SECONDS:
+        return {
+            "actionId": action_id,
+            "ts": ts(),
+            "tsEpoch": now_s,
+            "source": "cat-agents-stabilityd",
+            "component": "hermers",
+            "action": "restart_hermers_gateway",
+            "result": "cooldown_skip",
+            "profile": profile,
+            "unit": unit,
+            "reason": reason,
+            "cooldownUntilEpoch": last_restart + RESTART_COOLDOWN_SECONDS,
+        }
+    started = time.time()
+    try:
+        proc = run_hermes_profile_gateway_cmd(profile, "restart", timeout=60)
+        duration = int((time.time() - started) * 1000)
+        result = "ok" if proc.returncode == 0 else "failed"
+        payload = {
+            "actionId": action_id,
+            "ts": ts(),
+            "tsEpoch": epoch(),
+            "source": "cat-agents-stabilityd",
+            "component": "hermers",
+            "action": "restart_hermers_gateway",
+            "result": result,
+            "profile": profile,
+            "unit": unit,
+            "reason": reason,
+            "operation": "hermes-gateway-restart",
+            "adapter": "hermes-cli",
+            "command": [HERMES_CLI, "-p", profile, "gateway", "restart"],
+            "exitCode": proc.returncode,
+            "durationMs": duration,
+            "stderr": proc.stderr[-1200:],
+        }
+        if proc.returncode == 0:
+            db_set(conn, last_key, epoch())
+            record_hermers_gateway_restart_time(conn, profile)
+        return payload
+    except Exception as exc:
+        return {
+            "actionId": action_id,
+            "ts": ts(),
+            "tsEpoch": epoch(),
+            "source": "cat-agents-stabilityd",
+            "component": "hermers",
+            "action": "restart_hermers_gateway",
+            "result": "failed",
+            "profile": profile,
+            "unit": unit,
             "reason": reason,
             "exitCode": -1,
             "error": f"{type(exc).__name__}: {exc}",
@@ -4107,29 +4515,252 @@ def resource_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy:
     return actions
 
 
+def hermers_profile_mode_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    actions: List[Dict[str, Any]] = []
+    if not HERMERS_PROFILE_MODE_ENABLED or not HERMERS_PROFILE_MODE_ACTUATE_ENABLED:
+        return actions
+    hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
+    modes = hermers.get("profileModes") if isinstance(hermers.get("profileModes"), dict) else {}
+    profiles = modes.get("profiles") if isinstance(modes.get("profiles"), dict) else {}
+    now_s = epoch()
+    for profile, item in profiles.items():
+        if not isinstance(item, dict):
+            continue
+        if item.get("protected") or not item.get("managed"):
+            continue
+        if item.get("activeWork"):
+            continue
+        target_mode = str(item.get("targetMode") or item.get("observedMode") or "warm")
+        active = bool(item.get("active"))
+        unit = str(item.get("unit") or f"hermes-gateway-{profile}.service")
+        expected_unit = f"hermes-gateway-{profile}.service"
+        if unit != expected_unit:
+            actions.append(
+                {
+                    "action": "set_hermers_profile_mode",
+                    "result": "blocked",
+                    "profile": profile,
+                    "unit": unit,
+                    "targetMode": target_mode,
+                    "blockedReason": "unit-profile-mismatch",
+                    "expectedUnit": expected_unit,
+                }
+            )
+            continue
+        action_key = f"hermers_profile_mode:{profile}:{target_mode}"
+        last_action = int(db_get(conn, action_key, 0) or 0)
+        if last_action and now_s - last_action < HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS:
+            continue
+        if target_mode == "hibernate" and active:
+            if not item.get("safeToHibernate"):
+                actions.append(
+                    {
+                        "action": "set_hermers_profile_mode",
+                        "result": "blocked",
+                        "profile": profile,
+                        "unit": unit,
+                        "targetMode": target_mode,
+                        "reason": item.get("reason"),
+                        "blockedReason": item.get("safeToHibernateReason") or "runtime-safe-to-hibernate-missing",
+                    }
+                )
+                continue
+            started = time.time()
+            try:
+                proc = run_hermes_profile_gateway_cmd(profile, "stop", timeout=30)
+                duration_ms = int((time.time() - started) * 1000)
+                result = "ok" if proc.returncode == 0 else "failed"
+                actions.append(
+                    {
+                        "action": "set_hermers_profile_mode",
+                        "result": result,
+                        "profile": profile,
+                        "unit": unit,
+                        "targetMode": target_mode,
+                        "reason": item.get("reason"),
+                        "idleSeconds": item.get("idleSeconds"),
+                        "operation": "hermes-gateway-stop",
+                        "adapter": "hermes-cli",
+                        "command": [HERMES_CLI, "-p", profile, "gateway", "stop"],
+                        "exitCode": proc.returncode,
+                        "durationMs": duration_ms,
+                        "stderr": proc.stderr[-1200:],
+                    }
+                )
+                db_set(conn, action_key, now_s)
+                if proc.returncode == 0:
+                    db_set(
+                        conn,
+                        f"hermers_profile_mode:planned:{profile}",
+                        {
+                            "profile": profile,
+                            "targetMode": target_mode,
+                            "unit": unit,
+                            "reason": item.get("reason"),
+                            "setAt": ts(),
+                            "setAtEpoch": now_s,
+                            "source": "cat-agents-stabilityd",
+                        },
+                    )
+            except Exception as exc:
+                db_set(conn, action_key, now_s)
+                actions.append(
+                    {
+                        "action": "set_hermers_profile_mode",
+                        "result": "failed",
+                        "profile": profile,
+                        "unit": unit,
+                        "targetMode": target_mode,
+                        "reason": item.get("reason"),
+                        "operation": "hermes-gateway-stop",
+                        "adapter": "hermes-cli",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+        elif target_mode == "hot" and not active and HERMERS_PROFILE_MODE_START_ENABLED:
+            started = time.time()
+            try:
+                proc = run_hermes_profile_gateway_cmd(profile, "start", timeout=30)
+                duration_ms = int((time.time() - started) * 1000)
+                result = "ok" if proc.returncode == 0 else "failed"
+                actions.append(
+                    {
+                        "action": "set_hermers_profile_mode",
+                        "result": result,
+                        "profile": profile,
+                        "unit": unit,
+                        "targetMode": target_mode,
+                        "reason": item.get("reason"),
+                        "operation": "hermes-gateway-start",
+                        "adapter": "hermes-cli",
+                        "command": [HERMES_CLI, "-p", profile, "gateway", "start"],
+                        "exitCode": proc.returncode,
+                        "durationMs": duration_ms,
+                        "stderr": proc.stderr[-1200:],
+                    }
+                )
+                db_set(conn, action_key, now_s)
+            except Exception as exc:
+                db_set(conn, action_key, now_s)
+                actions.append(
+                    {
+                        "action": "set_hermers_profile_mode",
+                        "result": "failed",
+                        "profile": profile,
+                        "unit": unit,
+                        "targetMode": target_mode,
+                        "reason": item.get("reason"),
+                        "operation": "hermes-gateway-start",
+                        "adapter": "hermes-cli",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+    return actions
+
+
+def verify_hermers_orphan_worker(pid: int, profile: str, rows: List[Dict[str, str]]) -> Tuple[bool, str]:
+    current = None
+    for row in rows:
+        try:
+            row_pid = int(row.get("pid") or 0)
+        except Exception:
+            row_pid = 0
+        if row_pid == pid:
+            current = row
+            break
+    if not current:
+        return False, "pid-not-found"
+    cmd = current.get("cmd", "")
+    if "/hermes" not in cmd or " acp" not in cmd or "--accept-hooks" not in cmd:
+        return False, "cmd-not-hermers-acp"
+    if profile and f" -p {profile} " not in cmd and f"--profile {profile}" not in cmd:
+        return False, "profile-mismatch"
+    try:
+        ppid = int(current.get("ppid") or 0)
+    except Exception:
+        ppid = 0
+    if ppid > 1:
+        return False, "worker-has-live-parent"
+    return True, "verified-orphan"
+
+
 def hermers_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
     actions: List[Dict[str, Any]] = []
     hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
-    if not HERMERS_ACP_ORPHAN_REAP_ENABLED:
-        return actions
     workers = hermers.get("orphanAcpWorkers") if isinstance(hermers.get("orphanAcpWorkers"), list) else []
-    killed = []
-    for item in workers[:20]:
-        try:
-            pid = int(item.get("pid") or 0)
-        except Exception:
-            pid = 0
-        if pid <= 1:
-            continue
-        try:
-            os.kill(pid, signal.SIGTERM)
-            killed.append({"pid": pid, "profile": item.get("profile"), "ageSeconds": item.get("ageSeconds"), "signal": "SIGTERM"})
-        except ProcessLookupError:
-            killed.append({"pid": pid, "profile": item.get("profile"), "result": "already_exited"})
-        except Exception as exc:
-            killed.append({"pid": pid, "profile": item.get("profile"), "result": "failed", "error": f"{type(exc).__name__}: {exc}"})
-    if killed:
-        actions.append({"action": "reap_hermers_acp_orphan_workers", "result": "ok", "workers": killed})
+    if workers and policy.get("canReapHermersOrphanWorkers"):
+        killed = []
+        current_rows = ps_rows()
+        for item in workers[:20]:
+            try:
+                pid = int(item.get("pid") or 0)
+            except Exception:
+                pid = 0
+            if pid <= 1:
+                continue
+            profile = str(item.get("profile") or "")
+            verified, verify_reason = verify_hermers_orphan_worker(pid, profile, current_rows)
+            if not verified:
+                killed.append({"pid": pid, "profile": profile, "result": "blocked", "reason": verify_reason})
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed.append({"pid": pid, "profile": profile, "ageSeconds": item.get("ageSeconds"), "signal": "SIGTERM", "verified": verify_reason})
+            except ProcessLookupError:
+                killed.append({"pid": pid, "profile": profile, "result": "already_exited"})
+            except Exception as exc:
+                killed.append({"pid": pid, "profile": profile, "result": "failed", "error": f"{type(exc).__name__}: {exc}"})
+        if killed:
+            actions.append({"action": "reap_hermers_acp_orphan_workers", "result": "ok", "workers": killed})
+    elif workers:
+        actions.append(
+            {
+                "action": "observe_hermers_acp_orphan_workers",
+                "result": "reap_blocked_by_policy",
+                "workers": workers[:20],
+            }
+        )
+    actions.extend(hermers_profile_mode_actuate(conn, snapshot))
+    profiles = hermers.get("profiles") if isinstance(hermers.get("profiles"), dict) else {}
+    modes = ((hermers.get("profileModes") or {}).get("profiles") or {}) if isinstance(hermers.get("profileModes"), dict) else {}
+    down_profiles = [
+        {"profile": profile, "unit": str((item or {}).get("unit") or f"hermes-gateway-{profile}.service")}
+        for profile, item in profiles.items()
+        if isinstance(item, dict) and not bool(item.get("active"))
+        and bool((modes.get(profile) or {}).get("expectedActive", True))
+    ]
+    restart_profiles = policy.get("hermersGatewayRestartProfiles") if isinstance(policy.get("hermersGatewayRestartProfiles"), list) else []
+    if restart_profiles and policy.get("canRestartHermersGateway"):
+        for item in restart_profiles:
+            actions.append(
+                hermers_gateway_restart(
+                    conn,
+                    str(item.get("profile") or ""),
+                    str(item.get("unit") or ""),
+                    str(policy.get("hermersGatewayRestartReason") or "hermers-gateway-service-down"),
+                )
+            )
+        if len(down_profiles) > len(restart_profiles):
+            actions.append(
+                {
+                    "action": "restart_hermers_gateway",
+                    "result": "limit_skip",
+                    "reason": "restart-limit-per-loop",
+                    "candidateCount": len(down_profiles),
+                    "limit": len(restart_profiles),
+                }
+            )
+    elif down_profiles:
+        actions.append(
+            {
+                "action": "observe_hermers_gateway_restart_candidate",
+                "result": "restart_actuator_blocked",
+                "candidateCount": len(down_profiles),
+                "candidate": bool(policy.get("hermersGatewayRestartCandidate")),
+                "blockedReasons": policy.get("hermersGatewayRestartBlockedReasons") or [],
+                "sample": down_profiles[:10],
+            }
+        )
     return actions
 
 
@@ -4151,6 +4782,15 @@ def actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str
         actions.append(action)
     if policy.get("canRestartGateway"):
         actions.append(gateway_restart(conn, str(policy.get("restartReason") or "policy")))
+    elif policy.get("restartCandidate"):
+        actions.append(
+            {
+                "action": "observe_gateway_restart_candidate",
+                "result": "restart_actuator_blocked",
+                "reason": str(policy.get("restartReason") or "policy"),
+                "blockedReasons": policy.get("restartBlockedReasons") or [],
+            }
+        )
     return actions or [{"action": "none", "result": "ok", "reason": policy.get("restartReason") or "no-action"}]
 
 
@@ -4373,11 +5013,9 @@ def runbook() -> Dict[str, Any]:
         "topFindings": findings[:10],
         "recommendedCommands": commands,
         "rollback": [
-            "sudo systemctl disable --now cat-agents-stabilityd.service",
-            "sudo systemctl enable --now openclaw-gateway-watchdog.service",
-            "sudo systemctl enable --now openclaw-cron-guard.timer",
-            "sudo systemctl enable --now openclaw-session-guard.timer",
-            "sudo systemctl enable --now openclaw-health-controller.timer",
+            "pause cat-agents-stabilityd evidence consumption if it is producing misleading findings",
+            "keep legacy gateway/cron/session controllers disabled unless Flashcat explicitly approves a documented rollback",
+            "route runtime-state repair through the owning OpenClaw/Hermers runtime adapter or an explicit operator action",
         ],
     }
 

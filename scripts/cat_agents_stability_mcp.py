@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Minimal stdio MCP server for local Codex cat-agents-stability control-plane reads."""
+"""Minimal stdio MCP server for local Codex cat-agents-stability operations.
+
+Most tools are read-only. `stability_workflow_evidence` writes the governed
+stability evidence package consumed by workflow governance logs.
+"""
 
 from __future__ import annotations
 
@@ -223,7 +227,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
     },
     "stability_profile_modes": {
-        "description": "Return Hermers profile runtime mode policy, including warm/cold/hibernate recommendations and managed/protected profile settings.",
+        "description": "Return registry-derived Hermers profile runtime governance state, including warm/cold/hibernate observations and policy-gated Hermers adapter lifecycle actions.",
         "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
     },
     "stability_actions": {
