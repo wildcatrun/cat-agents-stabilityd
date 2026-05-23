@@ -158,8 +158,6 @@ HERMERS_FAILURE_WINDOW_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMER
 HERMERS_FAILURE_BURST_THRESHOLD = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_FAILURE_BURST", "5"))
 HERMERS_STALE_SENT_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_STALE_SENT_SECONDS", "600"))
 HERMERS_PROFILE_MODE_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ENABLED", "1") != "0"
-HERMERS_PROFILE_MODE_ACTUATE_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTUATE", "1") != "0"
-HERMERS_PROFILE_MODE_START_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_START", "1") != "0"
 HERMERS_PROFILE_MODE_MANAGED_PROFILES = {
     item.strip()
     for item in os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_MANAGED", "catears").split(",")
@@ -172,7 +170,6 @@ HERMERS_PROFILE_MODE_PROTECTED_PROFILES = {
 }
 HERMERS_PROFILE_COLD_IDLE_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_COLD_IDLE_SECONDS", str(30 * 60)))
 HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS", str(8 * 3600)))
-HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS", "600"))
 
 TMP_FILE_MAX_AGE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_TMP_MAX_AGE_SECONDS", "3600"))
 ORPHAN_RUN_LOG_MIN_AGE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_ORPHAN_RUN_LOG_MIN_AGE_SECONDS", "3600"))
@@ -1359,8 +1356,6 @@ def build_hermers_profile_modes(
         profile_workers = [item for item in acp_workers if item.get("profile") == profile]
         workflow = workflow_activity.get(profile) or {}
         workflow_probe_ok = bool(workflow.get("probeOk", True))
-        planned = db_get(conn, f"hermers_profile_mode:planned:{profile}", {}) or {}
-        planned_mode = str(planned.get("targetMode") or "") if isinstance(planned, dict) else ""
         protected = profile in HERMERS_PROFILE_MODE_PROTECTED_PROFILES
         managed = profile in HERMERS_PROFILE_MODE_MANAGED_PROFILES and not protected
         active_work = bool(profile_workers) or int(workflow.get("activeRuntimeCount") or 0) > 0 or int(workflow.get("activeDispatchCount") or 0) > 0
@@ -1384,15 +1379,10 @@ def build_hermers_profile_modes(
         elif active_work:
             target_mode = "hot"
             reason = "active-work"
-        elif not active and planned_mode == "hibernate":
-            target_mode = "hibernate"
-            expected_active = False
-            reason = "planned-hibernate-inactive"
         elif not active:
             reason = "inactive-unplanned"
         elif idle_seconds is not None and idle_seconds >= HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS:
             target_mode = "hibernate"
-            expected_active = False
             reason = "idle-hibernate-threshold"
         elif idle_seconds is not None and idle_seconds >= HERMERS_PROFILE_COLD_IDLE_SECONDS:
             target_mode = "cold"
@@ -1426,13 +1416,13 @@ def build_hermers_profile_modes(
         "updatedAt": ts(),
         "updatedAtEpoch": now_s,
         "enabled": bool(HERMERS_PROFILE_MODE_ENABLED),
-        "actuateEnabled": bool(HERMERS_PROFILE_MODE_ACTUATE_ENABLED),
-        "startEnabled": bool(HERMERS_PROFILE_MODE_START_ENABLED),
+        "actuateEnabled": False,
+        "startEnabled": False,
+        "controlMode": "observe-only",
         "managedProfiles": sorted(HERMERS_PROFILE_MODE_MANAGED_PROFILES),
         "protectedProfiles": sorted(HERMERS_PROFILE_MODE_PROTECTED_PROFILES),
         "coldIdleSeconds": HERMERS_PROFILE_COLD_IDLE_SECONDS,
         "hibernateIdleSeconds": HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS,
-        "actionCooldownSeconds": HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS,
         "counts": counts,
         "profiles": profile_modes,
     }
@@ -3209,7 +3199,7 @@ def build_lane_policy(
                 "evidenceKeys": hermers_evidence,
                 "observationKeys": hermers_observations,
                 "streakCounts": {k: streak_counts[k] for k in hermers_evidence if k in streak_counts},
-                "governanceAction": "reap-orphan-acp-workers" if "hermers_acp_orphan_workers" in keys else "profile-mode-adjust" if int(profile_mode_counts.get("hibernate") or 0) > 0 else "restart-gateway-disabled-observe" if "hermers_gateway_service_down" in keys else "observe",
+                "governanceAction": "reap-orphan-acp-workers" if "hermers_acp_orphan_workers" in keys else "profile-mode-observe" if int(profile_mode_counts.get("hibernate") or 0) > 0 else "restart-gateway-disabled-observe" if "hermers_gateway_service_down" in keys else "observe",
                 "stabilizationGoal": "keep Hermers profile gateways, ACP workers, runtime receipts, and workflow-facing execution readiness healthy without masking runtime failures as workflow success",
                 "profileRuntimeModes": {
                     "enabled": bool(profile_modes.get("enabled")),
@@ -4055,121 +4045,8 @@ def resource_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy:
     return actions
 
 
-def hermers_profile_mode_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
-    actions: List[Dict[str, Any]] = []
-    if not HERMERS_PROFILE_MODE_ENABLED or not HERMERS_PROFILE_MODE_ACTUATE_ENABLED:
-        return actions
-    hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
-    modes = hermers.get("profileModes") if isinstance(hermers.get("profileModes"), dict) else {}
-    profiles = modes.get("profiles") if isinstance(modes.get("profiles"), dict) else {}
-    now_s = epoch()
-    for profile, item in profiles.items():
-        if profile in HERMERS_PROFILE_MODE_PROTECTED_PROFILES:
-            continue
-        if profile not in HERMERS_PROFILE_MODE_MANAGED_PROFILES:
-            continue
-        if item.get("activeWork"):
-            continue
-        target_mode = str(item.get("targetMode") or "warm")
-        active = bool(item.get("active"))
-        unit = str(item.get("unit") or f"hermes-gateway-{profile}.service")
-        action_key = f"hermers_profile_mode:{profile}:{target_mode}"
-        last_action = int(db_get(conn, action_key, 0) or 0)
-        if last_action and now_s - last_action < HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS:
-            continue
-        if target_mode == "hibernate" and active:
-            started = time.time()
-            try:
-                proc = run_user_cmd(["systemctl", "--user", "stop", unit], timeout=30)
-                duration_ms = int((time.time() - started) * 1000)
-                result = "ok" if proc.returncode == 0 else "failed"
-                actions.append(
-                    {
-                        "action": "set_hermers_profile_mode",
-                        "result": result,
-                        "profile": profile,
-                        "unit": unit,
-                        "targetMode": target_mode,
-                        "reason": item.get("reason"),
-                        "idleSeconds": item.get("idleSeconds"),
-                        "operation": "stop-user-service",
-                        "exitCode": proc.returncode,
-                        "durationMs": duration_ms,
-                        "stderr": proc.stderr[-1200:],
-                    }
-                )
-                db_set(conn, action_key, now_s)
-                if proc.returncode == 0:
-                    db_set(
-                        conn,
-                        f"hermers_profile_mode:planned:{profile}",
-                        {
-                            "profile": profile,
-                            "targetMode": target_mode,
-                            "unit": unit,
-                            "reason": item.get("reason"),
-                            "setAt": ts(),
-                            "setAtEpoch": now_s,
-                            "source": "cat-agents-stabilityd",
-                        },
-                    )
-                    with contextlib.suppress(Exception):
-                        run_user_cmd(["systemctl", "--user", "reset-failed", unit], timeout=10)
-            except Exception as exc:
-                db_set(conn, action_key, now_s)
-                actions.append(
-                    {
-                        "action": "set_hermers_profile_mode",
-                        "result": "failed",
-                        "profile": profile,
-                        "unit": unit,
-                        "targetMode": target_mode,
-                        "reason": item.get("reason"),
-                        "operation": "stop-user-service",
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-        elif target_mode == "hot" and not active and HERMERS_PROFILE_MODE_START_ENABLED:
-            started = time.time()
-            try:
-                proc = run_user_cmd(["systemctl", "--user", "start", unit], timeout=30)
-                duration_ms = int((time.time() - started) * 1000)
-                result = "ok" if proc.returncode == 0 else "failed"
-                actions.append(
-                    {
-                        "action": "set_hermers_profile_mode",
-                        "result": result,
-                        "profile": profile,
-                        "unit": unit,
-                        "targetMode": target_mode,
-                        "reason": item.get("reason"),
-                        "operation": "start-user-service",
-                        "exitCode": proc.returncode,
-                        "durationMs": duration_ms,
-                        "stderr": proc.stderr[-1200:],
-                    }
-                )
-                db_set(conn, action_key, now_s)
-            except Exception as exc:
-                db_set(conn, action_key, now_s)
-                actions.append(
-                    {
-                        "action": "set_hermers_profile_mode",
-                        "result": "failed",
-                        "profile": profile,
-                        "unit": unit,
-                        "targetMode": target_mode,
-                        "reason": item.get("reason"),
-                        "operation": "start-user-service",
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-    return actions
-
-
 def hermers_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
     actions: List[Dict[str, Any]] = []
-    actions.extend(hermers_profile_mode_actuate(conn, snapshot))
     hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
     if not HERMERS_ACP_ORPHAN_REAP_ENABLED:
         return actions
