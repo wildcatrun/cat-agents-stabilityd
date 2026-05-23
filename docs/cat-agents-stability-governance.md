@@ -269,14 +269,15 @@ Hermers runtime governance boundary:
 Runtime mode definitions:
 
 - `hot`: profile has active ACP workers, active workflow runtime rows, or active dispatch evidence. It must not be stopped.
-- `warm`: profile is eligible to stay running and accept work normally.
-- `cold`: profile has been idle beyond the cold threshold. In v1 this is an explicit policy/admission state: keep the service available, but avoid sending optional/background work unless needed.
+- `warm`: profile service is expected active and no cold/hibernate observation is present.
+- `cold`: profile has been idle beyond the cold threshold. This is an observation only.
 - `hibernate`: observation that the profile appears idle beyond the hibernate threshold. This is not authority for stabilityd to stop the user service, and it does not suppress service-down readiness findings by itself.
 
-Default profile mode policy:
+Profile observation source:
 
-- Managed profiles default to `catears` only.
-- Protected profiles default to `catbody`, `catheart`, `main`, and `cat_claw`; protection is recorded for readiness and policy context only.
+- Cat-system member observation starts from `trading-agents-workflow.runtime_agents`, not from a Hermers-only list.
+- Hermers profile observations are derived from active `runtime_agents` records whose runtime is `hermers`, `hermes`, or `hermes_acp` and whose `endpoint_ref` is `hermes-profile:<profile>`.
+- `CAT_AGENTS_STABILITY_HERMERS_PROFILES` is only a diagnostic fallback when the workflow registry is unavailable or empty. A fallback finding must be emitted; it is not a governance source of truth.
 - Cold threshold defaults to 30 minutes idle.
 - Hibernate threshold defaults to 8 hours idle.
 - `cold` and `hibernate` are advisory observations in the current implementation.
@@ -284,8 +285,7 @@ Default profile mode policy:
 Configuration:
 
 - `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ENABLED=1|0`
-- `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_MANAGED=catears`
-- `CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_PROTECTED=catbody,catheart,main,cat_claw`
+- `CAT_AGENTS_STABILITY_HERMERS_PROFILES=...`, fallback-only diagnostic list
 - `CAT_AGENTS_STABILITY_HERMERS_PROFILE_COLD_IDLE_SECONDS=1800`
 - `CAT_AGENTS_STABILITY_HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS=28800`
 
@@ -300,13 +300,13 @@ Unified agent lifecycle policy:
 - `trading-agents-workflow` is a workflow scheduler and evidence plane, not the runtime platform for cat-system members.
 - Cat-system members run inside OpenClaw, Hermers/Hermes, Codex, or other registered runtimes. Runtime residency is owned by those platforms.
 - Unified lifecycle language is governance vocabulary for readiness, dispatch admission, receipt, and Human Gate evidence. It must map to runtime-domain observations and runtime-native controls instead of introducing a third agent-level actuator.
-- Hermers/Hermes profiles must use the existing profile-mode policy when warm/cold/hibernate behavior is needed.
-- OpenClaw-native agents must use existing OpenClaw governance domains: cron admission, session protection, channel admission, and direct-session priority.
+- Hermers/Hermes, OpenClaw, Codex, and future runtimes are platform adapters under the global `runtime_agents` registry. They must not define separate cat-system member policy from their own local profile lists.
+- Runtime-specific checks can inspect service names, profile files, cron state, sessions, or ACP workers, but only after the target members are selected from the global registry or after emitting a fallback-warning finding.
 - Protected member requirements such as `main`, `catheart` / `cat_heart`, and `cat_claw` should be expressed as runtime-specific protection policy, not by workflow/stabilityd forcibly managing their execution environment.
 
 Safety rules:
 
-- Never infer that every profile is safe to hibernate. A profile must be explicitly listed in the managed set and absent from the protected set.
+- Never infer that every profile is safe to hibernate. Warm/cold/hibernate output is observation only unless the owning runtime platform supplies its own control mechanism and evidence.
 - Never stop a profile with active ACP workers, active workflow runtime rows, active dispatch evidence, pending Telegram ingress, profile-local cron work, or runtime-owned queue work.
 - Absence of workflow activity is not proof of runtime idleness. It is only one signal.
 - Workflow activity probe failure blocks hibernation. If the workflow DB is missing, locked, schema-drifted, or unreadable, stabilityd keeps managed profiles expected-active and emits an activity-probe finding instead of reclaiming them.

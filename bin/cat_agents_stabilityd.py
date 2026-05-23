@@ -136,7 +136,7 @@ RESOURCE_HUMAN_GATE_REFRESH_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_RES
 BACKUP_HEADROOM_WARN_RATIO = float(os.environ.get("OPENCLAW_STABILITY_BACKUP_HEADROOM_WARN_RATIO", "1.20"))
 BACKUP_KEEP_COUNT = int(os.environ.get("OPENCLAW_STABILITY_BACKUP_KEEP_COUNT", "3"))
 
-HERMERS_PROFILES = [
+HERMERS_PROFILE_FALLBACKS = [
     item.strip()
     for item in os.environ.get(
         "CAT_AGENTS_STABILITY_HERMERS_PROFILES",
@@ -158,16 +158,6 @@ HERMERS_FAILURE_WINDOW_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMER
 HERMERS_FAILURE_BURST_THRESHOLD = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_FAILURE_BURST", "5"))
 HERMERS_STALE_SENT_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_STALE_SENT_SECONDS", "600"))
 HERMERS_PROFILE_MODE_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ENABLED", "1") != "0"
-HERMERS_PROFILE_MODE_MANAGED_PROFILES = {
-    item.strip()
-    for item in os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_MANAGED", "catears").split(",")
-    if item.strip()
-}
-HERMERS_PROFILE_MODE_PROTECTED_PROFILES = {
-    item.strip()
-    for item in os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_PROTECTED", "catbody,catheart,main,cat_claw").split(",")
-    if item.strip()
-}
 HERMERS_PROFILE_COLD_IDLE_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_COLD_IDLE_SECONDS", str(30 * 60)))
 HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS", str(8 * 3600)))
 
@@ -1215,9 +1205,9 @@ def hermers_gateway_processes(rows: List[Dict[str, str]], profile: str) -> List[
     return results
 
 
-def hermers_acp_workers(rows: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+def hermers_acp_workers(rows: List[Dict[str, str]], known_profiles: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
     workers = []
-    known_profiles = set(HERMERS_PROFILES)
+    known = {str(item) for item in (known_profiles or HERMERS_PROFILE_FALLBACKS) if str(item)}
     for row in rows:
         cmd = row.get("cmd", "")
         if " acp" not in cmd or "/hermes" not in cmd or " --accept-hooks" not in cmd:
@@ -1226,7 +1216,7 @@ def hermers_acp_workers(rows: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         match = re.search(r"(?:^|\s)-p\s+([A-Za-z0-9_-]+)\s+acp(?:\s|$)", cmd)
         if match:
             profile = match.group(1)
-        if known_profiles and profile and profile not in known_profiles:
+        if known and profile and profile not in known:
             continue
         item = dict(row)
         item["profile"] = profile
@@ -1247,19 +1237,90 @@ def hermers_profile_agent_ids(profile: str) -> set[str]:
     return ids
 
 
-def hermers_profile_workflow_activity(profiles: List[str]) -> Dict[str, Dict[str, Any]]:
+def hermers_profiles_from_runtime_registry(findings: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    registry = workflow_runtime_registry_records()
+    records = registry.get("records") if isinstance(registry.get("records"), list) else []
+    profiles: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        runtime = str(record.get("runtime") or "")
+        status = str(record.get("status") or "")
+        endpoint_ref = str(record.get("endpoint_ref") or "")
+        if runtime not in {"hermes_acp", "hermes", "hermers"}:
+            continue
+        if status in {"retired", "inactive", "disabled"}:
+            continue
+        if not endpoint_ref.startswith("hermes-profile:"):
+            continue
+        profile = endpoint_ref.split(":", 1)[1].strip()
+        if not profile:
+            continue
+        item = profiles.setdefault(
+            profile,
+            {
+                "profile": profile,
+                "agentIds": set(),
+                "registryRecords": [],
+                "source": "runtime_agents",
+            },
+        )
+        agent_id = str(record.get("agent_id") or "")
+        if agent_id:
+            item["agentIds"].add(agent_id)
+        item["agentIds"].update(hermers_profile_agent_ids(profile))
+        item["registryRecords"].append(record)
+
+    if profiles:
+        for item in profiles.values():
+            item["agentIds"] = sorted(item.get("agentIds") or [])
+        return profiles, {
+            "source": "runtime_agents",
+            "dbFile": registry.get("dbFile"),
+            "recordCount": len(records),
+            "profileCount": len(profiles),
+        }
+
+    fallback = {
+        profile: {
+            "profile": profile,
+            "agentIds": sorted(hermers_profile_agent_ids(profile)),
+            "registryRecords": [],
+            "source": "fallback",
+        }
+        for profile in HERMERS_PROFILE_FALLBACKS
+    }
+    reason = registry.get("error") or "no active hermers profiles found in runtime_agents"
+    add_finding(
+        findings,
+        "hermers_profile_registry_fallback",
+        "warning",
+        "hermers",
+        "Hermers profile observation fell back to legacy profile list instead of runtime_agents",
+        reason=reason,
+        dbFile=registry.get("dbFile"),
+    )
+    return fallback, {
+        "source": "fallback",
+        "dbFile": registry.get("dbFile"),
+        "reason": reason,
+        "profileCount": len(fallback),
+    }
+
+
+def hermers_profile_workflow_activity(profile_records: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     activity: Dict[str, Dict[str, Any]] = {
         profile: {
             "profile": profile,
             "probeOk": True,
-            "agentIds": sorted(hermers_profile_agent_ids(profile)),
+            "agentIds": sorted(set(item.get("agentIds") or []) | hermers_profile_agent_ids(profile)),
             "activeRuntimeCount": 0,
             "activeDispatchCount": 0,
             "lastActivityEpoch": None,
             "lastActivityAt": None,
             "sample": [],
         }
-        for profile in profiles
+        for profile, item in profile_records.items()
     }
     if not WORKFLOW_DB.exists():
         for item in activity.values():
@@ -1270,8 +1331,9 @@ def hermers_profile_workflow_activity(profiles: List[str]) -> Dict[str, Dict[str
     def matches_profile(profile: str, row: Dict[str, Any]) -> bool:
         agent_id = str(row.get("agent_id") or "")
         adapter = str(row.get("adapter") or "")
+        agent_ids = set(activity.get(profile, {}).get("agentIds") or [])
         text = f"{agent_id} {adapter}".lower()
-        if agent_id in hermers_profile_agent_ids(profile):
+        if agent_id in agent_ids:
             return True
         return profile.lower() in text
 
@@ -1310,7 +1372,7 @@ def hermers_profile_workflow_activity(profiles: List[str]) -> Dict[str, Dict[str
             status = str(row.get("status") or "").lower()
             active = status in {"queued", "pending", "sent", "started", "running", "in_progress"}
             when_raw = row.get("completed_at") or row.get("started_at")
-            for profile in profiles:
+            for profile in profile_records:
                 if matches_profile(profile, row):
                     record(profile, row, when_raw, active, "runtime")
 
@@ -1328,7 +1390,7 @@ def hermers_profile_workflow_activity(profiles: List[str]) -> Dict[str, Dict[str
             status = str(row.get("status") or "").lower()
             active = status in {"queued", "pending", "sent", "started", "running", "in_progress"}
             when_raw = row.get("updated_at") or row.get("sent_at")
-            for profile in profiles:
+            for profile in profile_records:
                 if matches_profile(profile, row):
                     record(profile, row, when_raw, active, "dispatch")
     except Exception as exc:
@@ -1347,17 +1409,18 @@ def build_hermers_profile_modes(
     profiles: Dict[str, Any],
     acp_workers: List[Dict[str, Any]],
     workflow_activity: Dict[str, Dict[str, Any]],
+    profile_registry: Dict[str, Dict[str, Any]],
+    registry_meta: Dict[str, Any],
 ) -> Dict[str, Any]:
     now_s = epoch()
     profile_modes: Dict[str, Any] = {}
     for profile, profile_snapshot in profiles.items():
         service = profile_snapshot.get("service") if isinstance(profile_snapshot.get("service"), dict) else {}
         active = bool(profile_snapshot.get("active"))
+        registry_item = profile_registry.get(profile) if isinstance(profile_registry.get(profile), dict) else {}
         profile_workers = [item for item in acp_workers if item.get("profile") == profile]
         workflow = workflow_activity.get(profile) or {}
         workflow_probe_ok = bool(workflow.get("probeOk", True))
-        protected = profile in HERMERS_PROFILE_MODE_PROTECTED_PROFILES
-        managed = profile in HERMERS_PROFILE_MODE_MANAGED_PROFILES and not protected
         active_work = bool(profile_workers) or int(workflow.get("activeRuntimeCount") or 0) > 0 or int(workflow.get("activeDispatchCount") or 0) > 0
 
         last_activity_epoch = workflow.get("lastActivityEpoch")
@@ -1366,14 +1429,10 @@ def build_hermers_profile_modes(
         idle_seconds = max(0, now_s - int(last_activity_epoch)) if last_activity_epoch is not None else None
 
         target_mode = "warm"
-        reason = "not-managed"
+        reason = "warm"
         expected_active = True
         if not HERMERS_PROFILE_MODE_ENABLED:
             reason = "profile-mode-disabled"
-        elif protected:
-            reason = "protected-profile"
-        elif not managed:
-            reason = "not-managed"
         elif not workflow_probe_ok:
             reason = "workflow-activity-unavailable"
         elif active_work:
@@ -1392,8 +1451,9 @@ def build_hermers_profile_modes(
 
         profile_modes[profile] = {
             "profile": profile,
-            "managed": bool(managed),
-            "protected": bool(protected),
+            "agentIds": sorted(set(registry_item.get("agentIds") or []) | set(workflow.get("agentIds") or [])),
+            "registrySource": registry_item.get("source") or registry_meta.get("source"),
+            "registryRecords": registry_item.get("registryRecords") or [],
             "active": active,
             "activeWork": active_work,
             "workerCount": len(profile_workers),
@@ -1419,8 +1479,8 @@ def build_hermers_profile_modes(
         "actuateEnabled": False,
         "startEnabled": False,
         "controlMode": "observe-only",
-        "managedProfiles": sorted(HERMERS_PROFILE_MODE_MANAGED_PROFILES),
-        "protectedProfiles": sorted(HERMERS_PROFILE_MODE_PROTECTED_PROFILES),
+        "registrySource": registry_meta.get("source"),
+        "registry": registry_meta,
         "coldIdleSeconds": HERMERS_PROFILE_COLD_IDLE_SECONDS,
         "hibernateIdleSeconds": HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS,
         "counts": counts,
@@ -1498,7 +1558,8 @@ def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) ->
     profiles: Dict[str, Any] = {}
     down = []
     pid_mismatches = []
-    for profile in HERMERS_PROFILES:
+    profile_registry, registry_meta = hermers_profiles_from_runtime_registry(findings)
+    for profile in sorted(profile_registry):
         unit = f"hermes-gateway-{profile}.service"
         service = systemctl_user_show(unit)
         active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
@@ -1521,9 +1582,9 @@ def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) ->
             "gatewayProcesses": procs,
         }
 
-    acp_workers = hermers_acp_workers(rows)
-    workflow_activity = hermers_profile_workflow_activity(HERMERS_PROFILES)
-    profile_modes = build_hermers_profile_modes(conn, profiles, acp_workers, workflow_activity)
+    acp_workers = hermers_acp_workers(rows, profile_registry.keys())
+    workflow_activity = hermers_profile_workflow_activity(profile_registry)
+    profile_modes = build_hermers_profile_modes(conn, profiles, acp_workers, workflow_activity, profile_registry, registry_meta)
     mode_profiles = profile_modes.get("profiles") if isinstance(profile_modes.get("profiles"), dict) else {}
     down = [
         item for item in down
@@ -1594,6 +1655,7 @@ def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) ->
     return {
         "profiles": profiles,
         "profileCount": len(profiles),
+        "profileRegistry": registry_meta,
         "activeProfileCount": sum(1 for item in profiles.values() if item.get("active")),
         "acpWorkers": acp_workers,
         "orphanAcpWorkers": orphan_workers,
@@ -3204,8 +3266,8 @@ def build_lane_policy(
                 "profileRuntimeModes": {
                     "enabled": bool(profile_modes.get("enabled")),
                     "actuateEnabled": bool(profile_modes.get("actuateEnabled")),
-                    "managedProfiles": profile_modes.get("managedProfiles") or [],
-                    "protectedProfiles": profile_modes.get("protectedProfiles") or [],
+                    "controlMode": profile_modes.get("controlMode"),
+                    "registrySource": profile_modes.get("registrySource"),
                     "coldIdleSeconds": profile_modes.get("coldIdleSeconds"),
                     "hibernateIdleSeconds": profile_modes.get("hibernateIdleSeconds"),
                     "counts": profile_mode_counts,
@@ -3244,8 +3306,8 @@ def build_lane_policy(
             "profileModeEnabled": bool(profile_modes.get("enabled")),
             "profileModeActuateAllowed": bool(profile_modes.get("actuateEnabled")),
             "profileModes": {
-                "managedProfiles": profile_modes.get("managedProfiles") or [],
-                "protectedProfiles": profile_modes.get("protectedProfiles") or [],
+                "controlMode": profile_modes.get("controlMode"),
+                "registrySource": profile_modes.get("registrySource"),
                 "coldIdleSeconds": profile_modes.get("coldIdleSeconds"),
                 "hibernateIdleSeconds": profile_modes.get("hibernateIdleSeconds"),
                 "counts": profile_mode_counts,
