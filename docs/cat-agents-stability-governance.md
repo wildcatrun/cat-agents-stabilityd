@@ -313,6 +313,8 @@ Unified agent lifecycle policy:
 - Unified lifecycle language is governance vocabulary for readiness, dispatch admission, receipt, Human Gate evidence, and stabilityd external repair. It must map to runtime-domain observations and policy-gated stabilityd/runtime controls instead of creating platform-local membership policy.
 - Hermers/Hermes, OpenClaw, Codex, and future runtimes are platform adapters under the global `runtime_agents` registry. They must not define separate cat-system member policy from their own local profile lists.
 - Runtime-specific checks can inspect service names, profile files, cron state, sessions, or ACP workers only after the target members are selected from the global registry.
+- OpenClaw session scanning is registry-scoped. `cat-agents-stabilityd` must read `trading-agents-workflow.runtime_agents` first, derive active OpenClaw members, and only then inspect `.openclaw/agents/<agent>/sessions/sessions.json` for those members. Dormant `openclaw_route_shell` records and migrated Hermers agents are historical evidence paths, not active session-governance targets.
+- The workflow may export `registry/runtime-agents.snapshot.json` as an atomic read-only fallback for stabilityd when SQLite is temporarily unavailable. The snapshot is derived evidence from `runtime_agents`, not a separate desired-state authority.
 - Protected member requirements such as `main`, `catheart` / `cat_heart`, and `cat_claw` must be enforced by stabilityd and runtime-specific protection policy; workflow must not override them, and stabilityd profile lifecycle actions must skip them.
 
 Safety rules:

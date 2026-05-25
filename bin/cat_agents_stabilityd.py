@@ -53,6 +53,12 @@ def default_workflow_root() -> Path:
 
 WORKFLOW_ROOT = default_workflow_root()
 WORKFLOW_DB = Path(os.environ.get("CAT_AGENTS_WORKFLOW_DB", str(WORKFLOW_ROOT / "tracking.db")))
+WORKFLOW_RUNTIME_AGENTS_SNAPSHOT = Path(
+    os.environ.get(
+        "CAT_AGENTS_WORKFLOW_RUNTIME_AGENTS_SNAPSHOT",
+        str(WORKFLOW_ROOT / "registry" / "runtime-agents.snapshot.json"),
+    )
+)
 WORKFLOW_GOVERNANCE_LOG_DIR = WORKFLOW_ROOT / "governance-logs"
 SCRIPTS = HOME / "scripts"
 STABILITY_DIR = OPENCLAW / "stability"
@@ -595,9 +601,98 @@ def desired_state_required_files(state: Dict[str, Any]) -> List[str]:
     return [str(item) for item in files if str(item).strip()]
 
 
+def _snapshot_bool(value: Any, fallback: int = 1) -> int:
+    if value is None or value == "":
+        return fallback
+    if isinstance(value, bool):
+        return 1 if value else 0
+    text = str(value).strip().lower()
+    if text in {"0", "false", "no", "off", "disabled"}:
+        return 0
+    if text in {"1", "true", "yes", "on", "enabled"}:
+        return 1
+    return fallback
+
+
+def _registry_snapshot_records(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    records = snapshot.get("records") if isinstance(snapshot.get("records"), list) else []
+    if not records and isinstance(snapshot.get("runtimeRegistry"), dict):
+        for agents in snapshot["runtimeRegistry"].values():
+            if isinstance(agents, list):
+                records.extend(item for item in agents if isinstance(item, dict))
+    normalized = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        runtime = str(item.get("runtime") or "").strip()
+        agent_id = str(item.get("agent_id") or item.get("agentId") or "").strip()
+        if not agent_id:
+            continue
+        agent_key = str(item.get("agent_key") or item.get("agentKey") or "").strip()
+        if not agent_key and runtime:
+            agent_key = f"{runtime}:{agent_id}"
+        normalized.append(
+            {
+                "agent_key": agent_key,
+                "agent_id": agent_id,
+                "runtime": runtime,
+                "display_name": item.get("display_name") or item.get("displayName") or "",
+                "role": item.get("role") or "",
+                "status": item.get("status") or "",
+                "platform": item.get("platform") or "",
+                "execution_adapter": item.get("execution_adapter") or item.get("executionAdapter") or "",
+                "im_ingress_owner": item.get("im_ingress_owner") or item.get("imIngressOwner") or "",
+                "im_ingress_adapter": item.get("im_ingress_adapter") or item.get("imIngressAdapter") or "",
+                "workflow_ingress_adapter": item.get("workflow_ingress_adapter") or item.get("workflowIngressAdapter") or "",
+                "can_receive_dispatch": _snapshot_bool(item.get("can_receive_dispatch", item.get("canReceiveDispatch")), 1),
+                "can_start_workflow": _snapshot_bool(item.get("can_start_workflow", item.get("canStartWorkflow")), 1),
+                "gateway_proxy_allowed": _snapshot_bool(item.get("gateway_proxy_allowed", item.get("gatewayProxyAllowed")), 1),
+                "endpoint_ref": item.get("endpoint_ref") or item.get("endpointRef") or "",
+                "updated_at": item.get("updated_at") or item.get("updatedAt") or snapshot.get("generatedAt") or "",
+            }
+        )
+    return normalized
+
+
+def workflow_runtime_registry_snapshot_records(reason: str = "") -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "source": "snapshot",
+        "snapshotFile": str(WORKFLOW_RUNTIME_AGENTS_SNAPSHOT),
+        "snapshotExists": WORKFLOW_RUNTIME_AGENTS_SNAPSHOT.exists(),
+        "records": [],
+    }
+    if reason:
+        payload["fallbackReason"] = reason
+    if not WORKFLOW_RUNTIME_AGENTS_SNAPSHOT.exists():
+        payload["error"] = "runtime_agents snapshot not found"
+        return payload
+    snapshot = load_json(WORKFLOW_RUNTIME_AGENTS_SNAPSHOT, {}) or {}
+    if not isinstance(snapshot, dict):
+        payload["error"] = "runtime_agents snapshot is not an object"
+        return payload
+    payload["snapshotGeneratedAt"] = snapshot.get("generatedAt") or ""
+    payload["workflowSchemaVersion"] = snapshot.get("workflowSchemaVersion")
+    payload["records"] = _registry_snapshot_records(snapshot)
+    if not payload["records"]:
+        payload["error"] = "runtime_agents snapshot has no supported records"
+    return payload
+
+
 def workflow_runtime_registry_records() -> Dict[str, Any]:
-    payload: Dict[str, Any] = {"dbFile": str(WORKFLOW_DB), "exists": WORKFLOW_DB.exists(), "records": []}
+    payload: Dict[str, Any] = {
+        "source": "db",
+        "dbFile": str(WORKFLOW_DB),
+        "exists": WORKFLOW_DB.exists(),
+        "snapshotFile": str(WORKFLOW_RUNTIME_AGENTS_SNAPSHOT),
+        "snapshotExists": WORKFLOW_RUNTIME_AGENTS_SNAPSHOT.exists(),
+        "records": [],
+    }
     if not WORKFLOW_DB.exists():
+        fallback = workflow_runtime_registry_snapshot_records("workflow_db_missing")
+        if fallback.get("records"):
+            fallback["dbFile"] = str(WORKFLOW_DB)
+            fallback["exists"] = False
+            return fallback
         return payload
     try:
         conn = sqlite3.connect(str(WORKFLOW_DB))
@@ -623,8 +718,12 @@ def workflow_runtime_registry_records() -> Dict[str, Any]:
             "status",
             "platform",
             "execution_adapter",
+            "im_ingress_owner",
+            "im_ingress_adapter",
             "workflow_ingress_adapter",
             "can_receive_dispatch",
+            "can_start_workflow",
+            "gateway_proxy_allowed",
             "endpoint_ref",
             "updated_at",
         ]
@@ -647,6 +746,12 @@ def workflow_runtime_registry_records() -> Dict[str, Any]:
         conn.close()
     except Exception as exc:
         payload["error"] = f"{type(exc).__name__}: {exc}"
+        fallback = workflow_runtime_registry_snapshot_records("workflow_db_error")
+        if fallback.get("records"):
+            fallback["dbFile"] = str(WORKFLOW_DB)
+            fallback["exists"] = WORKFLOW_DB.exists()
+            fallback["dbError"] = payload["error"]
+            return fallback
     return payload
 
 
@@ -1843,12 +1948,50 @@ def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) ->
     }
 
 
-def iter_session_store_paths() -> List[Path]:
+def active_openclaw_agent_ids_from_registry(registry: Dict[str, Any]) -> List[str]:
+    records = registry.get("records") if isinstance(registry.get("records"), list) else []
+    agent_ids = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        status = str(record.get("status") or "").strip()
+        runtime = str(record.get("runtime") or "").strip()
+        platform = str(record.get("platform") or "").strip()
+        can_receive = _snapshot_bool(record.get("can_receive_dispatch"), 1)
+        if status != "active":
+            continue
+        if runtime == "openclaw_route_shell":
+            continue
+        if runtime != "openclaw" and platform != "openclaw":
+            continue
+        if can_receive == 0:
+            continue
+        agent_id = str(record.get("agent_id") or "").strip()
+        if agent_id:
+            agent_ids.add(agent_id)
+    return sorted(agent_ids)
+
+
+def session_store_agent_id(store_path: Path) -> str:
+    try:
+        return store_path.relative_to(AGENTS_DIR).parts[0]
+    except Exception:
+        return ""
+
+
+def session_key_agent_id(session_key: str) -> str:
+    match = re.match(r"^agent:([^:]+):", str(session_key or ""))
+    return match.group(1) if match else ""
+
+
+def iter_session_store_paths(agent_ids: Optional[Iterable[str]] = None) -> List[Path]:
     paths = []
+    allowed = {str(item) for item in agent_ids or [] if str(item)}
+    scoped = agent_ids is not None
     if not AGENTS_DIR.exists():
         return paths
     for path in sorted(AGENTS_DIR.glob("*/sessions/sessions.json")):
-        if path.is_file():
+        if path.is_file() and (not scoped or session_store_agent_id(path) in allowed):
             paths.append(path)
     return paths
 
@@ -2764,8 +2907,8 @@ def analyze_session_activity(entry: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def find_session_entry(session_key: str) -> Tuple[Optional[Path], Optional[Dict[str, Any]]]:
-    for store_path in iter_session_store_paths():
+def find_session_entry(session_key: str, agent_ids: Optional[Iterable[str]] = None) -> Tuple[Optional[Path], Optional[Dict[str, Any]]]:
+    for store_path in iter_session_store_paths(agent_ids):
         store = load_json(store_path, {})
         if not isinstance(store, dict) or session_key not in store:
             continue
@@ -2776,7 +2919,11 @@ def find_session_entry(session_key: str) -> Tuple[Optional[Path], Optional[Dict[
 
 
 def session_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
-    stores = iter_session_store_paths()
+    registry = workflow_runtime_registry_records()
+    registry_records = registry.get("records") if isinstance(registry.get("records"), list) else []
+    scope_available = bool(registry_records) and not registry.get("error")
+    active_openclaw_agent_ids = active_openclaw_agent_ids_from_registry(registry) if scope_available else []
+    stores = iter_session_store_paths(active_openclaw_agent_ids if scope_available else [])
     total_entries = 0
     stale_entries = []
     for store_path in stores:
@@ -2802,7 +2949,12 @@ def session_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     reset_candidates = []
     stale_log_candidates = []
     protected_candidates = []
+    active_openclaw_agent_set = set(active_openclaw_agent_ids)
     for key, meta in problems.items():
+        if scope_available:
+            key_agent_id = session_key_agent_id(key)
+            if key_agent_id and key_agent_id not in active_openclaw_agent_set:
+                continue
         failure_count = len(meta.get("failures") or [])
         overflow_count = int(meta.get("overflowCount") or 0)
         stuck_count = int(meta.get("stuckCount") or 0)
@@ -2814,7 +2966,7 @@ def session_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "stuckCount": stuck_count,
                 "sample": (meta.get("sample") or [])[-3:],
             }
-            store_path, entry = find_session_entry(key)
+            store_path, entry = find_session_entry(key, active_openclaw_agent_ids if scope_available else [])
             if not entry:
                 stale_log_candidates.append(item)
                 continue
@@ -2827,6 +2979,15 @@ def session_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
                 continue
             reset_candidates.append(item)
     main_candidates = [r for r in reset_candidates if r["sessionKey"].startswith("agent:main:") or ":main:" in r["sessionKey"]]
+    if not scope_available:
+        add_finding(
+            findings,
+            "session_registry_scope_unavailable",
+            "warning",
+            "session",
+            "workflow runtime_agents registry unavailable; session scanner did not fall back to OpenClaw agent directories",
+            registry=registry,
+        )
     if stale_entries:
         add_finding(findings, "session_stale_entries", "info", "session", "stale failed session entries detected", count=len(stale_entries), sample=stale_entries[:10])
     if stale_log_candidates:
@@ -2864,6 +3025,15 @@ def session_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "storeCount": len(stores),
         "entryCount": total_entries,
+        "scope": {
+            "source": registry.get("source") or "",
+            "dbFile": registry.get("dbFile") or "",
+            "snapshotFile": registry.get("snapshotFile") or "",
+            "snapshotGeneratedAt": registry.get("snapshotGeneratedAt") or "",
+            "registryRecordCount": len(registry_records),
+            "activeOpenClawAgentIds": active_openclaw_agent_ids,
+            "scopedByRuntimeAgents": scope_available,
+        },
         "staleEntries": stale_entries[:50],
         "problemCount": len(problems),
         "resetCandidates": reset_candidates[:50],
