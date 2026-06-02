@@ -155,6 +155,9 @@ HERMERS_GATEWAY_RESTART_ENABLED = os.environ.get(
 HERMERS_GATEWAY_RESTART_LIMIT = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_GATEWAY_RESTART_LIMIT", str(MAX_RESTARTS_PER_WINDOW)))
 HERMERS_ACP_ORPHAN_MIN_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_ACP_ORPHAN_SECONDS", "120"))
 HERMERS_ACP_LONG_RUNNING_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_ACP_LONG_SECONDS", "600"))
+HERMERS_LSP_IDLE_REAP_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_REAP_HERMERS_IDLE_LSP", "1") != "0"
+HERMERS_LSP_IDLE_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_LSP_IDLE_SECONDS", str(4 * 3600)))
+HERMERS_LSP_IDLE_STATE_TTL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_LSP_IDLE_STATE_TTL_SECONDS", str(24 * 3600)))
 HERMERS_FAILURE_WINDOW_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_FAILURE_WINDOW_SECONDS", "1800"))
 HERMERS_FAILURE_BURST_THRESHOLD = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_FAILURE_BURST", "5"))
 HERMERS_STALE_SENT_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_STALE_SENT_SECONDS", "600"))
@@ -1391,6 +1394,108 @@ def hermers_acp_workers(rows: List[Dict[str, str]], known_profiles: Optional[Ite
     return workers
 
 
+def proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def proc_cpu_ticks(pid: int) -> int:
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        end = text.rfind(")")
+        if end < 0:
+            return -1
+        fields = text[end + 2 :].split()
+        # /proc/<pid>/stat fields after comm start at field 3; utime/stime are fields 14/15.
+        return int(fields[11]) + int(fields[12])
+    except Exception:
+        return -1
+
+
+def hermers_lsp_processes(rows: List[Dict[str, str]], known_profiles: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
+    processes: List[Dict[str, Any]] = []
+    known = {str(item) for item in (known_profiles or []) if str(item)}
+    if known_profiles is not None and not known:
+        return processes
+    pattern = re.compile(r"/\.hermes/profiles/([A-Za-z0-9_-]+)/lsp/.*/pyright-langserver(?:\s|$)")
+    for row in rows:
+        cmd = row.get("cmd", "")
+        if "pyright-langserver" not in cmd or "--stdio" not in cmd:
+            continue
+        match = pattern.search(cmd)
+        if not match:
+            continue
+        profile = match.group(1)
+        if known and profile not in known:
+            continue
+        try:
+            pid = int(row.get("pid") or 0)
+        except Exception:
+            pid = 0
+        if pid <= 1:
+            continue
+        item = dict(row)
+        item["profile"] = profile
+        item["processType"] = "pyright-langserver"
+        item["ageSeconds"] = etime_seconds(row.get("etime"))
+        item["cpuTicks"] = proc_cpu_ticks(pid)
+        with contextlib.suppress(Exception):
+            item["rssBytes"] = int(row.get("rssKb") or "0") * 1024
+        processes.append(item)
+    return processes
+
+
+def update_hermers_lsp_idle_state(conn: sqlite3.Connection, processes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    now_s = epoch()
+    previous = db_get(conn, "hermers_lsp_idle_state", {}) or {}
+    if not isinstance(previous, dict):
+        previous = {}
+    updated: Dict[str, Any] = {}
+    enriched: List[Dict[str, Any]] = []
+    for item in processes:
+        pid = str(item.get("pid") or "")
+        profile = str(item.get("profile") or "")
+        key = f"{profile}:{pid}"
+        cpu_ticks = int(item.get("cpuTicks") or 0)
+        old = previous.get(key) if isinstance(previous.get(key), dict) else {}
+        old_ticks = int(old.get("cpuTicks") or -1)
+        if old and old_ticks == cpu_ticks:
+            idle_since = int(old.get("idleSinceEpoch") or now_s)
+        else:
+            idle_since = now_s
+        idle_observed = max(0, now_s - idle_since)
+        state_item = {
+            "profile": profile,
+            "pid": pid,
+            "cmd": item.get("cmd") or "",
+            "cpuTicks": cpu_ticks,
+            "idleSinceEpoch": idle_since,
+            "lastSeenEpoch": now_s,
+        }
+        updated[key] = state_item
+        enriched_item = dict(item)
+        enriched_item["idleSinceEpoch"] = idle_since
+        enriched_item["idleObservedSeconds"] = idle_observed
+        enriched_item["idleThresholdSeconds"] = HERMERS_LSP_IDLE_SECONDS
+        enriched_item["idleCandidate"] = (
+            cpu_ticks >= 0
+            and idle_observed >= HERMERS_LSP_IDLE_SECONDS
+            and int(enriched_item.get("ageSeconds") or 0) >= HERMERS_LSP_IDLE_SECONDS
+        )
+        enriched.append(enriched_item)
+    for key, old in previous.items():
+        if key in updated or not isinstance(old, dict):
+            continue
+        last_seen = int(old.get("lastSeenEpoch") or 0)
+        if last_seen and now_s - last_seen < HERMERS_LSP_IDLE_STATE_TTL_SECONDS:
+            updated[key] = old
+    db_set(conn, "hermers_lsp_idle_state", updated)
+    return enriched
+
+
 def hermers_profile_agent_ids(profile: str) -> set[str]:
     return set()
 
@@ -1859,6 +1964,11 @@ def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) ->
         }
 
     acp_workers = hermers_acp_workers(rows, profile_registry.keys())
+    if profile_registry:
+        lsp_processes = update_hermers_lsp_idle_state(conn, hermers_lsp_processes(rows, profile_registry.keys()))
+    else:
+        db_set(conn, "hermers_lsp_idle_state", {})
+        lsp_processes = []
     workflow_activity = hermers_profile_workflow_activity(profile_registry)
     profile_modes = build_hermers_profile_modes(conn, profiles, acp_workers, workflow_activity, profile_registry, registry_meta)
     orphan_workers = [
@@ -1868,6 +1978,10 @@ def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) ->
     long_workers = [
         item for item in acp_workers
         if int(item.get("ageSeconds") or 0) >= HERMERS_ACP_LONG_RUNNING_SECONDS
+    ]
+    idle_lsp_processes = [
+        item for item in lsp_processes
+        if bool(item.get("idleCandidate"))
     ]
     workflow = hermers_workflow_summary()
     recent_failure_count = int(workflow.get("recentFailureCount") or 0)
@@ -1891,6 +2005,17 @@ def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) ->
         add_finding(findings, "hermers_acp_orphan_workers", "high", "hermers", "Hermers ACP workers are orphaned from their workflow parent", count=len(orphan_workers), sample=orphan_workers[:10])
     if long_workers:
         add_finding(findings, "hermers_acp_long_running_workers", "warning", "hermers", "Hermers ACP workers exceeded the long-running threshold", count=len(long_workers), sample=long_workers[:10])
+    if idle_lsp_processes:
+        add_finding(
+            findings,
+            "hermers_lsp_idle_processes",
+            "warning",
+            "hermers",
+            "Hermers profile LSP helpers exceeded the idle threshold and are eligible for controlled reap",
+            count=len(idle_lsp_processes),
+            idleThresholdSeconds=HERMERS_LSP_IDLE_SECONDS,
+            sample=idle_lsp_processes[:10],
+        )
     if recent_failure_count >= HERMERS_FAILURE_BURST_THRESHOLD:
         add_finding(
             findings,
@@ -1941,9 +2066,13 @@ def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) ->
         "acpWorkers": acp_workers,
         "orphanAcpWorkers": orphan_workers,
         "longRunningAcpWorkers": long_workers,
+        "lspProcesses": lsp_processes,
+        "idleLspProcesses": idle_lsp_processes,
         "workflow": workflow,
         "profileModes": profile_modes,
         "reapOrphanAcpWorkersEnabled": bool(HERMERS_ACP_ORPHAN_REAP_ENABLED),
+        "reapIdleLspEnabled": bool(HERMERS_LSP_IDLE_REAP_ENABLED),
+        "lspIdleSeconds": HERMERS_LSP_IDLE_SECONDS,
         "gatewayRestartEnabled": bool(HERMERS_GATEWAY_RESTART_ENABLED),
     }
 
@@ -3634,7 +3763,7 @@ def build_lane_policy(
                 "evidenceKeys": hermers_evidence,
                 "observationKeys": hermers_observations,
                 "streakCounts": {k: streak_counts[k] for k in hermers_evidence if k in streak_counts},
-                "governanceAction": "reap-orphan-acp-workers" if "hermers_acp_orphan_workers" in keys and HERMERS_ACP_ORPHAN_REAP_ENABLED else "operator-review-orphan-acp-workers" if "hermers_acp_orphan_workers" in keys else "profile-mode-adjust" if int(profile_mode_counts.get("hibernate") or 0) > 0 and HERMERS_PROFILE_MODE_ACTUATE_ENABLED else "profile-readiness-observe" if int(profile_mode_counts.get("hibernate") or 0) > 0 else ("restart-hermers-gateway" if HERMERS_GATEWAY_RESTART_ENABLED else "restart-hermers-gateway-disabled-observe") if "hermers_gateway_service_down" in keys else "observe",
+                "governanceAction": "reap-orphan-acp-workers" if "hermers_acp_orphan_workers" in keys and HERMERS_ACP_ORPHAN_REAP_ENABLED else "operator-review-orphan-acp-workers" if "hermers_acp_orphan_workers" in keys else "reap-idle-lsp" if "hermers_lsp_idle_processes" in keys and HERMERS_LSP_IDLE_REAP_ENABLED else "operator-review-idle-lsp" if "hermers_lsp_idle_processes" in keys else "profile-mode-adjust" if int(profile_mode_counts.get("hibernate") or 0) > 0 and HERMERS_PROFILE_MODE_ACTUATE_ENABLED else "profile-readiness-observe" if int(profile_mode_counts.get("hibernate") or 0) > 0 else ("restart-hermers-gateway" if HERMERS_GATEWAY_RESTART_ENABLED else "restart-hermers-gateway-disabled-observe") if "hermers_gateway_service_down" in keys else "observe",
                 "stabilizationGoal": "keep Hermers profile gateways, ACP workers, runtime receipts, and workflow-facing execution readiness healthy without masking runtime failures as workflow success",
                 "profileRuntimeModes": {
                     "enabled": bool(profile_modes.get("enabled")),
@@ -3674,6 +3803,8 @@ def build_lane_policy(
         "hermers": {
             "pressure": bool(hermers_pressure),
             "reapOrphanAcpWorkersAllowed": bool(HERMERS_ACP_ORPHAN_REAP_ENABLED),
+            "reapIdleLspAllowed": bool(HERMERS_LSP_IDLE_REAP_ENABLED),
+            "lspIdleSeconds": HERMERS_LSP_IDLE_SECONDS,
             "gatewayRestartAllowed": bool(HERMERS_GATEWAY_RESTART_ENABLED),
             "gatewayRestartDefault": "policy-gated" if HERMERS_GATEWAY_RESTART_ENABLED else "disabled",
             "profileModeEnabled": bool(profile_modes.get("enabled")),
@@ -3911,6 +4042,8 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         "hermersGatewayRestartBlockedReasons": hermers_restart_blocked_reasons,
         "canRestartHermersGateway": bool(can_restart_hermers_gateway),
         "canReapHermersOrphanWorkers": bool(HERMERS_ACP_ORPHAN_REAP_ENABLED),
+        "canReapHermersIdleLsp": bool(HERMERS_LSP_IDLE_REAP_ENABLED),
+        "hermersLspIdleSeconds": HERMERS_LSP_IDLE_SECONDS,
         "hermersGatewayRestartLimit": HERMERS_GATEWAY_RESTART_LIMIT,
         "hermersGatewayRestartRemaining": hermers_restart_remaining,
         "hermersGatewayRestartProfiles": hermers_restart_decisions,
@@ -4857,6 +4990,53 @@ def verify_hermers_orphan_worker(pid: int, profile: str, rows: List[Dict[str, st
     return True, "verified-orphan"
 
 
+def verify_hermers_idle_lsp(pid: int, profile: str, item: Dict[str, Any], rows: List[Dict[str, str]]) -> Tuple[bool, str]:
+    current = None
+    for row in rows:
+        try:
+            row_pid = int(row.get("pid") or 0)
+        except Exception:
+            row_pid = 0
+        if row_pid == pid:
+            current = row
+            break
+    if not current:
+        return False, "pid-not-found"
+    cmd = proc_cmdline(pid) or current.get("cmd", "")
+    if "pyright-langserver" not in cmd or "--stdio" not in cmd:
+        return False, "cmd-not-pyright-lsp"
+    if f"/.hermes/profiles/{profile}/lsp/" not in cmd:
+        return False, "profile-path-mismatch"
+    try:
+        ppid = int(current.get("ppid") or 0)
+    except Exception:
+        ppid = 0
+    if ppid <= 1:
+        return False, "missing-live-hermers-parent"
+    parent_cmd = proc_cmdline(ppid)
+    if not parent_cmd:
+        for row in rows:
+            if str(row.get("pid") or "") == str(ppid):
+                parent_cmd = row.get("cmd", "")
+                break
+    if "hermes_cli.main" not in parent_cmd or f"--profile {profile}" not in parent_cmd or "gateway run" not in parent_cmd:
+        return False, "parent-not-profile-gateway"
+    if int(item.get("ageSeconds") or 0) < HERMERS_LSP_IDLE_SECONDS:
+        return False, "process-younger-than-idle-threshold"
+    if int(item.get("idleObservedSeconds") or 0) < HERMERS_LSP_IDLE_SECONDS:
+        return False, "idle-observation-below-threshold"
+    try:
+        expected_ticks = int(item.get("cpuTicks"))
+    except Exception:
+        return False, "missing-cpu-baseline"
+    if expected_ticks < 0:
+        return False, "missing-cpu-baseline"
+    current_ticks = proc_cpu_ticks(pid)
+    if current_ticks != expected_ticks:
+        return False, "cpu-advanced-after-snapshot"
+    return True, "verified-idle-lsp"
+
+
 def hermers_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
     actions: List[Dict[str, Any]] = []
     hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
@@ -4891,6 +5071,50 @@ def hermers_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: 
                 "action": "observe_hermers_acp_orphan_workers",
                 "result": "reap_blocked_by_policy",
                 "workers": workers[:20],
+            }
+        )
+    idle_lsps = hermers.get("idleLspProcesses") if isinstance(hermers.get("idleLspProcesses"), list) else []
+    if idle_lsps and policy.get("canReapHermersIdleLsp"):
+        reaped = []
+        current_rows = ps_rows()
+        for item in idle_lsps[:20]:
+            try:
+                pid = int(item.get("pid") or 0)
+            except Exception:
+                pid = 0
+            if pid <= 1:
+                continue
+            profile = str(item.get("profile") or "")
+            verified, verify_reason = verify_hermers_idle_lsp(pid, profile, item, current_rows)
+            if not verified:
+                reaped.append({"pid": pid, "profile": profile, "result": "blocked", "reason": verify_reason})
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                reaped.append(
+                    {
+                        "pid": pid,
+                        "profile": profile,
+                        "processType": item.get("processType") or "pyright-langserver",
+                        "ageSeconds": item.get("ageSeconds"),
+                        "idleObservedSeconds": item.get("idleObservedSeconds"),
+                        "rssBytes": item.get("rssBytes"),
+                        "signal": "SIGTERM",
+                        "verified": verify_reason,
+                    }
+                )
+            except ProcessLookupError:
+                reaped.append({"pid": pid, "profile": profile, "result": "already_exited"})
+            except Exception as exc:
+                reaped.append({"pid": pid, "profile": profile, "result": "failed", "error": f"{type(exc).__name__}: {exc}"})
+        if reaped:
+            actions.append({"action": "reap_hermers_idle_lsp_processes", "result": "ok", "processes": reaped})
+    elif idle_lsps:
+        actions.append(
+            {
+                "action": "observe_hermers_idle_lsp_processes",
+                "result": "reap_blocked_by_policy",
+                "processes": idle_lsps[:20],
             }
         )
     actions.extend(hermers_profile_mode_actuate(conn, snapshot))
