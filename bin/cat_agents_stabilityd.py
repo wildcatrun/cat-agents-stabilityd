@@ -1652,7 +1652,7 @@ def hermers_profile_workflow_activity(profile_records: Dict[str, Dict[str, Any]]
                 item["activeDispatchCount"] = int(item.get("activeDispatchCount") or 0) + 1
         sample = item.setdefault("sample", [])
         if isinstance(sample, list) and len(sample) < 5:
-            sample.append({k: row.get(k) for k in ("kind", "status", "agent_id", "adapter", "started_at", "completed_at", "updated_at", "sent_at") if k in row})
+            sample.append({k: row.get(k) for k in ("kind", "dispatch_id", "status", "agent_id", "adapter", "started_at", "completed_at", "updated_at", "sent_at") if k in row})
 
     conn: Optional[sqlite3.Connection] = None
     try:
@@ -1660,10 +1660,36 @@ def hermers_profile_workflow_activity(profile_records: Dict[str, Dict[str, Any]]
         conn.row_factory = sqlite3.Row
         runtime_rows = conn.execute(
             """
-            SELECT 'runtime' AS kind, agent_id, adapter, acp_agent, status, started_at, completed_at, payload_json
-            FROM runtime_runs
-            WHERE runtime IN ('hermes_acp', 'hermes', 'hermers')
-            ORDER BY COALESCE(completed_at, started_at) DESC
+            SELECT 'runtime' AS kind, rr.dispatch_id, rr.agent_id, rr.adapter, rr.acp_agent, rr.status,
+                   rr.attempt, rr.started_at, rr.completed_at, rr.payload_json
+            FROM runtime_runs rr
+            WHERE rr.runtime IN ('hermes_acp', 'hermes', 'hermers')
+              AND NOT (
+                rr.status = 'started'
+                AND rr.started_at IS NOT NULL
+                AND rr.started_at != ''
+                AND EXISTS (
+                  SELECT 1
+                  FROM runtime_runs terminal
+                  WHERE terminal.dispatch_id = rr.dispatch_id
+                    AND terminal.runtime_run_id != rr.runtime_run_id
+                    AND terminal.runtime = rr.runtime
+                    AND terminal.agent_id = rr.agent_id
+                    AND terminal.status IN ('acked', 'failed', 'retry_scheduled')
+                    AND terminal.completed_at IS NOT NULL
+                    AND terminal.completed_at != ''
+                    AND terminal.completed_at >= rr.started_at
+                    AND (
+                      terminal.attempt = rr.attempt
+                      OR (
+                        terminal.adapter = 'stale_dispatch_reconcile'
+                        AND terminal.failure_type = 'runtime_stale'
+                        AND terminal.started_at = rr.started_at
+                      )
+                    )
+                )
+              )
+            ORDER BY COALESCE(rr.completed_at, rr.started_at) DESC
             LIMIT 500
             """
         ).fetchall()
