@@ -76,8 +76,101 @@ def main() -> int:
         checks["hermers_restart_disabled_by_default"] = not stabilityd.HERMERS_GATEWAY_RESTART_ENABLED
         checks["hermers_idle_lsp_reap_enabled_by_default"] = stabilityd.HERMERS_LSP_IDLE_REAP_ENABLED
         checks["hermers_idle_lsp_default_threshold_4h"] = stabilityd.HERMERS_LSP_IDLE_SECONDS == 4 * 3600
+        prefixed_json = """[state-migrations] Legacy state migration warnings:
+- Left plugin install index in place because shared SQLite state has conflicting plugin install metadata for: acpx
+{"enabled": true, "storage": "sqlite", "sqlitePath": "/tmp/openclaw.sqlite"}"""
+        payload, diagnostics, error = stabilityd.extract_json_payload(prefixed_json)
+        checks["openclaw_prefixed_json_parse_ok"] = isinstance(payload, dict) and payload.get("storage") == "sqlite" and error is None
+        checks["openclaw_state_migration_diagnostics_detected"] = bool(stabilityd.openclaw_state_migration_diagnostics(diagnostics))
+        deep = stabilityd.parse_gateway_deep_status(
+            """Connectivity probe: failed
+Probe target: ws://0.0.0.0:23466
+  connect failed: SECURITY ERROR: Cannot connect to "0.0.0.0" over plaintext ws://. Both credentials and chat data would be exposed to network interception.
+Runtime: running (pid 123, state active, sub running, last exit 0, reason 0)
+Port 23466 is already in use.
+- pid 123 flashcat: /usr/bin/node /usr/lib/node_modules/openclaw/dist/index.js gateway --port 23466 (*:23466)
+Listening: *:23466
+Plugin version drift: 1 active official plugins not on gateway 2026.6.8
+- acpx: 2026.6.1 (npm) → expected 2026.6.8
+"""
+        )
+        checks["gateway_deep_insecure_probe_detected"] = deep.get("connectivityProbeFailed") and deep.get("insecurePlaintextWsBlocked")
+        checks["gateway_deep_plugin_drift_detected"] = deep.get("pluginVersionDrift") == [{"id": "acpx", "current": "2026.6.1", "expected": "2026.6.8"}]
+        cli_jobs = stabilityd.jobs_from_cron_cli_status(
+            {
+                "available": True,
+                "byJob": {
+                    "job-1": {
+                        "jobId": "job-1",
+                        "name": "main heartbeat",
+                        "agentId": "main",
+                        "enabled": True,
+                        "lastStatus": "succeeded",
+                        "runningAtMs": 123,
+                        "timeoutSeconds": 60,
+                    }
+                },
+            }
+        )
+        checks["cron_cli_jobs_fallback_builds_jobs"] = stabilityd.job_items(cli_jobs)[0][0] == "job-1"
+        checks["cron_cli_jobs_fallback_preserves_running"] = stabilityd.job_items(cli_jobs)[0][1].get("runningAtMs") == 123
+        stale_cli_jobs = stabilityd.jobs_from_cron_cli_status(
+            {
+                "available": True,
+                "byJob": {
+                    "stale-job": {
+                        "jobId": "stale-job",
+                        "name": "stale from cli",
+                        "runningAtMs": stabilityd.now_ms() - (stabilityd.MIN_STALE_RUNNING_SECONDS + 5) * 1000,
+                        "timeoutSeconds": 60,
+                    }
+                },
+            }
+        )
+        checks["cron_cli_jobs_fallback_stale_detection"] = (
+            stabilityd.find_stale_running_jobs(stale_cli_jobs)[0].get("jobId") == "stale-job"
+        )
+        original_run_cmd = stabilityd.run_cmd
+        class FakeProc:
+            returncode = 0
+            stdout = """[state-migrations] Legacy state migration warnings:
+- Left plugin install index in place because shared SQLite state has conflicting plugin install metadata for: acpx
+{"registry":{"source":"persisted"},"plugins":[{"id":"acpx","version":"2026.6.8","enabled":true,"status":"loaded","origin":"npm"}]}"""
+            stderr = ""
+        try:
+            stabilityd.run_cmd = lambda *_args, **_kwargs: FakeProc()
+            plugin_status = stabilityd.collect_plugins_status()
+        finally:
+            stabilityd.run_cmd = original_run_cmd
+        checks["plugins_status_prefixed_json_parse_ok"] = plugin_status.get("available") and plugin_status.get("enabledPluginCount") == 1
+        checks["plugins_status_state_migration_diagnostics"] = bool(plugin_status.get("stateMigrationDiagnostics"))
 
         conn = stabilityd.init_db()
+        stabilityd.ensure_dirs()
+        lease_path = stabilityd.LEASE_DIR / "job-lease.json"
+        run_path = stabilityd.RUNS_BY_RUN_DIR / "run-1.json"
+        stabilityd.write_json_atomic(
+            lease_path,
+            {"jobId": "job-1", "runId": "run-1", "expiresAtMs": stabilityd.now_ms() - 1000},
+        )
+        stabilityd.write_json_atomic(
+            run_path,
+            {"jobId": "job-1", "runId": "run-1", "status": "running", "startedAtMs": stabilityd.now_ms() - 5000},
+        )
+        cron_actions = stabilityd.cron_actuate(
+            {
+                "cron": {
+                    "storageStatus": {"storage": "sqlite"},
+                    "staleRunning": [{"jobId": "job-1", "ageMs": 999999, "thresholdMs": 1}],
+                    "expiredLeases": [{"path": str(lease_path), "jobId": "job-1", "runId": "run-1"}],
+                }
+            },
+            {"canMutateCronState": False, "cronMutationBlockedReason": "openclaw-sqlite-cron-storage"},
+        )
+        checks["sqlite_cron_blocks_legacy_job_mutation"] = any(
+            item.get("result") == "legacy_jobs_mutation_blocked_by_sqlite_storage" for item in cron_actions
+        )
+        checks["sqlite_cron_still_reaps_expired_leases"] = any(item.get("action") == "reap_expired_leases" for item in cron_actions) and not lease_path.exists()
         stabilityd.HERMERS_LSP_IDLE_SECONDS = 10
         lsp_process = {
             "pid": "12345",

@@ -447,6 +447,165 @@ def command_probe(cmd: List[str], timeout: int = 5, max_chars: int = 16_000) -> 
         }
 
 
+def extract_json_payload(text: str) -> Tuple[Optional[Any], List[str], Optional[str]]:
+    """Parse CLI JSON while preserving OpenClaw diagnostic preambles."""
+    diagnostics: List[str] = []
+    if not text:
+        return None, diagnostics, "empty"
+    starts = sorted(idx for idx, char in enumerate(text) if char in "{[")
+    if not starts:
+        return None, [line for line in text.splitlines() if line.strip()][:20], "json_start_missing"
+    decoder = json.JSONDecoder()
+    first_error: Optional[str] = None
+    for start in starts:
+        prefix = text[:start].strip()
+        payload_text = text[start:].strip()
+        try:
+            payload, _ = decoder.raw_decode(payload_text)
+            if prefix:
+                diagnostics = [line for line in prefix.splitlines() if line.strip()][:40]
+            try:
+                return json.loads(payload_text), diagnostics, None
+            except Exception as exc:
+                return payload, diagnostics, f"trailing_non_json_ignored: {exc}"
+        except Exception as exc:
+            if first_error is None:
+                first_error = str(exc)
+            continue
+    prefix_lines = [line for line in text.splitlines() if line.strip()][:40]
+    return None, prefix_lines, f"json_parse_failed: {first_error or 'unknown'}"
+
+
+def openclaw_state_migration_diagnostics(diagnostics: Iterable[str]) -> List[str]:
+    return [line for line in diagnostics if "state-migrations" in line or "Legacy state migration" in line or "plugin install index" in line]
+
+
+def parse_openclaw_version(text: str) -> Dict[str, Any]:
+    match = re.search(r"OpenClaw\s+([^\s]+)(?:\s+\(([^)]+)\))?", text or "")
+    if not match:
+        return {"raw": (text or "").strip()}
+    return {
+        "raw": (text or "").strip(),
+        "version": match.group(1),
+        "commit": match.group(2),
+    }
+
+
+def collect_openclaw_version() -> Dict[str, Any]:
+    probe = command_probe(["openclaw", "--version"], timeout=8, max_chars=2000)
+    version = parse_openclaw_version(str(probe.get("stdout") or probe.get("stderr") or ""))
+    version["probe"] = {k: v for k, v in probe.items() if k not in {"stdout", "stderr"}}
+    return version
+
+
+def parse_gateway_deep_status(text: str) -> Dict[str, Any]:
+    lines = [line.rstrip() for line in (text or "").splitlines()]
+    joined = "\n".join(lines)
+    plugin_drifts = []
+    drift_re = re.compile(r"^-\s+([^:]+):\s+([^\s]+)\s+\([^)]+\)\s+→\s+expected\s+([^\s]+)")
+    for line in lines:
+        match = drift_re.search(line.strip())
+        if match:
+            plugin_drifts.append({"id": match.group(1).strip(), "current": match.group(2), "expected": match.group(3)})
+    runtime_match = re.search(r"Runtime:\s+(\S+)(?:\s+\(pid\s+(\d+),\s+state\s+([^,]+),\s+sub\s+([^,]+))?", joined)
+    service_match = re.search(r"Service:\s+(.+)", joined)
+    bind_match = re.search(r"Gateway:\s+bind=([^,]+),\s+port=(\d+)", joined)
+    client_match = re.search(r"Established clients:\s+(\d+)", joined)
+    return {
+        "rawSample": joined[-4000:],
+        "runtimeState": runtime_match.group(1) if runtime_match else None,
+        "runtimePid": int(runtime_match.group(2)) if runtime_match and runtime_match.group(2) else None,
+        "systemdState": runtime_match.group(3).strip() if runtime_match and runtime_match.group(3) else None,
+        "systemdSubState": runtime_match.group(4).strip() if runtime_match and runtime_match.group(4) else None,
+        "service": service_match.group(1).strip() if service_match else None,
+        "bind": bind_match.group(1).strip() if bind_match else None,
+        "port": int(bind_match.group(2)) if bind_match else None,
+        "connectivityProbeFailed": "Connectivity probe: failed" in joined,
+        "insecurePlaintextWsBlocked": "SECURITY ERROR: Cannot connect to \"0.0.0.0\" over plaintext ws://" in joined,
+        "portInUse": "Port 23466 is already in use" in joined or f"Port {PORT} is already in use" in joined,
+        "listening": "Listening:" in joined,
+        "pluginVersionDrift": plugin_drifts,
+        "establishedClients": int(client_match.group(1)) if client_match else None,
+    }
+
+
+def collect_gateway_deep_status() -> Dict[str, Any]:
+    probe = command_probe(["openclaw", "gateway", "status", "--deep"], timeout=18, max_chars=20_000)
+    text = "\n".join(str(probe.get(key) or "") for key in ("stdout", "stderr"))
+    parsed = parse_gateway_deep_status(text)
+    parsed["probe"] = {k: v for k, v in probe.items() if k not in {"stdout", "stderr"}}
+    return parsed
+
+
+def collect_cron_storage_status() -> Dict[str, Any]:
+    try:
+        out = run_cmd(["openclaw", "cron", "status", "--json"], timeout=15)
+    except Exception as exc:
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+    text = "\n".join([out.stdout or "", out.stderr or ""])
+    payload, diagnostics, error = extract_json_payload(text)
+    result: Dict[str, Any] = {
+        "available": out.returncode == 0 and isinstance(payload, dict),
+        "exitCode": out.returncode,
+        "diagnostics": diagnostics,
+    }
+    if error:
+        result["parseWarning"] = error
+    if isinstance(payload, dict):
+        result.update(
+            {
+                "enabled": payload.get("enabled"),
+                "storePath": payload.get("storePath"),
+                "storage": payload.get("storage"),
+                "sqlitePath": payload.get("sqlitePath"),
+                "jobs": payload.get("jobs"),
+                "nextWakeAtMs": payload.get("nextWakeAtMs"),
+            }
+        )
+    elif out.returncode != 0:
+        result["stderr"] = out.stderr[-1000:]
+    return result
+
+
+def collect_plugins_status() -> Dict[str, Any]:
+    try:
+        out = run_cmd(["openclaw", "plugins", "list", "--json"], timeout=20)
+    except Exception as exc:
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+    text = "\n".join([out.stdout or "", out.stderr or ""])
+    payload, diagnostics, error = extract_json_payload(text)
+    result: Dict[str, Any] = {
+        "available": out.returncode == 0 and isinstance(payload, dict),
+        "exitCode": out.returncode,
+        "diagnostics": diagnostics,
+        "stateMigrationDiagnostics": openclaw_state_migration_diagnostics(diagnostics),
+    }
+    if error:
+        result["parseWarning"] = error
+    if isinstance(payload, dict):
+        plugins = payload.get("plugins") if isinstance(payload.get("plugins"), list) else []
+        enabled = [item for item in plugins if isinstance(item, dict) and item.get("enabled") is True]
+        result.update(
+            {
+                "registry": payload.get("registry"),
+                "pluginCount": len([item for item in plugins if isinstance(item, dict)]),
+                "enabledPluginCount": len(enabled),
+                "enabledPlugins": [
+                    {
+                        "id": item.get("id"),
+                        "version": item.get("version"),
+                        "status": item.get("status"),
+                        "origin": item.get("origin"),
+                    }
+                    for item in enabled[:50]
+                ],
+            }
+        )
+    elif out.returncode != 0:
+        result["stderr"] = out.stderr[-1000:]
+    return result
+
+
 def meminfo_bytes() -> Dict[str, int]:
     data: Dict[str, int] = {}
     try:
@@ -1271,6 +1430,7 @@ def child_process_summary(root_pid: int) -> Dict[str, Any]:
 
 
 def gateway_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    version = collect_openclaw_version()
     service = systemctl_show_gateway()
     active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
     pid = int(service.get("MainPID") or 0)
@@ -1285,6 +1445,17 @@ def gateway_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     memory = cgroup_bytes("openclaw-gateway.service", "memory.current") or proc_status_bytes(pid, "VmRSS")
     swap = cgroup_bytes("openclaw-gateway.service", "memory.swap.current") or proc_status_bytes(pid, "VmSwap")
     children = child_process_summary(pid)
+    deep_status = collect_gateway_deep_status()
+    deep_runtime_running = deep_status.get("runtimeState") == "running"
+    deep_insecure_probe_only = bool(
+        deep_status.get("connectivityProbeFailed")
+        and deep_status.get("insecurePlaintextWsBlocked")
+        and active
+        and port_ok
+        and (health_ok or deep_runtime_running or deep_status.get("portInUse"))
+    )
+    if deep_insecure_probe_only:
+        deep_status["connectivityProbeInterpretation"] = "ignored_insecure_0_0_0_0_plaintext_ws_probe"
 
     if not active:
         add_finding(findings, "gateway_service_down", "critical", "gateway", "openclaw-gateway.service is not active", service=service)
@@ -1316,8 +1487,29 @@ def gateway_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
         add_finding(findings, "gateway_swap_pressure", "high", "resource", "gateway swap usage is high", swapBytes=swap)
     if children["codexAppServers"] > 4 or children["openclawChildren"] > 16:
         add_finding(findings, "gateway_child_accumulation", "high", "resource", "gateway child process accumulation detected", children=children)
+    plugin_drifts = deep_status.get("pluginVersionDrift") if isinstance(deep_status.get("pluginVersionDrift"), list) else []
+    if plugin_drifts:
+        add_finding(
+            findings,
+            "openclaw_plugin_version_drift",
+            "warning",
+            "config",
+            "OpenClaw official plugin versions differ from the Gateway version",
+            openclawVersion=version.get("version"),
+            pluginVersionDrift=plugin_drifts,
+        )
+    if deep_status.get("connectivityProbeFailed") and not deep_insecure_probe_only and not in_grace:
+        add_finding(
+            findings,
+            "gateway_deep_connectivity_probe_failed",
+            "warning",
+            "gateway",
+            "OpenClaw deep status connectivity probe failed outside the known insecure 0.0.0.0 plaintext probe case",
+            deepStatus={k: v for k, v in deep_status.items() if k != "rawSample"},
+        )
 
     return {
+        "openclawVersion": version,
         "service": service,
         "active": active,
         "pid": pid,
@@ -1330,6 +1522,7 @@ def gateway_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
         "memoryBytes": memory,
         "swapBytes": swap,
         "children": children,
+        "deepStatus": deep_status,
     }
 
 
@@ -2367,13 +2560,12 @@ def collect_cron_cli_status() -> Dict[str, Any]:
         return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
     if out.returncode != 0:
         return {"available": False, "exitCode": out.returncode, "stderr": out.stderr[-1000:]}
-    try:
-        payload = json.loads(out.stdout)
-    except Exception as exc:
-        return {"available": False, "error": f"json_parse_failed: {exc}", "stdoutSample": out.stdout[:1000]}
+    payload, diagnostics, error = extract_json_payload("\n".join([out.stdout or "", out.stderr or ""]))
+    if payload is None:
+        return {"available": False, "error": error or "json_parse_failed", "stdoutSample": out.stdout[:1000], "diagnostics": diagnostics}
     jobs = payload.get("jobs") if isinstance(payload, dict) else payload
     if not isinstance(jobs, list):
-        return {"available": False, "error": "missing_jobs_array"}
+        return {"available": False, "error": "missing_jobs_array", "diagnostics": diagnostics}
     by_job: Dict[str, Dict[str, Any]] = {}
     status_counts: Dict[str, int] = {}
     samples: Dict[str, List[Dict[str, Any]]] = {}
@@ -2398,6 +2590,15 @@ def collect_cron_cli_status() -> Dict[str, Any]:
             item["lastStatus"] = state.get("lastStatus") or state.get("lastRunStatus")
             item["consecutiveErrors"] = state.get("consecutiveErrors")
             item["lastError"] = state.get("lastError")
+            item["runningAtMs"] = state.get("runningAtMs")
+            item["lastDurationMs"] = state.get("lastDurationMs")
+        if item.get("runningAtMs") is None:
+            item["runningAtMs"] = job.get("runningAtMs")
+        execution = job.get("execution") if isinstance(job.get("execution"), dict) else {}
+        payload_cfg = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        timeout_seconds = execution.get("timeoutSeconds", payload_cfg.get("timeoutSeconds", job.get("timeoutSeconds")))
+        if timeout_seconds is not None:
+            item["timeoutSeconds"] = timeout_seconds
         by_job[job_id] = item
         if status not in {"ok", "idle", "running", "disabled"}:
             samples.setdefault(status, []).append(item)
@@ -2407,7 +2608,38 @@ def collect_cron_cli_status() -> Dict[str, Any]:
         "statusCounts": status_counts,
         "byJob": by_job,
         "nonOkSamples": {key: value[:10] for key, value in samples.items()},
+        "diagnostics": diagnostics,
+        "parseWarning": error,
     }
+
+
+def jobs_from_cron_cli_status(cli_status: Dict[str, Any]) -> Dict[str, Any]:
+    by_job = cli_status.get("byJob") if isinstance(cli_status.get("byJob"), dict) else {}
+    jobs = []
+    for job_id, item in by_job.items():
+        if not isinstance(item, dict):
+            continue
+        state = {
+            "lastRunAtMs": item.get("lastRunAtMs"),
+            "lastStatus": item.get("lastStatus"),
+            "consecutiveErrors": item.get("consecutiveErrors"),
+            "lastError": item.get("lastError"),
+            "runningAtMs": item.get("runningAtMs"),
+            "lastDurationMs": item.get("lastDurationMs"),
+        }
+        job = {
+            "id": str(item.get("jobId") or job_id),
+            "name": item.get("name") or job_id,
+            "agentId": item.get("agentId"),
+            "enabled": item.get("enabled") is not False,
+            "state": {key: value for key, value in state.items() if value is not None},
+        }
+        if item.get("runningAtMs") is not None:
+            job["runningAtMs"] = item.get("runningAtMs")
+        if item.get("timeoutSeconds") is not None:
+            job["execution"] = {"timeoutSeconds": item.get("timeoutSeconds")}
+        jobs.append(job)
+    return {"jobs": jobs}
 
 
 def find_recent_orphan_run_logs(active_ids: set[str], cutoff_ms: int) -> List[Dict[str, Any]]:
@@ -2590,7 +2822,12 @@ def build_cron_runtime_summary(data: Dict[str, Any], cli_status: Optional[Dict[s
 
 
 def cron_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    cron_storage = collect_cron_storage_status()
+    cli_status = collect_cron_cli_status()
     jobs = load_jobs()
+    legacy_jobs_missing = not bool(job_items(jobs))
+    if legacy_jobs_missing and bool(cli_status.get("available")):
+        jobs = jobs_from_cron_cli_status(cli_status)
     items = job_items(jobs)
     stale = find_stale_running_jobs(jobs)
     leases = sorted(LEASE_DIR.glob("*.json")) if LEASE_DIR.exists() else []
@@ -2610,9 +2847,11 @@ def cron_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     audit_fresh = audit_age is not None and audit_age <= CRON_AUDIT_FRESH_SECONDS
     high_audit = [f for f in audit_findings if str(f.get("severity")) == "high"] if audit_fresh else []
     gateway_log = collect_gateway_log_summary()
-    cli_status = collect_cron_cli_status()
     runtime = build_cron_runtime_summary(jobs, cli_status)
     totals = runtime.get("totals") if isinstance(runtime.get("totals"), dict) else {}
+    state_migration_diags = openclaw_state_migration_diagnostics(
+        list(cron_storage.get("diagnostics") or []) + list(cli_status.get("diagnostics") or [])
+    )
 
     if stale:
         add_finding(findings, "cron_stale_running_state", "high", "cron", "stale running cron state detected", count=len(stale), sample=stale[:10])
@@ -2725,9 +2964,21 @@ def cron_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
         add_finding(findings, "gateway_ws_instability", "high", "gateway", "gateway websocket instability markers found in logs", gatewayLog=gateway_log)
     if gateway_log["memoryCronUnavailable"] >= 10:
         add_finding(findings, "memory_core_unavailable", "high", "runtime", "memory core unavailable markers found in logs", gatewayLog=gateway_log)
+    if state_migration_diags:
+        add_finding(
+            findings,
+            "openclaw_state_migration_observations",
+            "info",
+            "config",
+            "OpenClaw CLI emitted legacy state migration diagnostics",
+            diagnostics=state_migration_diags[:20],
+        )
 
     return {
         "jobsPath": str(JOBS_PATH),
+        "legacyJobsPathExists": JOBS_PATH.exists(),
+        "legacyJobsMissingFallback": bool(legacy_jobs_missing and cli_status.get("available")),
+        "storageStatus": cron_storage,
         "jobCount": len(items),
         "staleRunning": stale,
         "leaseCount": len(leases),
@@ -3349,13 +3600,24 @@ def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def config_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    plugins_status = collect_plugins_status()
     checks = {
         "openclawJsonExists": (OPENCLAW / "openclaw.json").exists(),
         "gatewayServiceExists": Path("/etc/systemd/system/openclaw-gateway.service").exists(),
         "stabilityServiceExists": Path("/etc/systemd/system/cat-agents-stabilityd.service").exists(),
+        "plugins": plugins_status,
     }
     if not checks["openclawJsonExists"]:
         add_finding(findings, "openclaw_config_missing", "critical", "config", "openclaw.json is missing")
+    if plugins_status.get("stateMigrationDiagnostics"):
+        add_finding(
+            findings,
+            "openclaw_plugin_state_migration_observations",
+            "info",
+            "config",
+            "OpenClaw plugin CLI emitted legacy state migration diagnostics",
+            diagnostics=(plugins_status.get("stateMigrationDiagnostics") or [])[:20],
+        )
     return checks
 
 
@@ -4000,7 +4262,16 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         restart_blocked_reasons.append("restart-actuator-unavailable")
     can_restart = bool(restart_candidate and GATEWAY_RESTART_ENABLED and GATEWAY_RESTART_ACTUATOR_SUPPORTED and not restart_blocked_reasons)
 
-    can_mutate_cron = CRON_MUTATION_ENABLED and not restart_storm and not can_restart and mode not in {"gateway-unreachable", "channel-stalled", "resource-pressure", "restart-storm"}
+    cron_snapshot = snapshot.get("cron") if isinstance(snapshot.get("cron"), dict) else {}
+    cron_storage = cron_snapshot.get("storageStatus") if isinstance(cron_snapshot.get("storageStatus"), dict) else {}
+    cron_uses_sqlite_storage = str(cron_storage.get("storage") or "").lower() == "sqlite"
+    can_mutate_cron = (
+        CRON_MUTATION_ENABLED
+        and not cron_uses_sqlite_storage
+        and not restart_storm
+        and not can_restart
+        and mode not in {"gateway-unreachable", "channel-stalled", "resource-pressure", "restart-storm"}
+    )
     can_reset_session = SESSION_RESET_ENABLED and not restart_storm and mode not in {"gateway-unreachable", "resource-pressure", "restart-storm"}
     should_pause_cron = mode in {"channel-stalled", "delivery-failing", "cron-congested", "hermers-unavailable", "hermers-degraded", "resource-pressure", "cooldown", "restart-storm"}
     should_defer_control_plane_heavy = mode in {"cooldown", "cron-congested", "resource-pressure", "restart-storm"} or (
@@ -4060,6 +4331,7 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         "mode": mode,
         "severity": severity,
         "canMutateCronState": bool(can_mutate_cron),
+        "cronMutationBlockedReason": "openclaw-sqlite-cron-storage" if cron_uses_sqlite_storage else "",
         "canResetSession": bool(can_reset_session),
         "gatewayRestartEnabled": bool(GATEWAY_RESTART_ENABLED),
         "gatewayRestartActuatorSupported": bool(GATEWAY_RESTART_ACTUATOR_SUPPORTED),
@@ -4107,6 +4379,11 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
 def control_plane_backpressure(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
     active = bool(policy.get("deferControlPlaneHeavyReports"))
     jobs = load_jobs()
+    if not job_items(jobs):
+        cron = snapshot.get("cron") if isinstance(snapshot.get("cron"), dict) else {}
+        runtime = cron.get("runtime") if isinstance(cron.get("runtime"), dict) else {}
+        cli_status = runtime.get("cliStatus") if isinstance(runtime.get("cliStatus"), dict) else {}
+        jobs = jobs_from_cron_cli_status(cli_status)
     job_lookup = {job_id: job for job_id, job in job_items(jobs)}
     heavy_jobs = []
     for job_id in sorted(CONTROL_PLANE_HEAVY_JOB_IDS):
@@ -4281,13 +4558,21 @@ def update_repair_queue_status(policy: Dict[str, Any]) -> Dict[str, Any]:
 
 def cron_actuate(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
     actions: List[Dict[str, Any]] = []
+    cron = snapshot.get("cron") or {}
+    storage_status = cron.get("storageStatus") if isinstance(cron.get("storageStatus"), dict) else {}
+    sqlite_cron_storage = str(storage_status.get("storage") or "").lower() == "sqlite"
+    sqlite_legacy_mutation_blocked = (
+        sqlite_cron_storage
+        and not bool(policy.get("canMutateCronState"))
+        and policy.get("cronMutationBlockedReason") == "openclaw-sqlite-cron-storage"
+    )
     removed_tmp = cleanup_stale_tmp_files()
     if removed_tmp:
         actions.append({"action": "cleanup_stale_tmp_files", "result": "ok", "removed": removed_tmp})
     repair_queue = update_repair_queue_status(policy)
     if repair_queue.get("pendingCount") or repair_queue.get("updatedPendingEntries"):
         actions.append({"action": "update_repair_queue_status", "result": "ok", "repairQueue": repair_queue})
-    if not policy.get("canMutateCronState"):
+    if not policy.get("canMutateCronState") and not sqlite_legacy_mutation_blocked:
         if (snapshot.get("cron") or {}).get("staleRunning") or (snapshot.get("cron") or {}).get("expiredLeases"):
             actions.append(
                 {
@@ -4298,11 +4583,21 @@ def cron_actuate(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[
                 }
             )
         return actions
-    cron = snapshot.get("cron") or {}
-    data = load_jobs()
     stale = cron.get("staleRunning") or []
     gate = build_repair_gate_from_policy(policy)
-    if stale:
+    if sqlite_legacy_mutation_blocked and (stale or cron.get("expiredLeases")):
+        actions.append(
+            {
+                "action": "observe_cron_repair_candidates",
+                "result": "legacy_jobs_mutation_blocked_by_sqlite_storage",
+                "storageStatus": storage_status,
+                "staleRunningCount": len(stale),
+                "expiredLeaseCount": len(cron.get("expiredLeases") or []),
+            }
+        )
+        gate = {**gate, "status": "ready", "reason": "sqlite-storage-lease-hygiene"}
+    if stale and not sqlite_cron_storage:
+        data = load_jobs()
         snap_path = snapshot_jobs()
         changed = clear_stale_running_state(data, stale)
         if changed:

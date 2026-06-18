@@ -1093,6 +1093,19 @@ Post-adaptation validation on 2026-05-07:
 - `findingCount=2`
 - remaining findings: backup disk headroom and stale failed session entries
 
+### 2026.6.8 Upgrade Adaptation
+
+OpenClaw was upgraded from `2026.6.1` to `2026.6.8` on 2026-06-19. The official release notes emphasize richer channel delivery, safer model routing, agent/runtime recovery fixes, resilient memory/state behavior, managed plugin install/update repair, and cron status reporting the SQLite storage path instead of legacy `jobs.json`.
+
+Adapted interpretation:
+
+- `openclaw cron status --json` is the source for cron storage mode. When it reports `storage=sqlite`, stabilityd must not directly rewrite legacy `.openclaw/cron/jobs.json` to repair stale running state; it may still observe, record repair candidates, and perform separately verified lease hygiene.
+- `openclaw cron list --json` and `openclaw plugins list --json` may emit `[state-migrations]` diagnostic preambles before JSON. Stabilityd must parse the JSON payload after the preamble and preserve migration warnings as low-severity observations instead of treating them as malformed CLI output.
+- `openclaw gateway status --deep` can fail its WebSocket connectivity probe when the gateway is bound to `0.0.0.0` because OpenClaw blocks plaintext `ws://0.0.0.0` for security. If systemd is active, TCP port `23466` is listening, and `/health`/`/readyz` are healthy or the deep status reports runtime running, this is a known probe limitation, not a Gateway outage.
+- `openclaw gateway status --deep` plugin version drift is now first-class config evidence. Drift between Gateway and official plugins such as `acpx` or `codex` should produce a warning and an operator action to run `openclaw plugins update <plugin-id>` followed by a controlled Gateway restart.
+- OpenClaw memory/state migrations and QMD/SQLite resilience improvements mean old legacy state files can be archived as `.migrated`; their disappearance is not evidence of data loss when the new SQLite/plugin state is present.
+- Agent runtime fixes around restart shutdown aborts, yielded subagent pauses, de-duplicated main-session heartbeats, and session identity reduce expected false positives, but stabilityd should still judge readiness from systemd, TCP/HTTP health, runtime receipts, sessions, and delivery evidence rather than trusting a single CLI surface.
+
 ### Current Operations Entry Points
 
 Use these commands first during maintenance:
