@@ -12,4 +12,8 @@ Environment=CAT_AGENTS_STABILITYD_BRANCH=main
 Environment=CAT_AGENTS_STABILITYD_SERVICE=cat-agents-stabilityd.service
 Environment=CAT_AGENTS_STABILITYD_RUN_USER=flashcat
 Environment=CAT_AGENTS_STABILITYD_RUN_GROUP=flashcat
+Environment=HTTP_PROXY=http://127.0.0.1:7890
+Environment=HTTPS_PROXY=http://127.0.0.1:7890
+Environment=ALL_PROXY=socks5://127.0.0.1:7890
+Environment=NO_PROXY=127.0.0.1,localhost,::1
 ExecStart=/usr/local/sbin/cat-agents-stabilityd-auto-update

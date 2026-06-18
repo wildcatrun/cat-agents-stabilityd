@@ -11,6 +11,11 @@ RUN_GROUP="${CAT_AGENTS_STABILITYD_RUN_GROUP:-flashcat}"
 LOCK_PATH="${CAT_AGENTS_STABILITYD_UPDATE_LOCK:-/run/lock/cat-agents-stabilityd-auto-update.lock}"
 LATEST_PATH="${CAT_AGENTS_STABILITYD_LATEST_PATH:-/home/flashcat/.openclaw/stability/latest.json}"
 
+export HTTP_PROXY="${HTTP_PROXY:-http://127.0.0.1:7890}"
+export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:7890}"
+export ALL_PROXY="${ALL_PROXY:-socks5://127.0.0.1:7890}"
+export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost,::1}"
+
 install -d -o "${RUN_USER}" -g "${RUN_GROUP}" -m 0755 "${WORK_ROOT}/logs" "${WORK_ROOT}/worktrees"
 stamp="$(date +%Y%m%dT%H%M%S%z)"
 log_path="${WORK_ROOT}/logs/update-${stamp}.log"
@@ -26,7 +31,12 @@ if ! flock -n 9; then
 fi
 
 as_run_user() {
-  runuser -u "${RUN_USER}" -- "$@"
+  runuser -u "${RUN_USER}" -- env \
+    "HTTP_PROXY=${HTTP_PROXY}" \
+    "HTTPS_PROXY=${HTTPS_PROXY}" \
+    "ALL_PROXY=${ALL_PROXY}" \
+    "NO_PROXY=${NO_PROXY}" \
+    "$@"
 }
 
 wait_service_ready() {
