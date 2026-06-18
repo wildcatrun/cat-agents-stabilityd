@@ -1,0 +1,15 @@
+[Unit]
+Description=Fast-forward Cat Agents Stability checkout after validation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/flashcat/cat-agents-stabilityd.git-checkout
+Environment=CAT_AGENTS_STABILITYD_CHECKOUT=/home/flashcat/cat-agents-stabilityd.git-checkout
+Environment=CAT_AGENTS_STABILITYD_REMOTE=origin
+Environment=CAT_AGENTS_STABILITYD_BRANCH=main
+Environment=CAT_AGENTS_STABILITYD_SERVICE=cat-agents-stabilityd.service
+Environment=CAT_AGENTS_STABILITYD_RUN_USER=flashcat
+Environment=CAT_AGENTS_STABILITYD_RUN_GROUP=flashcat
+ExecStart=/usr/local/sbin/cat-agents-stabilityd-auto-update

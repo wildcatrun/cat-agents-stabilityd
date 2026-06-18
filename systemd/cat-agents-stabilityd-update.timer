@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily validated Cat Agents Stability checkout update
+
+[Timer]
+OnCalendar=*-*-* 06:18:00
+RandomizedDelaySec=20m
+Persistent=true
+Unit=cat-agents-stabilityd-update.service
+
+[Install]
+WantedBy=timers.target
