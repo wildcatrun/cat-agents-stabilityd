@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any
 
 
-HOME = Path(os.environ.get("CAT_HEARTBEAT_HOME", str(Path.home())))
+DEFAULT_HOME = Path("/home/flashcat") if Path("/home/flashcat").exists() else Path.home()
+HOME = Path(os.environ.get("CAT_HEARTBEAT_HOME", str(DEFAULT_HOME)))
 OPENCLAW = HOME / ".openclaw"
 HERMES_HOME = HOME / ".hermes" / "profiles"
 DEFAULT_STATE_DIR = OPENCLAW / "stability" / "heartbeat-probe"
