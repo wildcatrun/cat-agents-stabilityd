@@ -19,8 +19,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         env = dict(os.environ)
         env["CAT_HEARTBEAT_HOME"] = tmp
-        env["PATH"] = "/usr/bin:/bin"
-        proc = run_probe(["--agent", "cat_voice", "--runtime", "openclaw"], env)
+        proc = run_probe(["--agent", "__missing_agent__", "--runtime", "openclaw", "--job-id", "__missing_job__"], env)
         assert proc.returncode == 2, proc
         assert "HEARTBEAT_WARN" in proc.stdout, proc.stdout
         assert "errors=1" in proc.stdout, proc.stdout
