@@ -151,7 +151,7 @@ def summarize_openclaw(args: argparse.Namespace) -> dict[str, Any]:
     if result["job"]["last_status"] not in (None, "ok"):
         result["warnings"].append({"kind": "last_status_not_ok", "last_status": result["job"]["last_status"]})
     if int(state.get("consecutiveErrors") or 0) > args.max_consecutive_errors:
-        result["errors"].append({"kind": "consecutive_errors", "count": state.get("consecutiveErrors")})
+        result["warnings"].append({"kind": "consecutive_errors", "count": state.get("consecutiveErrors")})
     result["observations"]["heartbeat_candidates"] = len(candidates)
     result["ok"] = not result["errors"]
     return result
