@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 const PLUGIN_ID = "cat-agents-stability";
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
 
-const READ_ACTIONS = new Set(["status", "snapshot", "policy", "lanes", "profile-modes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook"]);
-const GUARDED_ACTIONS = new Set(["doctor", "repair", "once"]);
+const READ_ACTIONS = new Set(["status", "snapshot", "policy", "lanes", "profile-modes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook", "auth-readiness"]);
+const GUARDED_ACTIONS = new Set(["doctor", "repair", "once", "auth-maintenance", "auth-mirror"]);
 
 function jsonText(value) {
   return {
@@ -115,6 +115,20 @@ function stabilityArgs(api, params = {}) {
     const dryRun = params.dryRun ?? params.dry_run ?? !allowMutating;
     if (boolConfig(dryRun, true)) args.push("--dry-run");
   }
+  if (action === "auth-readiness" && boolConfig(params.fresh, false)) args.push("--fresh");
+  if (action === "auth-maintenance") {
+    if (boolConfig(params.fresh, false)) args.push("--fresh");
+    const actionId = params.actionId ?? params.action_id;
+    if (actionId !== undefined && String(actionId).trim()) args.push("--action-id", String(actionId).trim());
+    if (boolConfig(params.dryRun ?? params.dry_run, false)) args.push("--dry-run");
+    if (boolConfig(params.execute, false)) args.push("--execute");
+    const allowAuthMirror = boolConfig(pluginConfig(api).allowAuthMirror, false);
+    if (allowAuthMirror && boolConfig(params.allowMirror ?? params.allow_mirror, false)) args.push("--allow-mirror");
+  }
+  if (action === "auth-mirror") {
+    const allowAuthMirror = boolConfig(pluginConfig(api).allowAuthMirror, false);
+    if (allowAuthMirror && boolConfig(params.apply, false)) args.push("--apply");
+  }
   return args;
 }
 
@@ -124,13 +138,20 @@ const toolParameters = {
   properties: {
     action: {
       type: "string",
-      enum: ["status", "snapshot", "policy", "lanes", "profile-modes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook", "doctor", "repair", "once"]
+      enum: ["status", "snapshot", "policy", "lanes", "profile-modes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook", "auth-readiness", "auth-maintenance", "auth-mirror", "doctor", "repair", "once"]
     },
     limit: { type: "number" },
     noAction: { type: "boolean" },
     no_action: { type: "boolean" },
     dryRun: { type: "boolean" },
-    dry_run: { type: "boolean" }
+    dry_run: { type: "boolean" },
+    fresh: { type: "boolean" },
+    execute: { type: "boolean" },
+    actionId: { type: "string" },
+    action_id: { type: "string" },
+    allowMirror: { type: "boolean" },
+    allow_mirror: { type: "boolean" },
+    apply: { type: "boolean" }
   }
 };
 
@@ -177,6 +198,7 @@ export default definePluginEntry({
     properties: {
       stabilityBin: { type: "string" },
       allowMutatingActions: { type: "boolean" },
+      allowAuthMirror: { type: "boolean" },
       toolTimeoutMs: { type: "number" }
     }
   },

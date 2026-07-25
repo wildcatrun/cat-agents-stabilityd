@@ -231,6 +231,7 @@ Collectors:
 - `SessionCollector`
 - `ChannelCollector`
 - `HermersCollector`
+- `AuthCollector`
 - `ResourceCollector`
 - `ConfigCollector`
 
@@ -241,6 +242,7 @@ Analyzers:
 - `SessionAnalyzer`
 - `ChannelAnalyzer`
 - `HermersAnalyzer`
+- `AuthAnalyzer`
 - `ResourceAnalyzer`
 - `RuntimeAnalyzer`
 
@@ -258,6 +260,18 @@ Actuators:
 - `SessionActuator`
 - `HermersActuator`
 - `ResourceActuator`
+
+OAuth/auth readiness boundary:
+
+- `AuthCollector` covers Codex CLI, OpenClaw OAuth auth profiles, and Hermers profile `auth.json` files as stability-readiness inputs.
+- OpenClaw OAuth probing defaults to agent `main` to keep the daemon lightweight; additional OpenClaw agent ids must be explicitly listed with `CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_IDS`, and daemon cost is bounded by `CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_LIMIT` plus `CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_TIMEOUT_SECONDS`.
+- It records only redacted metadata: file existence, mode, mtime, active provider, token counts, decoded JWT issuer/audience/issued-at/expiry, and seconds remaining. It must not record access tokens, refresh tokens, API keys, or secrets.
+- Expired access tokens with a refresh token are readiness warnings: they prove the mac-codex mirror path must be refreshed, not that development-server stabilityd should become a refresh-token owner. Missing refresh tokens, missing access tokens, or expired OpenClaw OAuth profiles are stronger repair/Human-Gate signals.
+- `cat-agents-stabilityd` may produce findings, runbook evidence, mirror/reauth repair candidates, and an explicit mac-codex mirror execution path. It must not silently run device-code login, execute OpenAI/Codex refresh, become a refresh-token owner, or print authorization material.
+- Cat Brain `main` daily-report and 8H report must consume `auth-readiness` as part of stability governance for OpenClaw, Hermers/Hermes, and development-server Codex CLI.
+- Operators can use `cat-agents-stability auth-readiness --fresh` for immediate post-repair confirmation; normal daemon reports should consume the latest persisted evidence.
+- `auth-maintenance` is the mirror/reauth planning surface. It can recommend Codex CLI mirror-from-mac-codex, OpenClaw reauth/sync, Hermers token-copy cleanup, or Human Gate escalation. Default execution records blocked decisions; `--execute --allow-mirror` may run the governed mac-codex mirror script for mirrorable actions. `auth-mirror` is the direct mac-codex broker command for operator-run dry-run/apply.
+- OpenAI/Codex token refresh remains owned by `mac-codex`; development-server Codex CLI, Hermers, and OpenClaw consume mirrored access/id tokens plus the non-secret refresh placeholder. `--allow-mirror` validates the local mac-codex access token and `id_token` TTL before any remote write and must keep token values redacted in stdout, stderr, action records, and artifacts.
 
 Hermers runtime governance boundary:
 

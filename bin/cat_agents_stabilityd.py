@@ -9,6 +9,7 @@ It intentionally uses only the Python standard library.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import datetime as dt
 import errno
@@ -32,10 +33,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-HOME = Path(os.environ.get("OPENCLAW_HOME_DIR", "/home/flashcat"))
+HOME = Path(os.environ.get("OPENCLAW_HOME_DIR", str(Path.home())))
 OPENCLAW = HOME / ".openclaw"
 HERMES_HOME = HOME / ".hermes"
 HERMES_CLI = os.environ.get("CAT_AGENTS_STABILITY_HERMES_CLI", str(HOME / ".local/bin/hermes"))
+CODEX_HOME = Path(os.environ.get("CAT_AGENTS_STABILITY_CODEX_HOME", str(HOME / ".codex")))
+CODEX_AUTH_PATH = Path(os.environ.get("CAT_AGENTS_STABILITY_CODEX_AUTH_PATH", str(CODEX_HOME / "auth.json")))
 
 
 def default_workflow_root() -> Path:
@@ -82,6 +85,8 @@ RESOURCE_INCIDENT_LATEST = RESOURCE_INCIDENT_DIR / "gateway-resource-pressure-la
 CONTROL_PLANE_BACKPRESSURE_PATH = STABILITY_DIR / "control-plane-backpressure.json"
 LANE_POLICY_PATH = STABILITY_DIR / "lane-policy.json"
 HERMERS_PROFILE_MODES_PATH = STABILITY_DIR / "hermers-profile-modes.json"
+AUTH_MAINTENANCE_PLAN_PATH = STABILITY_DIR / "auth-maintenance-plan-latest.json"
+AUTH_REFRESH_BROKER_LOCK_PATH = STABILITY_DIR / "auth-refresh-broker.lock"
 WORKFLOW_STABILITY_EVIDENCE_JSON = WORKFLOW_GOVERNANCE_LOG_DIR / "stability-evidence-latest.json"
 WORKFLOW_STABILITY_EVIDENCE_MD = WORKFLOW_GOVERNANCE_LOG_DIR / "stability-evidence-latest.md"
 DESIRED_STATE_PATH = Path(
@@ -191,6 +196,36 @@ HERMERS_PROFILE_PROTECTED_IDS = {
     ).split(",")
     if item.strip()
 }
+AUTH_WARN_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_WARN_SECONDS", str(72 * 3600)))
+AUTH_CRITICAL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_CRITICAL_SECONDS", str(24 * 3600)))
+AUTH_OPENCLAW_PROBE_TTL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_SECONDS", str(3600)))
+AUTH_OPENCLAW_PROBE_TIMEOUT_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_TIMEOUT_SECONDS", "8"))
+AUTH_OPENCLAW_AGENT_LIMIT = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_LIMIT", "5"))
+AUTH_OPENCLAW_AGENT_IDS = [
+    item.strip()
+    for item in os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_IDS", "").split(",")
+    if item.strip()
+]
+AUTH_OPENAI_PROVIDER_IDS = {
+    item.strip()
+    for item in os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENAI_PROVIDERS", "openai-codex,openai").split(",")
+    if item.strip()
+}
+AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS = {
+    item.strip()
+    for item in os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_REQUIRED_PROVIDERS", "openai-codex").split(",")
+    if item.strip()
+}
+AUTH_REFRESH_BROKER_ENABLED = False
+AUTH_MIRROR_SCRIPT = Path(
+    os.environ.get("CAT_AGENTS_STABILITY_AUTH_MIRROR_SCRIPT", str(PACKAGE_ROOT / "scripts" / "mac_codex_oauth_mirror.py"))
+)
+AUTH_MIRROR_TIMEOUT_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_MIRROR_TIMEOUT_SECONDS", "180"))
+AUTH_MIRROR_MIN_TTL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_MIRROR_MIN_TTL_SECONDS", "3600"))
+AUTH_MIRROR_ACTION_KINDS = {"mirror-from-mac-codex", "reauth-or-sync", "sync-or-refresh"}
+AUTH_EVIDENCE_FRESH_SECONDS = int(
+    os.environ.get("CAT_AGENTS_STABILITY_AUTH_EVIDENCE_FRESH_SECONDS", str(max(POLICY_TTL_SECONDS, AUTH_OPENCLAW_PROBE_TTL_SECONDS)))
+)
 
 TMP_FILE_MAX_AGE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_TMP_MAX_AGE_SECONDS", "3600"))
 ORPHAN_RUN_LOG_MIN_AGE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_ORPHAN_RUN_LOG_MIN_AGE_SECONDS", "3600"))
@@ -406,6 +441,262 @@ def parse_iso_epoch(value: Any) -> Optional[int]:
         except Exception:
             continue
     return None
+
+
+def iso_from_epoch(value: Optional[int]) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(int(value), dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return None
+
+
+def decode_jwt_payload(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, str) or value.count(".") < 2:
+        return None
+    try:
+        part = value.split(".", 2)[1]
+        part += "=" * ((4 - len(part) % 4) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(part.encode("utf-8")))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def token_kind_from_path(path: str) -> str:
+    lowered = path.lower()
+    if "refresh_token" in lowered:
+        return "refresh"
+    if "access_token" in lowered:
+        return "access"
+    if "id_token" in lowered:
+        return "id"
+    if "token" in lowered:
+        return "token"
+    if "api_key" in lowered or lowered.endswith(".key") or "secret" in lowered:
+        return "secret"
+    return "other"
+
+
+def iter_token_fields(payload: Any, prefix: str = "") -> Iterable[Tuple[str, str, Any]]:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            yield from iter_token_fields(value, child_prefix)
+        return
+    if isinstance(payload, list):
+        for index, value in enumerate(payload):
+            child_prefix = f"{prefix}[{index}]" if prefix else f"[{index}]"
+            yield from iter_token_fields(value, child_prefix)
+        return
+    kind = token_kind_from_path(prefix)
+    if kind in {"access", "refresh", "id", "token", "secret"}:
+        yield prefix, kind, payload
+
+
+def summarize_auth_json(path: Path) -> Dict[str, Any]:
+    file_age = file_age_seconds(path)
+    summary: Dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+        "ageSeconds": file_age,
+        "mode": None,
+        "mtimeEpoch": None,
+        "mtime": None,
+        "topKeys": [],
+        "authMode": None,
+        "activeProvider": None,
+        "providerKeys": [],
+        "credentialPoolKeys": [],
+        "accessTokenCount": 0,
+        "refreshTokenCount": 0,
+        "idTokenCount": 0,
+        "secretFieldCount": 0,
+        "jwtCount": 0,
+        "accessTokens": [],
+        "freshestAccessTokenExpiresEpoch": None,
+        "freshestAccessTokenExpiresAt": None,
+        "freshestAccessTokenSecondsRemaining": None,
+        "oldestAccessTokenExpiresEpoch": None,
+        "oldestAccessTokenExpiresAt": None,
+        "expiredAccessTokenCount": 0,
+        "hasAccessToken": False,
+        "hasRefreshToken": False,
+    }
+    try:
+        stat = path.stat()
+        summary["mode"] = oct(stat.st_mode & 0o777)
+        summary["mtimeEpoch"] = int(stat.st_mtime)
+        summary["mtime"] = iso_from_epoch(int(stat.st_mtime))
+    except Exception:
+        pass
+    payload = load_json(path, None)
+    if not isinstance(payload, dict):
+        if path.exists():
+            summary["error"] = "json-unreadable"
+        return summary
+
+    summary["topKeys"] = sorted(str(key) for key in payload.keys())[:50]
+    summary["authMode"] = payload.get("auth_mode") or payload.get("authMode")
+    summary["activeProvider"] = payload.get("active_provider") or payload.get("activeProvider") or payload.get("active")
+    providers = payload.get("providers") if isinstance(payload.get("providers"), dict) else {}
+    credential_pool = payload.get("credential_pool") if isinstance(payload.get("credential_pool"), dict) else {}
+    summary["providerKeys"] = sorted(str(key) for key in providers.keys())[:50]
+    summary["credentialPoolKeys"] = sorted(str(key) for key in credential_pool.keys())[:50]
+
+    access_expiries: List[int] = []
+    access_tokens: List[Dict[str, Any]] = []
+    current_epoch = epoch()
+    for token_path, kind, value in iter_token_fields(payload):
+        if kind == "access":
+            summary["accessTokenCount"] += 1
+            summary["hasAccessToken"] = True
+        elif kind == "refresh":
+            summary["refreshTokenCount"] += 1
+            summary["hasRefreshToken"] = True
+        elif kind == "id":
+            summary["idTokenCount"] += 1
+        elif kind == "secret":
+            summary["secretFieldCount"] += 1
+        jwt_payload = decode_jwt_payload(value)
+        if jwt_payload:
+            summary["jwtCount"] += 1
+            exp_epoch = parse_iso_epoch(jwt_payload.get("exp"))
+            iat_epoch = parse_iso_epoch(jwt_payload.get("iat"))
+            if kind == "access" and exp_epoch is not None:
+                access_expiries.append(int(exp_epoch))
+                access_tokens.append(
+                    {
+                        "path": token_path,
+                        "expiresEpoch": int(exp_epoch),
+                        "expiresAt": iso_from_epoch(int(exp_epoch)),
+                        "secondsRemaining": int(exp_epoch) - current_epoch,
+                        "issuedAt": iso_from_epoch(iat_epoch),
+                        "issuer": jwt_payload.get("iss"),
+                        "audience": jwt_payload.get("aud"),
+                    }
+                )
+
+    if access_expiries:
+        freshest = max(access_expiries)
+        oldest = min(access_expiries)
+        summary["freshestAccessTokenExpiresEpoch"] = freshest
+        summary["freshestAccessTokenExpiresAt"] = iso_from_epoch(freshest)
+        summary["freshestAccessTokenSecondsRemaining"] = freshest - current_epoch
+        summary["oldestAccessTokenExpiresEpoch"] = oldest
+        summary["oldestAccessTokenExpiresAt"] = iso_from_epoch(oldest)
+        summary["expiredAccessTokenCount"] = sum(1 for item in access_expiries if item <= current_epoch)
+        summary["accessTokenExpirySpreadSeconds"] = freshest - oldest
+    summary["accessTokens"] = sorted(access_tokens, key=lambda item: int(item.get("expiresEpoch") or 0), reverse=True)[:10]
+    return summary
+
+
+def auth_token_status(summary: Dict[str, Any]) -> str:
+    if not bool(summary.get("exists")):
+        return "missing"
+    if not bool(summary.get("hasAccessToken")):
+        return "access-missing"
+    if not bool(summary.get("hasRefreshToken")):
+        return "refresh-missing"
+    remaining = summary.get("freshestAccessTokenSecondsRemaining")
+    if remaining is None:
+        return "access-expiry-unknown"
+    remaining_int = int(remaining)
+    if remaining_int <= 0:
+        return "access-expired"
+    if remaining_int <= AUTH_CRITICAL_SECONDS:
+        return "access-critical"
+    if remaining_int <= AUTH_WARN_SECONDS:
+        return "access-warning"
+    return "ok"
+
+
+def parse_openclaw_auth_list(text: str, agent_id: str) -> Dict[str, Any]:
+    profiles: List[Dict[str, Any]] = []
+    unparsed_profile_lines: List[str] = []
+    current_epoch = epoch()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("- "):
+            continue
+        if "oauth" not in line.lower() and "expires" not in line.lower():
+            continue
+        match = re.match(r"^-\s+([^\s]+)(?:\s+\([^)]*\))?\s+\[([^]]+)\]", line)
+        if not match:
+            unparsed_profile_lines.append(line[:240])
+            continue
+        raw_profile_id = match.group(1)
+        meta = match.group(2)
+        provider = meta.split("/", 1)[0].split(";", 1)[0].strip()
+        profile_kind = raw_profile_id.split(":", 1)[0]
+        expires_match = re.search(r"\bexpires(?:\s+at)?\s*[:=]?\s+([^;\]]+)", meta, re.IGNORECASE)
+        cooldown_match = re.search(r"\bcooldown\s+until\s*[:=]?\s+([^;\]]+)", meta, re.IGNORECASE)
+        expires_epoch = parse_iso_epoch(expires_match.group(1).strip()) if expires_match else None
+        cooldown_epoch = parse_iso_epoch(cooldown_match.group(1).strip()) if cooldown_match else None
+        profiles.append(
+            {
+                "agentId": agent_id,
+                "profileKind": profile_kind,
+                "provider": provider or profile_kind,
+                "profileLabel": f"{profile_kind}:[redacted]" if ":" in raw_profile_id else raw_profile_id,
+                "authKind": meta.split(";", 1)[0].strip(),
+                "expiresEpoch": expires_epoch,
+                "expiresAt": iso_from_epoch(expires_epoch),
+                "secondsRemaining": int(expires_epoch) - current_epoch if expires_epoch is not None else None,
+                "cooldownUntilEpoch": cooldown_epoch,
+                "cooldownUntil": iso_from_epoch(cooldown_epoch),
+                "expiryParseOk": expires_epoch is not None,
+            }
+        )
+    return {
+        "agentId": agent_id,
+        "profiles": profiles,
+        "profileCount": len(profiles),
+        "unparsedProfileLines": unparsed_profile_lines[:10],
+        "unparsedProfileLineCount": len(unparsed_profile_lines),
+    }
+
+
+def cached_openclaw_auth_probe(conn: sqlite3.Connection, agent_id: str) -> Dict[str, Any]:
+    cache_key = f"auth:openclaw:{agent_id}"
+    cached = db_get(conn, cache_key, {}) or {}
+    cached_epoch = int(cached.get("checkedAtEpoch") or 0) if isinstance(cached, dict) else 0
+    if cached_epoch and epoch() - cached_epoch < AUTH_OPENCLAW_PROBE_TTL_SECONDS:
+        result = dict(cached)
+        result["cached"] = True
+        return result
+    try:
+        out = run_cmd(["openclaw", "models", "auth", "list", "--agent", agent_id], timeout=AUTH_OPENCLAW_PROBE_TIMEOUT_SECONDS)
+        text = "\n".join([out.stdout or "", out.stderr or ""])
+        parsed = parse_openclaw_auth_list(text, agent_id)
+        result = {
+            "agentId": agent_id,
+            "checkedAt": ts(),
+            "checkedAtEpoch": epoch(),
+            "cached": False,
+            "available": out.returncode == 0,
+            "exitCode": out.returncode,
+            "profileCount": parsed.get("profileCount"),
+            "profiles": parsed.get("profiles") or [],
+            "unparsedProfileLineCount": parsed.get("unparsedProfileLineCount") or 0,
+            "unparsedProfileLines": parsed.get("unparsedProfileLines") or [],
+        }
+        if out.returncode != 0:
+            result["error"] = (out.stderr or out.stdout or "")[-1000:]
+    except Exception as exc:
+        result = {
+            "agentId": agent_id,
+            "checkedAt": ts(),
+            "checkedAtEpoch": epoch(),
+            "cached": False,
+            "available": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "profileCount": 0,
+            "profiles": [],
+        }
+    db_set(conn, cache_key, result)
+    return result
 
 
 def run_cmd(cmd: List[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
@@ -668,6 +959,15 @@ def init_db() -> sqlite3.Connection:
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS actions (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_epoch INTEGER NOT NULL, action_id TEXT, action TEXT, result TEXT, payload TEXT NOT NULL)"
+    )
+    conn.commit()
+    return conn
+
+
+def init_memory_kv_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)"
     )
     conn.commit()
     return conn
@@ -1172,6 +1472,8 @@ def build_workflow_stability_evidence(snapshot: Optional[Dict[str, Any]] = None)
     desired = latest.get("desiredState") if isinstance(latest.get("desiredState"), dict) else desired_state_drift()
     findings = latest.get("findings") if isinstance(latest.get("findings"), list) else []
     actions = latest.get("actions") if isinstance(latest.get("actions"), list) else []
+    auth = latest.get("auth") if isinstance(latest.get("auth"), dict) else {}
+    auth_maintenance = latest.get("authMaintenance") if isinstance(latest.get("authMaintenance"), dict) else load_json(AUTH_MAINTENANCE_PLAN_PATH, {}) or {}
     resource_human_gate = load_json(RESOURCE_HUMAN_GATE_DIR / "gateway-resource-pressure-latest.json", {}) or {}
     current_keys = {str(item.get("key")) for item in findings if isinstance(item, dict)}
     resource_gate_active = bool(resource_pressure_active(current_keys))
@@ -1219,9 +1521,31 @@ def build_workflow_stability_evidence(snapshot: Optional[Dict[str, Any]] = None)
             "markdownPath": str(RESOURCE_HUMAN_GATE_DIR / "gateway-resource-pressure-latest.md"),
             "incidentPath": str(RESOURCE_INCIDENT_LATEST),
         },
+        "authReadiness": {
+            "checkedAt": auth.get("checkedAt"),
+            "warnSeconds": auth.get("warnSeconds"),
+            "criticalSeconds": auth.get("criticalSeconds"),
+            "codexCli": {
+                "exists": ((auth.get("codexCli") or {}).get("exists") if isinstance(auth.get("codexCli"), dict) else None),
+                "freshestAccessTokenExpiresAt": ((auth.get("codexCli") or {}).get("freshestAccessTokenExpiresAt") if isinstance(auth.get("codexCli"), dict) else None),
+                "freshestAccessTokenSecondsRemaining": ((auth.get("codexCli") or {}).get("freshestAccessTokenSecondsRemaining") if isinstance(auth.get("codexCli"), dict) else None),
+                "hasRefreshToken": ((auth.get("codexCli") or {}).get("hasRefreshToken") if isinstance(auth.get("codexCli"), dict) else None),
+            },
+            "hermersProfileCount": (((auth.get("hermers") or {}).get("profileCount")) if isinstance(auth.get("hermers"), dict) else None),
+            "openclawAgentCount": (((auth.get("openclaw") or {}).get("agentCount")) if isinstance(auth.get("openclaw"), dict) else None),
+        },
+        "authMaintenance": {
+            "generatedAt": auth_maintenance.get("generatedAt"),
+            "status": auth_maintenance.get("status"),
+            "severity": auth_maintenance.get("severity"),
+            "refreshBrokerEnabled": bool(auth_maintenance.get("refreshBrokerEnabled")),
+            "actionCount": auth_maintenance.get("actionCount"),
+            "humanGateActionCount": auth_maintenance.get("humanGateActionCount"),
+            "blockedActionCount": auth_maintenance.get("blockedActionCount"),
+        },
         "catBrainConsumption": {
             "agentId": "main",
-            "heartbeatUse": "Read this evidence before 30min semantic governance checks and before deciding whether to ask cat_claw for Human Gate submission.",
+            "heartbeatUse": "Read this evidence before 30min semantic governance checks, daily-report, and 8H report; OAuth/auth readiness is part of stability governance.",
             "doNotUseFor": "This evidence does not authorize Gateway restart, runtime migration, trading actions, or Human Gate completion by itself.",
         },
     }
@@ -1234,6 +1558,8 @@ def render_workflow_stability_evidence_md(evidence: Dict[str, Any]) -> str:
     findings = evidence.get("topFindings") or []
     observations = desired.get("observations") or []
     resource_gate = evidence.get("resourceHumanGate") if isinstance(evidence.get("resourceHumanGate"), dict) else {}
+    auth_readiness = evidence.get("authReadiness") if isinstance(evidence.get("authReadiness"), dict) else {}
+    auth_maintenance = evidence.get("authMaintenance") if isinstance(evidence.get("authMaintenance"), dict) else {}
     lines = [
         "# Cat Agents Stability Evidence",
         "",
@@ -1258,6 +1584,28 @@ def render_workflow_stability_evidence_md(evidence: Dict[str, Any]) -> str:
     if observations:
         for item in observations[:20]:
             lines.append(f"- {item.get('key')}: {item.get('message')}")
+    else:
+        lines.append("- none")
+    lines.extend(["", "## OAuth / Auth Readiness"])
+    if auth_readiness:
+        codex_cli = auth_readiness.get("codexCli") if isinstance(auth_readiness.get("codexCli"), dict) else {}
+        lines.append(f"- checkedAt: {auth_readiness.get('checkedAt')}")
+        lines.append(f"- codexCli.exists: {codex_cli.get('exists')}")
+        lines.append(f"- codexCli.hasRefreshToken: {codex_cli.get('hasRefreshToken')}")
+        lines.append(f"- codexCli.freshestAccessTokenExpiresAt: {codex_cli.get('freshestAccessTokenExpiresAt')}")
+        lines.append(f"- hermersProfileCount: {auth_readiness.get('hermersProfileCount')}")
+        lines.append(f"- openclawAgentCount: {auth_readiness.get('openclawAgentCount')}")
+    else:
+        lines.append("- none")
+    lines.extend(["", "## OAuth / Auth Maintenance"])
+    if auth_maintenance:
+        lines.append(f"- generatedAt: {auth_maintenance.get('generatedAt')}")
+        lines.append(f"- status: {auth_maintenance.get('status')}")
+        lines.append(f"- severity: {auth_maintenance.get('severity')}")
+        lines.append(f"- refreshBrokerEnabled: {auth_maintenance.get('refreshBrokerEnabled')}")
+        lines.append(f"- actionCount: {auth_maintenance.get('actionCount')}")
+        lines.append(f"- humanGateActionCount: {auth_maintenance.get('humanGateActionCount')}")
+        lines.append(f"- blockedActionCount: {auth_maintenance.get('blockedActionCount')}")
     else:
         lines.append("- none")
     lines.extend(["", "## Resource Human Gate"])
@@ -2318,6 +2666,720 @@ def active_openclaw_agent_ids_from_registry(registry: Dict[str, Any]) -> List[st
         if agent_id:
             agent_ids.add(agent_id)
     return sorted(agent_ids)
+
+
+def default_hermers_auth_profiles(hermers_profiles: Optional[Iterable[str]] = None) -> List[str]:
+    if hermers_profiles is not None:
+        return sorted({str(item) for item in hermers_profiles if str(item)})
+    profile_dir = HERMES_HOME / "profiles"
+    if not profile_dir.exists():
+        return []
+    return sorted(path.name for path in profile_dir.iterdir() if (path / "auth.json").is_file())
+
+
+def add_auth_summary_findings(
+    findings: List[Dict[str, Any]],
+    *,
+    prefix: str,
+    component: str,
+    label: str,
+    summary: Dict[str, Any],
+    require_when_active_provider: bool = True,
+) -> None:
+    status = auth_token_status(summary)
+    active_provider = str(summary.get("activeProvider") or "")
+    openai_active = active_provider in AUTH_OPENAI_PROVIDER_IDS if active_provider else True
+    if require_when_active_provider and active_provider and not openai_active:
+        return
+
+    evidence = {
+        "label": label,
+        "path": summary.get("path"),
+        "mode": summary.get("mode"),
+        "mtime": summary.get("mtime"),
+        "activeProvider": summary.get("activeProvider"),
+        "providerKeys": summary.get("providerKeys"),
+        "credentialPoolKeys": summary.get("credentialPoolKeys"),
+        "accessTokenCount": summary.get("accessTokenCount"),
+        "refreshTokenCount": summary.get("refreshTokenCount"),
+        "freshestAccessTokenExpiresAt": summary.get("freshestAccessTokenExpiresAt"),
+        "freshestAccessTokenSecondsRemaining": summary.get("freshestAccessTokenSecondsRemaining"),
+        "expiredAccessTokenCount": summary.get("expiredAccessTokenCount"),
+    }
+    if status == "missing":
+        add_finding(findings, f"{prefix}_oauth_missing", "warning", component, f"{label} OAuth auth file is missing", **evidence)
+    elif status == "access-missing":
+        add_finding(findings, f"{prefix}_oauth_access_missing", "high", component, f"{label} has no access token", **evidence)
+    elif status == "refresh-missing":
+        add_finding(findings, f"{prefix}_oauth_refresh_missing", "high", component, f"{label} has no refresh token for durable OAuth", **evidence)
+    elif status == "access-expired":
+        add_finding(findings, f"{prefix}_oauth_access_expired", "warning", component, f"{label} access token is expired; refresh transaction must be healthy", **evidence)
+    elif status == "access-critical":
+        add_finding(findings, f"{prefix}_oauth_expires_critical", "warning", component, f"{label} access token expires within {AUTH_CRITICAL_SECONDS}s", **evidence)
+    elif status == "access-warning":
+        add_finding(findings, f"{prefix}_oauth_expires_soon", "info", component, f"{label} access token expires within {AUTH_WARN_SECONDS}s", **evidence)
+    elif status == "access-expiry-unknown":
+        add_finding(findings, f"{prefix}_oauth_expiry_unknown", "warning", component, f"{label} access token expiry could not be decoded", **evidence)
+
+
+def openclaw_oauth_provider_groups(profiles: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    groups: Dict[str, Dict[str, Any]] = {}
+    for profile in profiles or []:
+        if not isinstance(profile, dict):
+            continue
+        provider = str(profile.get("provider") or profile.get("profileKind") or "")
+        if provider not in AUTH_OPENAI_PROVIDER_IDS:
+            continue
+        group = groups.setdefault(provider, {"provider": provider, "profiles": []})
+        group["profiles"].append(profile)
+
+    for provider, group in groups.items():
+        parsed = [item for item in group["profiles"] if item.get("secondsRemaining") is not None]
+        parsed.sort(key=lambda item: int(item.get("secondsRemaining") or 0), reverse=True)
+        freshest = parsed[0] if parsed else None
+        stale_expired = [
+            item for item in parsed[1:]
+            if int(item.get("secondsRemaining") or 0) <= 0
+        ]
+        unparseable = [
+            item for item in group["profiles"]
+            if not bool(item.get("expiryParseOk", True)) or item.get("secondsRemaining") is None
+        ]
+        group["freshest"] = freshest
+        group["staleExpiredProfiles"] = stale_expired
+        group["unparseableProfiles"] = unparseable
+        group["profileCount"] = len(group["profiles"])
+    return groups
+
+
+def auth_finding_is_pressure(key: str) -> bool:
+    if not key.startswith(("codex_cli_oauth_", "openclaw_oauth_", "hermers_oauth_", "hermers_cat")):
+        return False
+    if key in {"openclaw_oauth_profile_expires_soon", "openclaw_oauth_stale_profile_copies"}:
+        return False
+    return not key.endswith("_expires_soon")
+
+
+def auth_collect(
+    conn: sqlite3.Connection,
+    findings: List[Dict[str, Any]],
+    hermers_profiles: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    codex_cli = summarize_auth_json(CODEX_AUTH_PATH)
+    add_auth_summary_findings(
+        findings,
+        prefix="codex_cli",
+        component="auth",
+        label="Codex CLI",
+        summary=codex_cli,
+        require_when_active_provider=False,
+    )
+
+    profile_names = default_hermers_auth_profiles(hermers_profiles)
+    hermers_auth: Dict[str, Any] = {}
+    hermers_drift_samples: List[Dict[str, Any]] = []
+    for profile in profile_names:
+        auth_path = HERMES_HOME / "profiles" / profile / "auth.json"
+        summary = summarize_auth_json(auth_path)
+        hermers_auth[profile] = summary
+        add_auth_summary_findings(
+            findings,
+            prefix=f"hermers_{profile}",
+            component="auth",
+            label=f"Hermers profile {profile}",
+            summary=summary,
+        )
+        spread = int(summary.get("accessTokenExpirySpreadSeconds") or 0)
+        expired_count = int(summary.get("expiredAccessTokenCount") or 0)
+        access_count = int(summary.get("accessTokenCount") or 0)
+        if access_count > 1 and (spread > 3600 or expired_count > 0):
+            hermers_drift_samples.append(
+                {
+                    "profile": profile,
+                    "accessTokenCount": access_count,
+                    "expiredAccessTokenCount": expired_count,
+                    "oldestAccessTokenExpiresAt": summary.get("oldestAccessTokenExpiresAt"),
+                    "freshestAccessTokenExpiresAt": summary.get("freshestAccessTokenExpiresAt"),
+                    "spreadSeconds": spread,
+                }
+            )
+    if hermers_drift_samples:
+        add_finding(
+            findings,
+            "hermers_oauth_token_copy_drift",
+            "warning",
+            "auth",
+            "Hermers profile auth files contain multiple openai-codex token copies with divergent expiry",
+            count=len(hermers_drift_samples),
+            sample=hermers_drift_samples[:10],
+        )
+
+    registry = workflow_runtime_registry_records()
+    openclaw_agent_ids = AUTH_OPENCLAW_AGENT_IDS or ["main"]
+    if "main" not in openclaw_agent_ids:
+        openclaw_agent_ids = ["main", *openclaw_agent_ids]
+    openclaw_agent_ids = sorted(dict.fromkeys(openclaw_agent_ids))
+    requested_openclaw_agent_count = len(openclaw_agent_ids)
+    openclaw_agent_ids = openclaw_agent_ids[: max(1, AUTH_OPENCLAW_AGENT_LIMIT)]
+    openclaw_auth: Dict[str, Any] = {}
+    expired_profiles: List[Dict[str, Any]] = []
+    expiring_profiles: List[Dict[str, Any]] = []
+    stale_profile_copies: List[Dict[str, Any]] = []
+    missing_codex_profiles: List[Dict[str, Any]] = []
+    unparsed_profiles: List[Dict[str, Any]] = []
+    for agent_id in openclaw_agent_ids:
+        probe = cached_openclaw_auth_probe(conn, agent_id)
+        openclaw_auth[agent_id] = probe
+        if not bool(probe.get("available")):
+            add_finding(
+                findings,
+                "openclaw_oauth_probe_failed",
+                "warning",
+                "auth",
+                "OpenClaw auth profile probe failed",
+                agentId=agent_id,
+                error=probe.get("error"),
+                cached=probe.get("cached"),
+            )
+            continue
+        if int(probe.get("unparsedProfileLineCount") or 0) > 0:
+            unparsed_profiles.append(
+                {
+                    "agentId": agent_id,
+                    "count": int(probe.get("unparsedProfileLineCount") or 0),
+                    "sample": probe.get("unparsedProfileLines") or [],
+                    "cached": probe.get("cached"),
+                }
+            )
+        provider_groups = openclaw_oauth_provider_groups(probe.get("profiles") or [])
+        if agent_id == "main" and AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS and not any(provider in AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS for provider in provider_groups):
+            missing_codex_profiles.append({"agentId": agent_id, "requiredProviders": sorted(AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS), "providers": sorted(provider_groups)})
+        for group in provider_groups.values():
+            for item in group.get("unparseableProfiles") or []:
+                unparsed_profiles.append(
+                    {
+                        "agentId": agent_id,
+                        "provider": item.get("provider"),
+                        "profileKind": item.get("profileKind"),
+                        "reason": "expiry-unparseable",
+                        "cached": probe.get("cached"),
+                    }
+                )
+            item = group.get("freshest")
+            if not isinstance(item, dict):
+                continue
+            remaining = item.get("secondsRemaining")
+            sample = {
+                "agentId": agent_id,
+                "provider": item.get("provider"),
+                "profileKind": item.get("profileKind"),
+                "expiresAt": item.get("expiresAt"),
+                "secondsRemaining": remaining,
+                "cooldownUntil": item.get("cooldownUntil"),
+                "cached": probe.get("cached"),
+                "profileCount": group.get("profileCount"),
+                "staleExpiredProfileCount": len(group.get("staleExpiredProfiles") or []),
+            }
+            if remaining is not None and int(remaining) <= 0:
+                expired_profiles.append(sample)
+            elif remaining is not None and int(remaining) <= AUTH_WARN_SECONDS:
+                expiring_profiles.append(sample)
+            elif group.get("staleExpiredProfiles"):
+                stale_profile_copies.append(
+                    {
+                        **sample,
+                    }
+                )
+    if missing_codex_profiles:
+        add_finding(
+            findings,
+            "openclaw_oauth_required_provider_missing",
+            "warning",
+            "auth",
+            "OpenClaw main has no required OAuth provider profile",
+            count=len(missing_codex_profiles),
+            sample=missing_codex_profiles[:10],
+        )
+    if unparsed_profiles:
+        add_finding(
+            findings,
+            "openclaw_oauth_profile_parse_incomplete",
+            "warning",
+            "auth",
+            "OpenClaw OAuth profile output was partially unparseable",
+            count=len(unparsed_profiles),
+            sample=unparsed_profiles[:10],
+        )
+    if expired_profiles:
+        add_finding(
+            findings,
+            "openclaw_oauth_profile_expired",
+            "high",
+            "auth",
+            "OpenClaw OAuth profiles are expired",
+            count=len(expired_profiles),
+            sample=expired_profiles[:10],
+        )
+    if expiring_profiles:
+        add_finding(
+            findings,
+            "openclaw_oauth_profile_expires_soon",
+            "warning",
+            "auth",
+            "OpenClaw OAuth profiles expire soon",
+            count=len(expiring_profiles),
+            sample=expiring_profiles[:10],
+        )
+    if stale_profile_copies:
+        add_finding(
+            findings,
+            "openclaw_oauth_stale_profile_copies",
+            "warning",
+            "auth",
+            "OpenClaw OAuth has stale expired profile copies but the freshest provider token is still valid",
+            count=len(stale_profile_copies),
+            sample=stale_profile_copies[:10],
+        )
+
+    return {
+        "schemaVersion": 1,
+        "checkedAt": ts(),
+        "warnSeconds": AUTH_WARN_SECONDS,
+        "criticalSeconds": AUTH_CRITICAL_SECONDS,
+        "codexCli": codex_cli,
+        "hermers": {
+            "profileSource": "argument" if hermers_profiles is not None else "profile-dir-fallback",
+            "profileCount": len(hermers_auth),
+            "profiles": hermers_auth,
+        },
+        "openclaw": {
+            "agentCount": len(openclaw_auth),
+            "requestedAgentCount": requested_openclaw_agent_count,
+            "agentLimit": AUTH_OPENCLAW_AGENT_LIMIT,
+            "agents": openclaw_auth,
+            "registrySource": registry.get("source"),
+            "registryDbFile": registry.get("dbFile"),
+            "probeTtlSeconds": AUTH_OPENCLAW_PROBE_TTL_SECONDS,
+            "probeTimeoutSeconds": AUTH_OPENCLAW_PROBE_TIMEOUT_SECONDS,
+            "requiredProviders": sorted(AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS),
+        },
+    }
+
+
+def auth_maintenance_action(
+    actions: List[Dict[str, Any]],
+    *,
+    action_id: str,
+    target: str,
+    kind: str,
+    severity: str,
+    reason: str,
+    can_auto_run: bool = False,
+    human_gate_required: bool = False,
+    evidence: Optional[Dict[str, Any]] = None,
+) -> None:
+    base_action_id = action_id
+    existing = {str(item.get("actionId") or "") for item in actions}
+    suffix = 2
+    while action_id in existing:
+        action_id = f"{base_action_id}-{suffix}"
+        suffix += 1
+    actions.append(
+        {
+            "actionId": action_id,
+            "source": "cat-agents-stabilityd.auth-maintenance",
+            "target": target,
+            "kind": kind,
+            "severity": severity,
+            "reason": reason,
+            "canAutoRun": bool(can_auto_run and AUTH_REFRESH_BROKER_ENABLED),
+            "blockedReason": "" if can_auto_run and AUTH_REFRESH_BROKER_ENABLED else "refresh-broker-disabled" if can_auto_run else "manual-or-runtime-owned",
+            "humanGateRequired": bool(human_gate_required),
+            "tokenValuesRedacted": True,
+            "evidence": evidence or {},
+        }
+    )
+
+
+def build_auth_maintenance_plan(auth: Dict[str, Any], findings: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    finding_items = [item for item in findings if isinstance(item, dict) and item.get("component") == "auth"]
+    finding_keys = {str(item.get("key") or "") for item in finding_items}
+    actions: List[Dict[str, Any]] = []
+    codex_cli = auth.get("codexCli") if isinstance(auth.get("codexCli"), dict) else {}
+    codex_status = auth_token_status(codex_cli)
+    if codex_status in {"access-expired", "access-critical"} and codex_cli.get("hasRefreshToken"):
+        auth_maintenance_action(
+            actions,
+            action_id="codex_cli_mirror_required",
+            target="codex-cli",
+            kind="mirror-from-mac-codex",
+            severity="high" if codex_status == "access-expired" else "warning",
+            reason=f"Codex CLI OAuth status is {codex_status}; mirror a fresh access/id token from mac-codex",
+            can_auto_run=False,
+            human_gate_required=False,
+            evidence={
+                "freshestAccessTokenExpiresAt": codex_cli.get("freshestAccessTokenExpiresAt"),
+                "freshestAccessTokenSecondsRemaining": codex_cli.get("freshestAccessTokenSecondsRemaining"),
+                "authPath": codex_cli.get("path"),
+                "refreshOwner": "mac-codex",
+            },
+        )
+    elif codex_status in {"missing", "access-missing", "refresh-missing", "access-expiry-unknown"}:
+        auth_maintenance_action(
+            actions,
+            action_id="codex_cli_reauth_required",
+            target="codex-cli",
+            kind="reauth",
+            severity="high",
+            reason=f"Codex CLI OAuth status is {codex_status}",
+            can_auto_run=False,
+            human_gate_required=True,
+            evidence={"authPath": codex_cli.get("path"), "status": codex_status},
+        )
+
+    openclaw = auth.get("openclaw") if isinstance(auth.get("openclaw"), dict) else {}
+    openclaw_agents = openclaw.get("agents") if isinstance(openclaw.get("agents"), dict) else {}
+    for agent_id, probe in sorted(openclaw_agents.items()):
+        if not isinstance(probe, dict):
+            continue
+        if not probe.get("available"):
+            auth_maintenance_action(
+                actions,
+                action_id=f"openclaw_{agent_id}_auth_probe_repair",
+                target=f"openclaw:{agent_id}",
+                kind="probe-repair",
+                severity="warning",
+                reason="OpenClaw auth probe failed",
+                can_auto_run=False,
+                human_gate_required=False,
+                evidence={"error": probe.get("error")},
+            )
+            continue
+        for provider, group in openclaw_oauth_provider_groups(probe.get("profiles") or []).items():
+            profile = group.get("freshest")
+            if not isinstance(profile, dict):
+                continue
+            remaining = profile.get("secondsRemaining")
+            if remaining is None or int(remaining) <= AUTH_CRITICAL_SECONDS:
+                auth_maintenance_action(
+                    actions,
+                    action_id=f"openclaw_{agent_id}_{provider}_reauth_or_sync",
+                    target=f"openclaw:{agent_id}:{provider}",
+                    kind="reauth-or-sync",
+                    severity="high" if remaining is not None and int(remaining) <= 0 else "warning",
+                    reason="OpenClaw OAuth profile is expired or nearing expiry",
+                    can_auto_run=False,
+                    human_gate_required=True,
+                    evidence={
+                        "expiresAt": profile.get("expiresAt"),
+                        "secondsRemaining": remaining,
+                        "cooldownUntil": profile.get("cooldownUntil"),
+                        "profileCount": group.get("profileCount"),
+                        "staleExpiredProfileCount": len(group.get("staleExpiredProfiles") or []),
+                    },
+                )
+
+    hermers = auth.get("hermers") if isinstance(auth.get("hermers"), dict) else {}
+    hermers_profiles = hermers.get("profiles") if isinstance(hermers.get("profiles"), dict) else {}
+    for profile, summary in sorted(hermers_profiles.items()):
+        if not isinstance(summary, dict):
+            continue
+        status = auth_token_status(summary)
+        active_provider = str(summary.get("activeProvider") or "")
+        if active_provider and active_provider not in AUTH_OPENAI_PROVIDER_IDS:
+            continue
+        if status in {"access-expired", "access-critical"} and summary.get("hasRefreshToken"):
+            auth_maintenance_action(
+                actions,
+                action_id=f"hermers_{profile}_token_sync_or_refresh",
+                target=f"hermers:{profile}",
+                kind="sync-or-refresh",
+                severity="warning" if status != "access-expired" else "high",
+                reason=f"Hermers profile OAuth status is {status}; refresh token is present",
+                can_auto_run=False,
+                human_gate_required=False,
+                evidence={
+                    "activeProvider": summary.get("activeProvider"),
+                    "freshestAccessTokenExpiresAt": summary.get("freshestAccessTokenExpiresAt"),
+                    "freshestAccessTokenSecondsRemaining": summary.get("freshestAccessTokenSecondsRemaining"),
+                },
+            )
+        elif status in {"missing", "access-missing", "refresh-missing", "access-expiry-unknown"}:
+            auth_maintenance_action(
+                actions,
+                action_id=f"hermers_{profile}_reauth_required",
+                target=f"hermers:{profile}",
+                kind="reauth",
+                severity="high",
+                reason=f"Hermers profile OAuth status is {status}",
+                can_auto_run=False,
+                human_gate_required=True,
+                evidence={"activeProvider": summary.get("activeProvider"), "authPath": summary.get("path"), "status": status},
+            )
+
+    for finding in finding_items:
+        if finding.get("key") != "openclaw_oauth_required_provider_missing":
+            continue
+        for sample in (finding.get("sample") or [])[:10]:
+            if not isinstance(sample, dict):
+                continue
+            agent_id = str(sample.get("agentId") or "unknown")
+            auth_maintenance_action(
+                actions,
+                action_id=f"openclaw_{agent_id}_required_provider_reauth",
+                target=f"openclaw:{agent_id}:required-provider",
+                kind="reauth",
+                severity="warning",
+                reason="OpenClaw required OAuth provider profile is missing",
+                can_auto_run=False,
+                human_gate_required=True,
+                evidence={
+                    "requiredProviders": sample.get("requiredProviders"),
+                    "providers": sample.get("providers"),
+                    "findingKey": "openclaw_oauth_required_provider_missing",
+                },
+            )
+
+    if "hermers_oauth_token_copy_drift" in finding_keys:
+        auth_maintenance_action(
+            actions,
+            action_id="hermers_token_copy_drift_cleanup",
+            target="hermers:*",
+            kind="deduplicate-token-copies",
+            severity="warning",
+            reason="Hermers auth files contain divergent token copies",
+            can_auto_run=False,
+            human_gate_required=False,
+            evidence={"findingKey": "hermers_oauth_token_copy_drift"},
+        )
+
+    severity = max_severity(actions)
+    status = "action-required" if actions else "ok"
+    blocked_count = sum(1 for item in actions if item.get("blockedReason"))
+    human_gate_count = sum(1 for item in actions if item.get("humanGateRequired"))
+    return {
+        "schemaVersion": 1,
+        "generatedAt": ts(),
+        "status": status,
+        "severity": severity,
+        "refreshBrokerEnabled": bool(AUTH_REFRESH_BROKER_ENABLED),
+        "tokenValuesRedacted": True,
+        "actionCount": len(actions),
+        "blockedActionCount": blocked_count,
+        "humanGateActionCount": human_gate_count,
+        "findingKeys": sorted(finding_keys),
+        "actions": actions,
+        "notes": [
+            "Default mode is observe-only; no device-code login, token copy, or credential mutation is executed by this plan.",
+            "mac-codex is the canonical OAuth refresh owner; dev-server runtimes should receive access/id-token mirrors, not reusable refresh tokens.",
+            "Use auth-maintenance --execute --allow-mirror from mac-codex to update Codex CLI, Hermers, and OpenClaw mirrors with backups and redacted evidence.",
+        ],
+    }
+
+
+def redact_auth_text(text: Any, max_chars: int = 2000) -> str:
+    raw = str(text or "")[-max_chars:]
+    raw = re.sub(r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]*", "[REDACTED_JWT]", raw)
+    raw = re.sub(r'(?i)("(?:access|refresh|id)(?:[_-]?token|Token)?"\s*:\s*")[^"]+(")', r"\1[REDACTED]\2", raw)
+    raw = re.sub(r'(?i)("(?:api[_-]?key|secret|token)"\s*:\s*")[^"]+(")', r"\1[REDACTED]\2", raw)
+    raw = re.sub(r"(?i)\b(access|refresh|id)(?:[_-]?token)?\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]", raw)
+    raw = re.sub(r"(?i)(api[_-]?key|secret|token)\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]", raw)
+    return raw
+
+
+def compact_mirror_summary(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        "schemaVersion": value.get("schemaVersion"),
+        "status": value.get("status"),
+        "artifact": value.get("artifact"),
+        "generatedAt": value.get("generatedAt"),
+        "targets": value.get("targets"),
+        "tokenValuesRedacted": bool(value.get("tokenValuesRedacted", True)),
+        "refreshOwner": value.get("refreshOwner"),
+        "remoteRefreshTokenStored": value.get("remoteRefreshTokenStored"),
+        "accessExpiresAt": value.get("accessExpiresAt"),
+        "resultCount": len(value.get("results") or []) if isinstance(value.get("results"), list) else None,
+    }
+
+
+def run_mac_codex_oauth_mirror(*, apply: bool = True) -> Dict[str, Any]:
+    script = AUTH_MIRROR_SCRIPT
+    if not script.exists():
+        return {
+            "action": "mac_codex_oauth_mirror",
+            "result": "failed",
+            "reason": "mirror-script-missing",
+            "script": str(script),
+            "tokenValuesRedacted": True,
+        }
+    cmd = [
+        sys.executable,
+        str(script),
+        "--min-ttl-seconds",
+        str(AUTH_MIRROR_MIN_TTL_SECONDS),
+        "--json-only",
+    ]
+    if apply:
+        cmd.append("--apply")
+    else:
+        cmd.append("--local-preflight")
+    try:
+        proc = run_cmd(cmd, timeout=AUTH_MIRROR_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return {
+            "action": "mac_codex_oauth_mirror",
+            "result": "failed",
+            "reason": "timeout",
+            "script": str(script),
+            "timeoutSeconds": AUTH_MIRROR_TIMEOUT_SECONDS,
+            "tokenValuesRedacted": True,
+        }
+    parsed = None
+    try:
+        parsed = json.loads(proc.stdout or "")
+    except Exception:
+        parsed = None
+    return {
+        "action": "mac_codex_oauth_mirror",
+        "result": (compact_mirror_summary(parsed).get("status") or ("applied" if apply else "dry-run")) if proc.returncode == 0 else "failed",
+        "script": str(script),
+        "exitCode": proc.returncode,
+        "stdout": redact_auth_text(proc.stdout, 4000),
+        "stderr": redact_auth_text(proc.stderr, 4000),
+        "summary": compact_mirror_summary(parsed),
+        "tokenValuesRedacted": True,
+    }
+
+
+def execute_auth_maintenance_plan(
+    conn: sqlite3.Connection,
+    plan: Dict[str, Any],
+    *,
+    action_id: str = "",
+    dry_run: bool = False,
+    allow_mirror: bool = False,
+) -> Dict[str, Any]:
+    selected = [
+        item for item in plan.get("actions") or []
+        if isinstance(item, dict) and (not action_id or str(item.get("actionId")) == action_id)
+    ]
+    if action_id and not selected:
+        return {
+            "generatedAt": ts(),
+            "status": "not-found",
+            "requestedActionId": action_id,
+            "refreshBrokerEnabled": bool(AUTH_REFRESH_BROKER_ENABLED),
+            "executions": [],
+        }
+    executions: List[Dict[str, Any]] = []
+    AUTH_REFRESH_BROKER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUTH_REFRESH_BROKER_LOCK_PATH.open("a+", encoding="utf-8") as lock_fh:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return {
+                    "generatedAt": ts(),
+                    "status": "locked",
+                    "requestedActionId": action_id,
+                    "refreshBrokerEnabled": bool(AUTH_REFRESH_BROKER_ENABLED),
+                    "executions": [],
+                }
+            raise
+
+        mirror_result: Optional[Dict[str, Any]] = None
+        for item in selected:
+            item_id = str(item.get("actionId") or "")
+            kind = str(item.get("kind") or "")
+            mirrorable = kind in AUTH_MIRROR_ACTION_KINDS
+            if dry_run:
+                result = {
+                    "action": "auth_refresh_broker",
+                    "result": "dry_run",
+                    "actionId": item_id,
+                    "target": item.get("target"),
+                    "wouldRun": bool(allow_mirror and mirrorable),
+                    "blockedReason": item.get("blockedReason"),
+                    "mirrorAllowed": bool(allow_mirror),
+                    "mirrorable": bool(mirrorable),
+                    "tokenValuesRedacted": True,
+                }
+            elif bool(item.get("humanGateRequired")):
+                result = {
+                    "action": "auth_refresh_broker",
+                    "result": "blocked",
+                    "actionId": item_id,
+                    "target": item.get("target"),
+                    "kind": kind,
+                    "blockedReason": "human-gate-required",
+                    "mirrorAllowed": bool(allow_mirror),
+                    "mirrorable": bool(mirrorable),
+                    "tokenValuesRedacted": True,
+                }
+            elif allow_mirror and mirrorable:
+                if mirror_result is None:
+                    mirror_result = run_mac_codex_oauth_mirror(apply=True)
+                result = {
+                    "action": "auth_refresh_broker",
+                    "result": mirror_result.get("result"),
+                    "actionId": item_id,
+                    "target": item.get("target"),
+                    "kind": kind,
+                    "mirrorAllowed": True,
+                    "mirror": mirror_result,
+                    "tokenValuesRedacted": True,
+                }
+            elif not AUTH_REFRESH_BROKER_ENABLED:
+                result = {
+                    "action": "auth_refresh_broker",
+                    "result": "blocked",
+                    "actionId": item_id,
+                    "target": item.get("target"),
+                    "blockedReason": "refresh-broker-disabled",
+                    "tokenValuesRedacted": True,
+                }
+            elif not bool(item.get("canAutoRun")):
+                result = {
+                    "action": "auth_refresh_broker",
+                    "result": "blocked",
+                    "actionId": item_id,
+                    "target": item.get("target"),
+                    "blockedReason": item.get("blockedReason") or "manual-or-runtime-owned",
+                    "tokenValuesRedacted": True,
+                }
+            else:
+                result = {
+                    "action": "auth_refresh_broker",
+                    "result": "blocked",
+                    "actionId": item_id,
+                    "target": item.get("target"),
+                    "blockedReason": "mac-codex-is-refresh-owner",
+                    "tokenValuesRedacted": True,
+                }
+            executions.append(result)
+            db_record_action(
+                conn,
+                {
+                    "ts": ts(),
+                    "tsEpoch": epoch(),
+                    "actionId": f"auth:{item_id or 'unknown'}",
+                    "action": "auth_refresh_broker",
+                    "result": result.get("result"),
+                    "payload": result,
+                },
+            )
+
+    return {
+        "generatedAt": ts(),
+        "status": "executed" if executions else "no-actions",
+        "requestedActionId": action_id,
+        "refreshBrokerEnabled": bool(AUTH_REFRESH_BROKER_ENABLED),
+        "dryRun": bool(dry_run),
+        "executionCount": len(executions),
+        "executions": executions,
+    }
 
 
 def session_store_agent_id(store_path: Path) -> str:
@@ -3874,6 +4936,7 @@ def build_lane_policy(
     channel_pressure = bool(
         {"telegram_provider_network_errors", "telegram_channel_restart_limited", "telegram_channel_restart_churn"} & keys
     ) or any(k.endswith("_consumer_lag") or k.endswith("_consumer_lag_warn") for k in keys)
+    auth_pressure = any(auth_finding_is_pressure(key) for key in keys)
     hermers_pressure = bool(
         {
             "hermers_gateway_service_down",
@@ -3943,6 +5006,24 @@ def build_lane_policy(
         )
     )
     channel_observations = sorted(k for k in keys if k.startswith("telegram_") and k not in set(channel_evidence))
+    auth_evidence = sorted(
+        k
+        for k in keys
+        if k.startswith(("codex_cli_oauth_", "openclaw_oauth_", "hermers_oauth_", "hermers_cat"))
+        and (
+            k.endswith("_missing")
+            or k.endswith("_expired")
+            or k.endswith("_refresh_missing")
+            or k.endswith("_access_missing")
+            or k == "openclaw_oauth_profile_expired"
+        )
+    )
+    auth_observations = sorted(
+        k
+        for k in keys
+        if k.startswith(("codex_cli_oauth_", "openclaw_oauth_", "hermers_oauth_", "hermers_cat"))
+        and k not in set(auth_evidence)
+    )
     hermers_evidence = sorted(
         k
         for k in keys
@@ -3976,6 +5057,7 @@ def build_lane_policy(
     cron_state = "blocked" if cron_admission == "closed" else "constrained" if cron_admission != "open" else "normal"
     session_state = "constrained" if session_pressure else "normal"
     channel_state = "blocked" if channel_probe_mode == "disabled" else "constrained" if channel_pressure else "normal"
+    auth_state = "constrained" if auth_pressure else "normal"
     hermers_state = "blocked" if "hermers_gateway_service_down" in keys else "constrained" if hermers_pressure else "normal"
 
     return {
@@ -3987,6 +5069,7 @@ def build_lane_policy(
             "cron": bool(cron_pressure),
             "session": bool(session_pressure),
             "channel": bool(channel_pressure),
+            "auth": bool(auth_pressure),
             "hermers": bool(hermers_pressure),
         },
         "secondaryPressureDomains": {
@@ -4045,6 +5128,15 @@ def build_lane_policy(
                 "governanceAction": "passive-backoff" if channel_pressure else "passive-observe",
                 "stabilizationGoal": "keep provider delivery healthy without competing with the Gateway consumer",
             },
+            "auth": {
+                "state": auth_state,
+                "pressure": bool(auth_pressure),
+                "evidenceKeys": auth_evidence,
+                "observationKeys": auth_observations,
+                "streakCounts": {k: streak_counts[k] for k in auth_evidence if k in streak_counts},
+                "governanceAction": "human-gate-reauth" if any(k.endswith("_refresh_missing") or k.endswith("_access_missing") or k.endswith("_missing") for k in auth_evidence) else "refresh-broker-needed" if auth_pressure else "observe",
+                "stabilizationGoal": "keep Codex CLI, OpenClaw openai-codex, and Hermers profile OAuth credentials refreshable without leaking tokens or requiring repeated manual login",
+            },
             "hermers": {
                 "state": hermers_state,
                 "pressure": bool(hermers_pressure),
@@ -4087,6 +5179,13 @@ def build_lane_policy(
             "mainResetAllowed": main_session_reset_allowed,
             "pressure": bool(session_pressure),
             "protectedDirectSessionKeys": sorted(CONTROL_PLANE_DIRECT_SESSION_KEYS),
+        },
+        "auth": {
+            "pressure": bool(auth_pressure),
+            "warnSeconds": AUTH_WARN_SECONDS,
+            "criticalSeconds": AUTH_CRITICAL_SECONDS,
+            "openclawProbeTtlSeconds": AUTH_OPENCLAW_PROBE_TTL_SECONDS,
+            "tokenValuesRedacted": True,
         },
         "hermers": {
             "pressure": bool(hermers_pressure),
@@ -4132,6 +5231,8 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         mode = "hermers-unavailable"
     elif {"hermers_acp_orphan_workers", "hermers_runtime_failure_burst", "hermers_stale_sent_dispatches"} & keys:
         mode = "hermers-degraded"
+    elif any(auth_finding_is_pressure(key) for key in keys):
+        mode = "auth-degraded"
     elif resource_pressure_active(keys):
         mode = "resource-pressure"
 
@@ -4295,6 +5396,7 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
             "channel": bool(
                 {"telegram_provider_network_errors", "telegram_channel_restart_limited", "telegram_channel_restart_churn"} & keys
             ) or any(k.endswith("_consumer_lag") or k.endswith("_consumer_lag_warn") for k in keys),
+            "auth": any(auth_finding_is_pressure(key) for key in keys),
             "hermers": bool(
                 {
                     "hermers_gateway_service_down",
@@ -5558,6 +6660,8 @@ def collect_snapshot(conn: sqlite3.Connection) -> Tuple[Dict[str, Any], List[Dic
     snapshot["session"] = session_collect(findings)
     snapshot["channel"] = channel_collect(findings)
     snapshot["hermers"] = hermers_collect(conn, findings)
+    hermers_profiles = (snapshot.get("hermers") or {}).get("profiles") if isinstance(snapshot.get("hermers"), dict) else {}
+    snapshot["auth"] = auth_collect(conn, findings, (hermers_profiles or {}).keys() if isinstance(hermers_profiles, dict) else None)
     snapshot["resource"] = resource_collect(findings)
     snapshot["config"] = config_collect(findings)
     snapshot["desiredState"] = desired_state_drift()
@@ -5579,6 +6683,7 @@ def collect_snapshot(conn: sqlite3.Connection) -> Tuple[Dict[str, Any], List[Dic
     snapshot["streaks"] = streaks
     policy = policy_from_findings(conn, findings, snapshot, streaks)
     snapshot["policy"] = policy
+    snapshot["authMaintenance"] = build_auth_maintenance_plan(snapshot.get("auth") if isinstance(snapshot.get("auth"), dict) else {}, findings)
     return snapshot, findings, policy
 
 
@@ -5594,6 +6699,7 @@ def run_once(conn: sqlite3.Connection, no_action: bool = False) -> Dict[str, Any
     write_json_atomic(LATEST_PATH, snapshot)
     write_json_atomic(LANE_POLICY_PATH, policy.get("lanes") or {})
     write_json_atomic(HERMERS_PROFILE_MODES_PATH, ((snapshot.get("hermers") or {}).get("profileModes") or {}))
+    write_json_atomic(AUTH_MAINTENANCE_PLAN_PATH, snapshot.get("authMaintenance") or {})
     write_json_atomic(CONTROL_PLANE_BACKPRESSURE_PATH, snapshot["controlPlane"])
     snapshot["workflowEvidence"] = write_workflow_stability_evidence(snapshot)
     write_legacy_watchdog_health(snapshot, policy)
@@ -5689,6 +6795,17 @@ def print_json(payload: Any) -> int:
     return 0
 
 
+def with_auth_freshness(payload: Dict[str, Any], timestamp_key: str, source: str) -> Dict[str, Any]:
+    result = dict(payload)
+    timestamp_epoch = parse_iso_epoch(result.get(timestamp_key))
+    age_seconds = max(0, epoch() - int(timestamp_epoch)) if timestamp_epoch is not None else None
+    result["source"] = source
+    result["ageSeconds"] = age_seconds
+    result["freshEnough"] = bool(age_seconds is not None and age_seconds <= AUTH_EVIDENCE_FRESH_SECONDS)
+    result["freshSeconds"] = AUTH_EVIDENCE_FRESH_SECONDS
+    return result
+
+
 def tail_jsonl(path: Path, limit: int = 20) -> List[Any]:
     if not path.exists():
         return []
@@ -5715,6 +6832,8 @@ def runbook() -> Dict[str, Any]:
         "systemctl status openclaw-gateway.service --no-pager",
         "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability status",
         "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability lanes",
+        "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability auth-readiness",
+        "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability auth-maintenance",
         "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability findings",
         "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability drift",
         "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability actions --limit 20",
@@ -5748,6 +6867,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("snapshot")
     sub.add_parser("policy")
     sub.add_parser("lanes")
+    auth_p = sub.add_parser("auth-readiness")
+    auth_p.add_argument("--fresh", action="store_true", help="collect a fresh auth-readiness snapshot instead of returning latest daemon evidence")
+    auth_maint_p = sub.add_parser("auth-maintenance")
+    auth_maint_p.add_argument("--fresh", action="store_true", help="build the maintenance plan from a fresh auth-readiness sample")
+    auth_maint_p.add_argument("--execute", action="store_true", help="execute explicit auth-maintenance actions; mirror execution still requires --allow-mirror")
+    auth_maint_p.add_argument("--dry-run", action="store_true", help="show auth-maintenance execution decisions without recording actions")
+    auth_maint_p.add_argument("--allow-mirror", action="store_true", help="allow running the mac-codex OAuth mirror script for mirrorable actions")
+    auth_maint_p.add_argument("--action-id", default="", help="execute or dry-run one maintenance action id")
+    auth_mirror_p = sub.add_parser("auth-mirror")
+    auth_mirror_p.add_argument("--apply", action="store_true", help="apply the mac-codex OAuth mirror; default runs the mirror script in its dry-run mode")
     sub.add_parser("profile-modes")
     sub.add_parser("desired-state")
     sub.add_parser("drift")
@@ -5791,6 +6920,50 @@ def main(argv: Optional[List[str]] = None) -> int:
     if cmd == "lanes":
         lanes = load_json(LANE_POLICY_PATH, {}) or (load_json(POLICY_PATH, {}) or {}).get("lanes") or {}
         return print_json(lanes)
+    if cmd == "auth-readiness":
+        latest = load_json(LATEST_PATH, {}) or {}
+        latest_auth = latest.get("auth") if isinstance(latest.get("auth"), dict) else {}
+        if latest_auth and not args.fresh:
+            return print_json(with_auth_freshness(latest_auth, "checkedAt", "latest"))
+        conn = init_memory_kv_db()
+        findings: List[Dict[str, Any]] = []
+        auth = auth_collect(conn, findings)
+        auth["findings"] = findings
+        return print_json(with_auth_freshness(auth, "checkedAt", "fresh"))
+    if cmd == "auth-maintenance":
+        latest = load_json(LATEST_PATH, {}) or {}
+        if args.execute and not args.fresh:
+            args.fresh = True
+        if not args.fresh:
+            latest_plan = latest.get("authMaintenance") if isinstance(latest.get("authMaintenance"), dict) else load_json(AUTH_MAINTENANCE_PLAN_PATH, {}) or {}
+            if latest_plan and not args.execute and not args.dry_run:
+                return print_json(with_auth_freshness(latest_plan, "generatedAt", "latest"))
+            if latest_plan:
+                plan = latest_plan
+            else:
+                conn = init_memory_kv_db()
+                findings: List[Dict[str, Any]] = []
+                auth = auth_collect(conn, findings)
+                plan = build_auth_maintenance_plan(auth, findings)
+        else:
+            conn = init_memory_kv_db()
+            findings = []
+            auth = auth_collect(conn, findings)
+            plan = build_auth_maintenance_plan(auth, findings)
+        if args.execute or args.dry_run:
+            conn = init_db()
+            return print_json(
+                execute_auth_maintenance_plan(
+                    conn,
+                    plan,
+                    action_id=args.action_id,
+                    dry_run=args.dry_run,
+                    allow_mirror=args.allow_mirror,
+                )
+            )
+        return print_json(with_auth_freshness(plan, "generatedAt", "fresh" if args.fresh else "latest"))
+    if cmd == "auth-mirror":
+        return print_json(run_mac_codex_oauth_mirror(apply=args.apply))
     if cmd == "profile-modes":
         return print_json(read_json_or_empty(HERMERS_PROFILE_MODES_PATH))
     if cmd == "desired-state":

@@ -104,12 +104,31 @@ def parse_json_output(result: dict[str, Any], fallback: Any) -> Any:
 
 
 def stability_cli_args(action: str, args: dict[str, Any]) -> list[str]:
-    allowed = {"status", "snapshot", "policy", "lanes", "profile-modes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook", "doctor", "repair", "once"}
+    allowed = {"status", "snapshot", "policy", "lanes", "profile-modes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook", "auth-readiness", "auth-maintenance", "auth-mirror", "doctor", "repair", "once"}
     if action not in allowed:
         raise ValueError(f"unsupported stability action: {action}")
     cmd = [action]
     if action == "actions" and args.get("limit") is not None:
         cmd.extend(["--limit", str(args.get("limit"))])
+    if action == "auth-readiness" and bool(args.get("fresh")):
+        cmd.append("--fresh")
+    if action == "auth-maintenance":
+        if bool(args.get("fresh")):
+            cmd.append("--fresh")
+        action_id = args.get("action_id", args.get("actionId", ""))
+        if str(action_id or "").strip():
+            cmd.extend(["--action-id", str(action_id).strip()])
+        if bool(args.get("dry_run", args.get("dryRun", False))):
+            cmd.append("--dry-run")
+        if bool(args.get("execute", False)):
+            cmd.append("--execute")
+        allow_env = os.environ.get("CAT_AGENTS_STABILITY_MCP_ALLOW_AUTH_MIRROR", "0") == "1"
+        if allow_env and bool(args.get("allow_mirror", args.get("allowMirror", False))):
+            cmd.append("--allow-mirror")
+    if action == "auth-mirror":
+        allow_env = os.environ.get("CAT_AGENTS_STABILITY_MCP_ALLOW_AUTH_MIRROR", "0") == "1"
+        if allow_env and bool(args.get("apply", False)):
+            cmd.append("--apply")
     if action in {"doctor", "once"}:
         if bool(args.get("no_action", args.get("noAction", True))):
             cmd.append("--no-action")
@@ -176,6 +195,18 @@ def drift_check(args: dict[str, Any]) -> dict[str, Any]:
 
 def workflow_evidence(args: dict[str, Any]) -> dict[str, Any]:
     return stability_call({**args, "action": "workflow-evidence"})
+
+
+def auth_readiness(args: dict[str, Any]) -> dict[str, Any]:
+    return stability_call({**args, "action": "auth-readiness"})
+
+
+def auth_maintenance(args: dict[str, Any]) -> dict[str, Any]:
+    return stability_call({**args, "action": "auth-maintenance"})
+
+
+def auth_mirror(args: dict[str, Any]) -> dict[str, Any]:
+    return stability_call({**args, "action": "auth-mirror"})
 
 
 def doctor(args: dict[str, Any]) -> dict[str, Any]:
@@ -250,6 +281,30 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": "Generate the cat-agents-stability evidence package consumed by trading-agents-workflow governance logs and cat-brain heartbeat.",
         "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
     },
+    "stability_auth_readiness": {
+        "description": "Return redacted OAuth readiness for Codex CLI, Hermers profiles, and OpenClaw auth profiles.",
+        "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}, "fresh": {"type": "boolean"}, "timeout": {"type": "number"}}, "additionalProperties": False},
+    },
+    "stability_auth_maintenance": {
+        "description": "Return or explicitly execute redacted OAuth maintenance decisions. Mirror execution requires CAT_AGENTS_STABILITY_MCP_ALLOW_AUTH_MIRROR=1 and allow_mirror=true.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "enum": ["local", "remote"]},
+                "fresh": {"type": "boolean"},
+                "dry_run": {"type": "boolean"},
+                "execute": {"type": "boolean"},
+                "action_id": {"type": "string"},
+                "allow_mirror": {"type": "boolean"},
+                "timeout": {"type": "number"}
+            },
+            "additionalProperties": False
+        },
+    },
+    "stability_auth_mirror": {
+        "description": "Run the mac-codex OAuth mirror broker through cat-agents-stability. Apply requires CAT_AGENTS_STABILITY_MCP_ALLOW_AUTH_MIRROR=1 and apply=true; otherwise it runs local source preflight only.",
+        "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}, "apply": {"type": "boolean"}, "timeout": {"type": "number"}}, "additionalProperties": False},
+    },
     "stability_doctor_dry_run": {
         "description": "Run cat-agents-stability doctor in no-action mode.",
         "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}, "timeout": {"type": "number"}}, "additionalProperties": False},
@@ -317,6 +372,12 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
                 payload = drift_check(arguments)
             elif name == "stability_workflow_evidence":
                 payload = workflow_evidence(arguments)
+            elif name == "stability_auth_readiness":
+                payload = auth_readiness(arguments)
+            elif name == "stability_auth_maintenance":
+                payload = auth_maintenance(arguments)
+            elif name == "stability_auth_mirror":
+                payload = auth_mirror(arguments)
             elif name == "stability_doctor_dry_run":
                 payload = doctor(arguments)
             elif name == "stability_server_snapshot":
