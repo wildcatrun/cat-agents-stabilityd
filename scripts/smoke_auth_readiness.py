@@ -255,6 +255,33 @@ def main() -> int:
         assert preflight.returncode == 0, preflight.stderr
         preflight_json = json.loads(preflight.stdout)
         assert preflight_json["status"] == "preflight-ok", preflight_json
+        assert preflight_json["idTokenFresh"] is True, preflight_json
+
+        expired_id_source_auth = Path(tmp) / "expired-id-source-auth.json"
+        expired_id_source_auth.write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "access_token": make_jwt(future_exp),
+                        "id_token": make_jwt(now - 60),
+                        "refresh_token": "local-refresh-owner",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        expired_id_preflight = subprocess.run(
+            [sys.executable, str(mirror_script), "--codex-auth", str(expired_id_source_auth), "--local-preflight"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert expired_id_preflight.returncode == 0, expired_id_preflight.stderr
+        expired_id_json = json.loads(expired_id_preflight.stdout)
+        assert expired_id_json["status"] == "preflight-ok", expired_id_json
+        assert expired_id_json["idTokenFresh"] is False, expired_id_json
         dummy_source_auth = Path(tmp) / "dummy-source-auth.json"
         dummy_source_auth.write_text(
             json.dumps(

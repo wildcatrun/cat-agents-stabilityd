@@ -49,7 +49,7 @@ OpenClaw OAuth probing defaults to agent `main` to keep the daemon lightweight. 
 
 `auth-maintenance` converts auth findings into a governed repair plan. It identifies mirror-from-mac-codex, reauth, sync, and token-copy-drift cleanup candidates. Default mode remains observe-only, and development-server stabilityd must not become the refresh-token owner.
 
-`cat-agents-stability auth-maintenance --dry-run --action-id codex_cli_mirror_required` shows the maintenance decision without side effects. `--execute` records blocked execution decisions unless the operator also passes `--allow-mirror` for a mirrorable action. `--allow-mirror` runs the governed mac-codex mirror script, which validates local access and id token TTL, writes redacted evidence, and pushes only mirrored access/id tokens plus the non-secret refresh placeholder to development-server runtime stores.
+`cat-agents-stability auth-maintenance --dry-run --action-id codex_cli_mirror_required` shows the maintenance decision without side effects. `--execute` records blocked execution decisions unless the operator also passes `--allow-mirror` for a mirrorable action. `--allow-mirror` runs the governed mac-codex mirror script, which requires a fresh local access token, records id token freshness, writes redacted evidence, and pushes only mirrored access/id tokens plus the non-secret refresh placeholder to development-server runtime stores.
 
 ### mac-codex OAuth Source
 
@@ -78,6 +78,14 @@ bin/cat-agents-stability auth-mirror --apply
 ```
 
 Do not run the mirror from a host that lacks the canonical mac-codex Codex auth file. A failed preflight is expected when the local `id_token` is expired; refresh the mac-codex Codex login first, then run the mirror again.
+
+mac-codex also has a launchd maintenance wrapper:
+
+```bash
+scripts/mac_codex_oauth_mirror_maintenance.sh
+```
+
+The wrapper first asks the development server for a fresh auth-maintenance plan. It runs `auth-mirror --apply` only when that plan contains auth maintenance actions, so routine checks do not create repeated OpenClaw SQLite backups.
 
 Direct actuator authority is policy-gated, not removed. When runtime pressure is still light, stabilityd should produce structured evidence and repair candidates for Cat Brain `main`. When cron/session/worker/profile pressure threatens runtime availability, `cat-agents-stabilityd.service` is the external repair layer and may execute controlled cron stale/lease repair, eligible session reset, orphan ACP worker reap, Hermers profile lifecycle repair through the Hermers CLI adapter, and Gateway restarts. These actions require registry scope, protected-member checks, an explicit `CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_ALLOWLIST` blast-radius limit for profile lifecycle execution, cooldown/restart-storm gates where applicable, backups or action ledger entries, and post-check evidence.
 

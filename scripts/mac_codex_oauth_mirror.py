@@ -2,8 +2,9 @@
 """Mirror mac-codex OAuth access tokens to governed runtime stores.
 
 The Mac Codex auth file remains the only refresh-token owner. Remote runtime
-stores receive the current access/id token plus a non-secret dummy refresh
-marker so they can use valid access tokens but cannot rotate refresh tokens.
+stores receive the current access token, the current id token when present, and
+a non-secret dummy refresh marker so they can use valid access tokens but cannot
+rotate refresh tokens.
 """
 
 from __future__ import annotations
@@ -360,6 +361,12 @@ def require_fresh_jwt(token: str, label: str, min_ttl_seconds: int) -> tuple[int
     return exp, remaining
 
 
+def inspect_jwt_expiry(token: str, label: str) -> tuple[int, int]:
+    claims = decode_jwt(token, label)
+    exp = int(claims.get("exp") or 0)
+    return exp, exp - int(time.time())
+
+
 def load_codex_auth(path: pathlib.Path, min_ttl_seconds: int) -> dict[str, Any]:
     if not path.exists():
         raise SystemExit(f"Codex auth file not found: {path}")
@@ -379,7 +386,7 @@ def load_codex_auth(path: pathlib.Path, min_ttl_seconds: int) -> dict[str, Any]:
     if refresh_token == DUMMY_REFRESH:
         raise SystemExit("Codex auth file contains the mirror refresh placeholder; this host is not the mac-codex refresh owner")
     access_exp, access_remaining = require_fresh_jwt(access_token, "access_token", min_ttl_seconds)
-    id_exp, id_remaining = require_fresh_jwt(id_token, "id_token", min_ttl_seconds)
+    id_exp, id_remaining = inspect_jwt_expiry(id_token, "id_token")
     return {
         "auth": data,
         "tokens": {
@@ -393,6 +400,7 @@ def load_codex_auth(path: pathlib.Path, min_ttl_seconds: int) -> dict[str, Any]:
         "idExpiresEpoch": id_exp,
         "idExpiresAt": iso_from_epoch(id_exp),
         "idSecondsRemaining": id_remaining,
+        "idTokenFresh": id_remaining >= min_ttl_seconds,
         "lastRefresh": data.get("last_refresh") or dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
@@ -428,6 +436,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         "accessSecondsRemaining": source["accessSecondsRemaining"],
         "idExpiresAt": source["idExpiresAt"],
         "idSecondsRemaining": source["idSecondsRemaining"],
+        "idTokenFresh": source["idTokenFresh"],
         "hermersProfiles": split_csv(args.hermers_profiles),
         "openclawAgents": split_csv(args.openclaw_agents),
         "openclawProfileKinds": split_csv(args.openclaw_profile_kinds),
@@ -496,6 +505,7 @@ def main() -> int:
         "accessSecondsRemaining": payload["accessSecondsRemaining"],
         "idExpiresAt": payload["idExpiresAt"],
         "idSecondsRemaining": payload["idSecondsRemaining"],
+        "idTokenFresh": payload["idTokenFresh"],
         "refreshOwner": "mac-codex",
         "remoteRefreshTokenStored": False,
         "tokenValuesRedacted": True,

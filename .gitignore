@@ -13,7 +13,7 @@ npm-debug.log*
 .tmp*/
 tmp/
 backups/
+reports/
 
 # Server backup snapshots are operational artifacts, not source.
 remote-backup/
-
