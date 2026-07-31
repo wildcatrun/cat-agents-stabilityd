@@ -1479,6 +1479,7 @@ def build_workflow_stability_evidence(snapshot: Optional[Dict[str, Any]] = None)
     resource_human_gate = load_json(RESOURCE_HUMAN_GATE_DIR / "gateway-resource-pressure-latest.json", {}) or {}
     current_keys = {str(item.get("key")) for item in findings if isinstance(item, dict)}
     resource_gate_active = bool(resource_pressure_active(current_keys))
+    resource_gate_generated_at = resource_human_gate.get("generatedAt")
     return {
         "schemaVersion": 1,
         "generatedAt": ts(),
@@ -1514,11 +1515,13 @@ def build_workflow_stability_evidence(snapshot: Optional[Dict[str, Any]] = None)
         "recentActions": actions[:20],
         "resourceHumanGate": {
             "active": resource_gate_active,
-            "status": resource_human_gate.get("status") if resource_gate_active else None,
-            "generatedAt": resource_human_gate.get("generatedAt"),
-            "severity": resource_human_gate.get("severity"),
-            "mode": resource_human_gate.get("mode"),
-            "triggerKeys": resource_human_gate.get("triggerKeys") or [],
+            "status": resource_human_gate.get("status") if resource_gate_active else "inactive",
+            "generatedAt": resource_gate_generated_at if resource_gate_active else None,
+            "lastGeneratedAt": resource_gate_generated_at,
+            "severity": resource_human_gate.get("severity") if resource_gate_active else None,
+            "mode": resource_human_gate.get("mode") if resource_gate_active else None,
+            "triggerKeys": (resource_human_gate.get("triggerKeys") or []) if resource_gate_active else [],
+            "inactiveReason": None if resource_gate_active else "no_current_resource_pressure",
             "jsonPath": str(RESOURCE_HUMAN_GATE_DIR / "gateway-resource-pressure-latest.json"),
             "markdownPath": str(RESOURCE_HUMAN_GATE_DIR / "gateway-resource-pressure-latest.md"),
             "incidentPath": str(RESOURCE_INCIDENT_LATEST),
