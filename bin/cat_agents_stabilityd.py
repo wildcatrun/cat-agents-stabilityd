@@ -138,6 +138,8 @@ SWAP_WARN_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_SWAP_WARN_GB", "0
 SWAP_CRIT_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_SWAP_CRIT_GB", "1.8")) * 1024**3)
 SYSTEM_MEMORY_AVAILABLE_WARN_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_SYSTEM_MEM_AVAILABLE_WARN_GB", "1.0")) * 1024**3)
 SYSTEM_MEMORY_AVAILABLE_CRIT_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_SYSTEM_MEM_AVAILABLE_CRIT_GB", "0.5")) * 1024**3)
+SYSTEM_SWAP_WARN_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_SYSTEM_SWAP_WARN_GB", "0")) * 1024**3)
+SYSTEM_SWAP_CRIT_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_SYSTEM_SWAP_CRIT_GB", "0")) * 1024**3)
 SYSTEM_SWAP_WARN_RATIO = float(os.environ.get("OPENCLAW_STABILITY_SYSTEM_SWAP_WARN_RATIO", "0.50"))
 SYSTEM_SWAP_CRIT_RATIO = float(os.environ.get("OPENCLAW_STABILITY_SYSTEM_SWAP_CRIT_RATIO", "0.90"))
 SYSTEM_COMMIT_WARN_RATIO = float(os.environ.get("OPENCLAW_STABILITY_SYSTEM_COMMIT_WARN_RATIO", "0.95"))
@@ -4539,6 +4541,19 @@ def backup_disk_summary() -> Dict[str, Any]:
     }
 
 
+def system_swap_pressure_level(swap_used: int, swap_total: int) -> str:
+    if not swap_total:
+        return ""
+    swap_used_ratio = swap_used / swap_total
+    critical_by_bytes = SYSTEM_SWAP_CRIT_BYTES > 0 and swap_used >= SYSTEM_SWAP_CRIT_BYTES
+    warning_by_bytes = SYSTEM_SWAP_WARN_BYTES > 0 and swap_used >= SYSTEM_SWAP_WARN_BYTES
+    if critical_by_bytes or swap_used_ratio >= SYSTEM_SWAP_CRIT_RATIO:
+        return "critical"
+    if warning_by_bytes or swap_used_ratio >= SYSTEM_SWAP_WARN_RATIO:
+        return "high"
+    return ""
+
+
 def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     statvfs = os.statvfs(str(OPENCLAW))
     free = statvfs.f_bavail * statvfs.f_frsize
@@ -4575,6 +4590,7 @@ def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     swap_free = int(meminfo.get("SwapFree") or 0)
     swap_used = max(0, swap_total - swap_free)
     swap_used_ratio = (swap_used / swap_total) if swap_total else 0
+    swap_pressure_level = system_swap_pressure_level(swap_used, swap_total)
     commit_limit = int(meminfo.get("CommitLimit") or 0)
     committed_as = int(meminfo.get("Committed_AS") or 0)
     commit_ratio = (committed_as / commit_limit) if commit_limit else 0
@@ -4598,7 +4614,7 @@ def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
             memAvailableBytes=mem_available,
             memTotalBytes=mem_total,
         )
-    if swap_total and (swap_used >= SWAP_CRIT_BYTES or swap_used_ratio >= SYSTEM_SWAP_CRIT_RATIO):
+    if swap_pressure_level == "critical":
         add_finding(
             findings,
             "system_swap_saturation",
@@ -4608,8 +4624,12 @@ def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
             swapUsedBytes=swap_used,
             swapTotalBytes=swap_total,
             swapUsedRatio=swap_used_ratio,
+            swapWarnBytes=SYSTEM_SWAP_WARN_BYTES,
+            swapCritBytes=SYSTEM_SWAP_CRIT_BYTES,
+            swapWarnRatio=SYSTEM_SWAP_WARN_RATIO,
+            swapCritRatio=SYSTEM_SWAP_CRIT_RATIO,
         )
-    elif swap_total and (swap_used >= SWAP_WARN_BYTES or swap_used_ratio >= SYSTEM_SWAP_WARN_RATIO):
+    elif swap_pressure_level == "high":
         add_finding(
             findings,
             "system_swap_pressure",
@@ -4619,6 +4639,10 @@ def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
             swapUsedBytes=swap_used,
             swapTotalBytes=swap_total,
             swapUsedRatio=swap_used_ratio,
+            swapWarnBytes=SYSTEM_SWAP_WARN_BYTES,
+            swapCritBytes=SYSTEM_SWAP_CRIT_BYTES,
+            swapWarnRatio=SYSTEM_SWAP_WARN_RATIO,
+            swapCritRatio=SYSTEM_SWAP_CRIT_RATIO,
         )
     if commit_limit and commit_ratio >= SYSTEM_COMMIT_CRIT_RATIO:
         add_finding(
@@ -5213,7 +5237,7 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
     components = {str(f.get("component")) for f in findings}
     reasons = [str(f.get("key")) for f in findings if SEVERITY_RANK.get(str(f.get("severity")), 0) >= SEVERITY_RANK["high"]]
     mode = "healthy"
-    if severity != "ok":
+    if SEVERITY_RANK.get(severity, 0) >= SEVERITY_RANK["warning"]:
         mode = "degraded"
     if {"gateway_service_down", "gateway_port_down", "gateway_health_endpoint_failed"} & keys:
         mode = "gateway-unreachable"

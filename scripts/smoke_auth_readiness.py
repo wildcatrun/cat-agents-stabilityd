@@ -343,6 +343,35 @@ def main() -> int:
         stale_only_policy = stabilityd.policy_from_findings(conn, stale_only_findings, {}, {})
         assert stale_only_policy["lanes"]["primaryPressureDomains"]["auth"] is False, stale_only_policy
         assert stale_only_policy["lanes"]["domains"]["auth"]["pressure"] is False, stale_only_policy
+        info_only_policy = stabilityd.policy_from_findings(
+            conn,
+            [{"key": "session_stale_entries", "severity": "info", "component": "session", "message": "observed only"}],
+            {},
+            {},
+        )
+        assert info_only_policy["severity"] == "info", info_only_policy
+        assert info_only_policy["mode"] == "healthy", info_only_policy
+
+        old_system_swap_warn_bytes = stabilityd.SYSTEM_SWAP_WARN_BYTES
+        old_system_swap_crit_bytes = stabilityd.SYSTEM_SWAP_CRIT_BYTES
+        old_system_swap_warn_ratio = stabilityd.SYSTEM_SWAP_WARN_RATIO
+        old_system_swap_crit_ratio = stabilityd.SYSTEM_SWAP_CRIT_RATIO
+        try:
+            stabilityd.SYSTEM_SWAP_WARN_BYTES = 0
+            stabilityd.SYSTEM_SWAP_CRIT_BYTES = 0
+            stabilityd.SYSTEM_SWAP_WARN_RATIO = 0.70
+            stabilityd.SYSTEM_SWAP_CRIT_RATIO = 0.90
+            assert stabilityd.system_swap_pressure_level(3_800_000_000, 8_589_930_496) == ""
+            assert stabilityd.system_swap_pressure_level(6_200_000_000, 8_589_930_496) == "high"
+            assert stabilityd.system_swap_pressure_level(7_800_000_000, 8_589_930_496) == "critical"
+            stabilityd.SYSTEM_SWAP_CRIT_BYTES = 7_200_000_000
+            assert stabilityd.system_swap_pressure_level(3_800_000_000, 8_589_930_496) == ""
+            assert stabilityd.system_swap_pressure_level(7_300_000_000, 8_589_930_496) == "critical"
+        finally:
+            stabilityd.SYSTEM_SWAP_WARN_BYTES = old_system_swap_warn_bytes
+            stabilityd.SYSTEM_SWAP_CRIT_BYTES = old_system_swap_crit_bytes
+            stabilityd.SYSTEM_SWAP_WARN_RATIO = old_system_swap_warn_ratio
+            stabilityd.SYSTEM_SWAP_CRIT_RATIO = old_system_swap_crit_ratio
     print("auth_readiness_smoke_ok")
     return 0
 
