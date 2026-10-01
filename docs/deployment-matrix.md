@@ -9,6 +9,8 @@ Install surface:
 - `.codex-plugin/plugin.json`
 - `.mcp.json`
 - `scripts/cat_agents_stability_mcp.py`
+- `bin/cat-agents-stability auth-maintenance-local`
+- `launchd/ai.flashcat.cat-agents-stability-auth-mirror.plist`
 
 Capabilities:
 
@@ -18,6 +20,8 @@ Capabilities:
 - generate workflow governance evidence for cat-brain consumption
 - inspect package status
 - fetch server package snapshot
+- run the stabilityd-owned mac-codex auth adapter; LaunchAgent is only its minute-level trigger
+- let Codex CLI itself refresh the local credential near expiry, then mirror only plan-approved access/id tokens to server runtime stores
 
 Restrictions:
 
@@ -25,6 +29,7 @@ Restrictions:
 - no automatic Gateway restart
 - no Hermers agent execution
 - no local Codex as return inbox
+- no refresh-token copy to the dev server; revoked-token or interactive-login cases require the account owner
 
 ## OpenClaw Gateway
 

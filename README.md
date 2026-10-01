@@ -11,6 +11,8 @@ cat-agents-stabilityd/
   bin/                         # Python stabilityd and CLI
   index.js                     # OpenClaw plugin tool wrapper
   scripts/cat_agents_stability_mcp.py
+  scripts/mac_codex_oauth_mirror_maintenance.py # local mac-codex adapter routed through the CLI
+  launchd/                     # macOS trigger template; policy remains in the plugin adapter
   policies/                    # Desired state and lane policy inputs
   systemd/                     # External daemon bootstrap units
   docs/                        # Governance docs and deployment matrix
@@ -45,11 +47,11 @@ bin/cat-agents-stability auth-maintenance
 
 `auth-readiness` reports redacted OAuth readiness for Codex CLI, OpenClaw OAuth profiles, and Hermers profile auth files. It records token presence, file metadata, and decoded JWT expiry only; it must not print access tokens, refresh tokens, API keys, or secrets. Expiry and refresh-token findings feed the `auth` lane so cat-brain `main` can include OAuth health in daily and 8H stability reports.
 
-OpenClaw OAuth probing defaults to agent `main` to keep the daemon lightweight. Set `CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_IDS=main,cat_claw,...` only when additional OpenClaw agent auth stores need explicit monitoring. `CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_LIMIT` and `CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_TIMEOUT_SECONDS` bound daemon cost. Use `cat-agents-stability auth-readiness --fresh` for an immediate one-off resample.
+OAuth auth targets are derived from active `trading-agents-workflow.runtime_agents` entries: Hermers profiles come from their registered profile endpoints, and OpenClaw agents come from active OpenClaw registry rows. `CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_IDS` is only an extra-scope consistency check; unregistered IDs cause a Human Gate instead of becoming mirror targets. `CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_LIMIT` and `CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_TIMEOUT_SECONDS` bound probe cost; if the limit or a failed/partial probe leaves active registry targets unobserved, source-wide mirror is gated. Use `cat-agents-stability auth-readiness --fresh` for an immediate one-off resample.
 
-`auth-maintenance` converts auth findings into a governed repair plan. It identifies mirror-from-mac-codex, reauth, sync, and token-copy-drift cleanup candidates. Default mode remains observe-only, and development-server stabilityd must not become the refresh-token owner.
+`auth-maintenance` converts auth findings into a governed repair plan. It identifies mirror-from-mac-codex, reauth, sync, and token-copy-drift cleanup candidates. The plan explicitly labels which access/id-token mirrors are eligible for the mac-codex adapter. Development-server stabilityd remains observe-only and never owns or rotates the refresh token.
 
-`cat-agents-stability auth-maintenance --dry-run --action-id codex_cli_mirror_required` shows the maintenance decision without side effects. `--execute` records blocked execution decisions unless the operator also passes `--allow-mirror` for a mirrorable action. `--allow-mirror` runs the governed mac-codex mirror script, which requires a fresh local access token, records id token freshness, writes redacted evidence, and pushes only mirrored access/id tokens plus the non-secret refresh placeholder to development-server runtime stores.
+`cat-agents-stability auth-maintenance --dry-run --action-id codex_cli_mirror_required` shows the maintenance decision without side effects. The server-side `--execute` path does not acquire or refresh credentials. The mac-codex adapter consumes only actions marked `localAutomation.eligible`, with no Human Gate, then writes redacted local status and server-side backups/evidence. It pushes only access/id tokens plus the non-secret refresh placeholder to development-server runtime stores.
 
 ### mac-codex OAuth Source
 
@@ -61,31 +63,29 @@ Run a local source preflight first:
 python3 scripts/mac_codex_oauth_mirror.py --local-preflight
 ```
 
-Apply the mirror after reviewing the summary:
+`mac_codex_oauth_mirror.py` is the stabilityd adapter's mirror implementation; it is not a separate scheduler. For the unattended path, use the plugin CLI:
 
 ```bash
-python3 scripts/mac_codex_oauth_mirror.py --apply
+bin/cat-agents-stability auth-maintenance-local
 ```
 
-The mirror script writes a server-side ops artifact and backups before mutation. It must not print token values. If access token TTL is too short, refresh local mac-codex first, then mirror again.
+The adapter follows the server-generated policy plan, refreshes through Codex CLI only in its native window, and writes a server-side ops artifact with backups before any mirror mutation. It must not print token values.
 
-The same mirror path is also available through the stability CLI on mac-codex:
+The stabilityd package owns the local maintenance adapter, available through its CLI on mac-codex:
 
 ```bash
+bin/cat-agents-stability auth-maintenance-local
 bin/cat-agents-stability auth-maintenance --fresh
 bin/cat-agents-stability auth-mirror
-bin/cat-agents-stability auth-mirror --apply
 ```
 
-Do not run the mirror from a host that lacks the canonical mac-codex Codex auth file. A failed preflight is expected when the local `id_token` is expired; refresh the mac-codex Codex login first, then run the mirror again.
+`auth-maintenance-local` checks the local auth file each minute, but fetches a fresh server plan at most every 15 minutes unless the local token generation changes. At the Codex refresh window (five minutes before access-token expiry), it waits 15 seconds and rechecks shared auth before deciding whether to invoke Codex CLI; that lets another local Codex process refresh first and avoids a redundant refresh-token use. Any CLI turn uses the fixed `CODEX_HOME`, ignores user config/rules, and disables local execution, browser, app, and image tools. Every mirror is followed by a fresh stabilityd auth-plan check; failures back off from one to fifteen minutes. It does not implement an OAuth endpoint or copy the refresh token. If the refresh token is revoked or interactive login/MFA is required, it records that the source needs user reauthentication.
 
-mac-codex also has a launchd maintenance wrapper:
+The macOS LaunchAgent is only a scheduler: it wakes this plugin CLI at login, every minute, and when `~/.codex/auth.json` changes. The adapter keeps the fixed public IP (`106.54.53.146`) as the primary SSH path and uses the dev-server Tailscale hostname only after an SSH transport failure. Latest redacted state is written to `reports/auth-mirror/latest.json`; the server-side mirror artifact contains backups, stabilityd action ids, and an index. The compatibility shell entrypoint routes into the same CLI:
 
 ```bash
 scripts/mac_codex_oauth_mirror_maintenance.sh
 ```
-
-The wrapper first asks the development server for a fresh auth-maintenance plan. It runs `auth-mirror --apply` only when that plan contains auth maintenance actions, so routine checks do not create repeated OpenClaw SQLite backups.
 
 Direct actuator authority is policy-gated, not removed. When runtime pressure is still light, stabilityd should produce structured evidence and repair candidates for Cat Brain `main`. When cron/session/worker/profile pressure threatens runtime availability, `cat-agents-stabilityd.service` is the external repair layer and may execute controlled cron stale/lease repair, eligible session reset, orphan ACP worker reap, Hermers profile lifecycle repair through the Hermers CLI adapter, and Gateway restarts. These actions require registry scope, protected-member checks, an explicit `CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_ALLOWLIST` blast-radius limit for profile lifecycle execution, cooldown/restart-storm gates where applicable, backups or action ledger entries, and post-check evidence.
 

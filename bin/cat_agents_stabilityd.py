@@ -17,6 +17,7 @@ import fcntl
 import glob
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -202,7 +203,7 @@ AUTH_WARN_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_WARN_SECONDS",
 AUTH_CRITICAL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_CRITICAL_SECONDS", str(24 * 3600)))
 AUTH_OPENCLAW_PROBE_TTL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_SECONDS", str(3600)))
 AUTH_OPENCLAW_PROBE_TIMEOUT_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_TIMEOUT_SECONDS", "8"))
-AUTH_OPENCLAW_AGENT_LIMIT = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_LIMIT", "5"))
+AUTH_OPENCLAW_AGENT_LIMIT = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_LIMIT", "32"))
 AUTH_OPENCLAW_AGENT_IDS = [
     item.strip()
     for item in os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_IDS", "").split(",")
@@ -215,7 +216,7 @@ AUTH_OPENAI_PROVIDER_IDS = {
 }
 AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS = {
     item.strip()
-    for item in os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_REQUIRED_PROVIDERS", "openai-codex").split(",")
+    for item in os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_REQUIRED_PROVIDERS", "openai-codex,openai").split(",")
     if item.strip()
 }
 AUTH_REFRESH_BROKER_ENABLED = False
@@ -223,7 +224,7 @@ AUTH_MIRROR_SCRIPT = Path(
     os.environ.get("CAT_AGENTS_STABILITY_AUTH_MIRROR_SCRIPT", str(PACKAGE_ROOT / "scripts" / "mac_codex_oauth_mirror.py"))
 )
 AUTH_MIRROR_TIMEOUT_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_MIRROR_TIMEOUT_SECONDS", "180"))
-AUTH_MIRROR_MIN_TTL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_MIRROR_MIN_TTL_SECONDS", "3600"))
+AUTH_MIRROR_MIN_TTL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_MIRROR_MIN_TTL_SECONDS", "300"))
 AUTH_MIRROR_ACTION_KINDS = {"mirror-from-mac-codex", "reauth-or-sync", "sync-or-refresh"}
 AUTH_EVIDENCE_FRESH_SECONDS = int(
     os.environ.get("CAT_AGENTS_STABILITY_AUTH_EVIDENCE_FRESH_SECONDS", str(max(POLICY_TTL_SECONDS, AUTH_OPENCLAW_PROBE_TTL_SECONDS)))
@@ -660,11 +661,11 @@ def parse_openclaw_auth_list(text: str, agent_id: str) -> Dict[str, Any]:
     }
 
 
-def cached_openclaw_auth_probe(conn: sqlite3.Connection, agent_id: str) -> Dict[str, Any]:
+def cached_openclaw_auth_probe(conn: sqlite3.Connection, agent_id: str, *, force: bool = False) -> Dict[str, Any]:
     cache_key = f"auth:openclaw:{agent_id}"
     cached = db_get(conn, cache_key, {}) or {}
     cached_epoch = int(cached.get("checkedAtEpoch") or 0) if isinstance(cached, dict) else 0
-    if cached_epoch and epoch() - cached_epoch < AUTH_OPENCLAW_PROBE_TTL_SECONDS:
+    if not force and cached_epoch and epoch() - cached_epoch < AUTH_OPENCLAW_PROBE_TTL_SECONDS:
         result = dict(cached)
         result["cached"] = True
         return result
@@ -685,7 +686,7 @@ def cached_openclaw_auth_probe(conn: sqlite3.Connection, agent_id: str) -> Dict[
             "unparsedProfileLines": parsed.get("unparsedProfileLines") or [],
         }
         if out.returncode != 0:
-            result["error"] = (out.stderr or out.stdout or "")[-1000:]
+            result["error"] = redact_auth_text(out.stderr or out.stdout or "", 1000)
     except Exception as exc:
         result = {
             "agentId": agent_id,
@@ -693,7 +694,7 @@ def cached_openclaw_auth_probe(conn: sqlite3.Connection, agent_id: str) -> Dict[
             "checkedAtEpoch": epoch(),
             "cached": False,
             "available": False,
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": redact_auth_text(f"{type(exc).__name__}: {exc}", 1000),
             "profileCount": 0,
             "profiles": [],
         }
@@ -2073,21 +2074,20 @@ def runtime_record_hermers_profile(record: Dict[str, Any]) -> str:
 def runtime_record_is_hermers_dispatch_profile(record: Dict[str, Any]) -> bool:
     values = runtime_record_adapter_values(record)
     endpoint_profile = runtime_record_hermers_profile(record)
-    hermers_like = bool(
-        {"hermers", "hermes", "hermes_acp", "hermers_acp"} & values
-        or endpoint_profile
-    )
-    acp_like = bool(
-        {"acp", "hermes_acp", "hermers_acp"} & values
-        or endpoint_profile
-    )
+    if "openclaw_route_shell" in values:
+        return False
+    hermers_like = bool({"hermers", "hermes", "hermes_acp", "hermers_acp"} & values)
+    acp_like = bool({"acp", "hermes_acp", "hermers_acp"} & values or (endpoint_profile and hermers_like))
     return hermers_like and acp_like
 
 
-def hermers_profiles_from_runtime_registry(findings: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    registry = workflow_runtime_registry_records()
+def hermers_profiles_from_runtime_registry(
+    findings: List[Dict[str, Any]], registry: Optional[Dict[str, Any]] = None
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    registry = registry if isinstance(registry, dict) else workflow_runtime_registry_records()
     records = registry.get("records") if isinstance(registry.get("records"), list) else []
     profiles: Dict[str, Dict[str, Any]] = {}
+    unparseable_record_count = 0
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -2099,7 +2099,8 @@ def hermers_profiles_from_runtime_registry(findings: List[Dict[str, Any]]) -> Tu
         if not runtime_record_is_hermers_dispatch_profile(record):
             continue
         profile = runtime_record_hermers_profile(record)
-        if not profile:
+        if not profile or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", profile):
+            unparseable_record_count += 1
             add_finding(
                 findings,
                 "hermers_profile_endpoint_unparseable",
@@ -2127,6 +2128,10 @@ def hermers_profiles_from_runtime_registry(findings: List[Dict[str, Any]]) -> Tu
         for item in profiles.values():
             item["agentIds"] = sorted(item.get("agentIds") or [])
         return profiles, {
+            "available": True,
+            "scopeComplete": unparseable_record_count == 0,
+            "unparseableRecordCount": unparseable_record_count,
+            "reason": "active-hermers-endpoint-unparseable" if unparseable_record_count else None,
             "source": "runtime_agents",
             "dbFile": registry.get("dbFile"),
             "recordCount": len(records),
@@ -2144,6 +2149,9 @@ def hermers_profiles_from_runtime_registry(findings: List[Dict[str, Any]]) -> Tu
         dbFile=registry.get("dbFile"),
     )
     return {}, {
+        "available": False,
+        "scopeComplete": False,
+        "unparseableRecordCount": unparseable_record_count,
         "source": "runtime_agents",
         "dbFile": registry.get("dbFile"),
         "reason": reason,
@@ -2661,7 +2669,7 @@ def active_openclaw_agent_ids_from_registry(registry: Dict[str, Any]) -> List[st
         can_receive = _snapshot_bool(record.get("can_receive_dispatch"), 1)
         if status != "active":
             continue
-        if runtime == "openclaw_route_shell":
+        if "openclaw_route_shell" in runtime_record_adapter_values(record):
             continue
         if runtime != "openclaw" and platform != "openclaw":
             continue
@@ -2671,15 +2679,6 @@ def active_openclaw_agent_ids_from_registry(registry: Dict[str, Any]) -> List[st
         if agent_id:
             agent_ids.add(agent_id)
     return sorted(agent_ids)
-
-
-def default_hermers_auth_profiles(hermers_profiles: Optional[Iterable[str]] = None) -> List[str]:
-    if hermers_profiles is not None:
-        return sorted({str(item) for item in hermers_profiles if str(item)})
-    profile_dir = HERMES_HOME / "profiles"
-    if not profile_dir.exists():
-        return []
-    return sorted(path.name for path in profile_dir.iterdir() if (path / "auth.json").is_file())
 
 
 def add_auth_summary_findings(
@@ -2757,6 +2756,26 @@ def openclaw_oauth_provider_groups(profiles: Iterable[Dict[str, Any]]) -> Dict[s
     return groups
 
 
+def hermers_openai_auth_candidate(summary: Dict[str, Any]) -> bool:
+    active_provider = str(summary.get("activeProvider") or "")
+    if active_provider:
+        return active_provider in AUTH_OPENAI_PROVIDER_IDS
+    provider_keys = {str(item) for item in (summary.get("providerKeys") or [])}
+    if provider_keys:
+        return bool(provider_keys & AUTH_OPENAI_PROVIDER_IDS)
+    return True
+
+
+def openclaw_required_provider_present(required: Iterable[str], available: Iterable[str]) -> bool:
+    available_ids = {str(item) for item in available}
+    aliases = {"openai-codex": "openai", "openai": "openai-codex"}
+    for provider in required:
+        provider_id = str(provider)
+        if provider_id in available_ids or aliases.get(provider_id) in available_ids:
+            return True
+    return False
+
+
 def auth_finding_is_pressure(key: str) -> bool:
     if not key.startswith(("codex_cli_oauth_", "openclaw_oauth_", "hermers_oauth_", "hermers_cat")):
         return False
@@ -2769,6 +2788,8 @@ def auth_collect(
     conn: sqlite3.Connection,
     findings: List[Dict[str, Any]],
     hermers_profiles: Optional[Iterable[str]] = None,
+    *,
+    force_openclaw_probe: bool = False,
 ) -> Dict[str, Any]:
     codex_cli = summarize_auth_json(CODEX_AUTH_PATH)
     add_auth_summary_findings(
@@ -2780,7 +2801,21 @@ def auth_collect(
         require_when_active_provider=False,
     )
 
-    profile_names = default_hermers_auth_profiles(hermers_profiles)
+    registry = workflow_runtime_registry_records()
+    hermers_registry_profiles, hermers_registry_meta = hermers_profiles_from_runtime_registry(findings, registry)
+    profile_names = sorted(hermers_registry_profiles)
+    requested_hermers_profiles = sorted({str(item) for item in hermers_profiles or [] if str(item)})
+    unregistered_hermers_profiles = sorted(set(requested_hermers_profiles) - set(profile_names))
+    if unregistered_hermers_profiles:
+        add_finding(
+            findings,
+            "hermers_auth_requested_profile_not_in_registry",
+            "warning",
+            "auth",
+            "Hermers auth inspection input contains profiles outside the active runtime_agents registry",
+            profileIds=unregistered_hermers_profiles,
+            registrySource=registry.get("source"),
+        )
     hermers_auth: Dict[str, Any] = {}
     hermers_drift_samples: List[Dict[str, Any]] = []
     for profile in profile_names:
@@ -2819,13 +2854,57 @@ def auth_collect(
             sample=hermers_drift_samples[:10],
         )
 
-    registry = workflow_runtime_registry_records()
-    openclaw_agent_ids = AUTH_OPENCLAW_AGENT_IDS or ["main"]
-    if "main" not in openclaw_agent_ids:
-        openclaw_agent_ids = ["main", *openclaw_agent_ids]
-    openclaw_agent_ids = sorted(dict.fromkeys(openclaw_agent_ids))
+    registry_openclaw_agent_ids = active_openclaw_agent_ids_from_registry(registry)
+    if "main" not in registry_openclaw_agent_ids:
+        add_finding(
+            findings,
+            "openclaw_auth_registry_missing_main",
+            "warning",
+            "auth",
+            "OpenClaw main is missing from the active runtime_agents auth scope",
+            registryAgentIds=registry_openclaw_agent_ids,
+            registrySource=registry.get("source"),
+        )
+    if "main" in registry_openclaw_agent_ids:
+        openclaw_agent_ids = ["main", *[item for item in registry_openclaw_agent_ids if item != "main"]]
+    else:
+        openclaw_agent_ids = list(registry_openclaw_agent_ids)
     requested_openclaw_agent_count = len(openclaw_agent_ids)
+    unregistered_requested_ids = sorted(set(AUTH_OPENCLAW_AGENT_IDS) - set(registry_openclaw_agent_ids))
+    if unregistered_requested_ids:
+        add_finding(
+            findings,
+            "openclaw_auth_requested_agent_not_in_registry",
+            "warning",
+            "auth",
+            "Explicit OpenClaw auth monitor IDs are not present in the active runtime_agents registry",
+            agentIds=unregistered_requested_ids,
+            registrySource=registry.get("source"),
+        )
+    if not openclaw_agent_ids:
+        add_finding(
+            findings,
+            "openclaw_auth_registry_unavailable",
+            "warning",
+            "auth",
+            "OpenClaw auth scope could not be derived from active runtime_agents rows",
+            registrySource=registry.get("source"),
+            registryError=registry.get("error"),
+        )
+    requested_openclaw_agent_ids = list(openclaw_agent_ids)
     openclaw_agent_ids = openclaw_agent_ids[: max(1, AUTH_OPENCLAW_AGENT_LIMIT)]
+    omitted_openclaw_agent_ids = sorted(set(requested_openclaw_agent_ids) - set(openclaw_agent_ids))
+    if omitted_openclaw_agent_ids:
+        add_finding(
+            findings,
+            "openclaw_oauth_probe_scope_truncated",
+            "warning",
+            "auth",
+            "OpenClaw auth probe limit excludes active runtime_agents targets",
+            omittedAgentIds=omitted_openclaw_agent_ids,
+            requestedAgentCount=requested_openclaw_agent_count,
+            probeLimit=AUTH_OPENCLAW_AGENT_LIMIT,
+        )
     openclaw_auth: Dict[str, Any] = {}
     expired_profiles: List[Dict[str, Any]] = []
     expiring_profiles: List[Dict[str, Any]] = []
@@ -2833,7 +2912,7 @@ def auth_collect(
     missing_codex_profiles: List[Dict[str, Any]] = []
     unparsed_profiles: List[Dict[str, Any]] = []
     for agent_id in openclaw_agent_ids:
-        probe = cached_openclaw_auth_probe(conn, agent_id)
+        probe = cached_openclaw_auth_probe(conn, agent_id, force=force_openclaw_probe)
         openclaw_auth[agent_id] = probe
         if not bool(probe.get("available")):
             add_finding(
@@ -2857,7 +2936,7 @@ def auth_collect(
                 }
             )
         provider_groups = openclaw_oauth_provider_groups(probe.get("profiles") or [])
-        if agent_id == "main" and AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS and not any(provider in AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS for provider in provider_groups):
+        if agent_id == "main" and AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS and not openclaw_required_provider_present(AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS, provider_groups):
             missing_codex_profiles.append({"agentId": agent_id, "requiredProviders": sorted(AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS), "providers": sorted(provider_groups)})
         for group in provider_groups.values():
             for item in group.get("unparseableProfiles") or []:
@@ -2953,13 +3032,43 @@ def auth_collect(
         "criticalSeconds": AUTH_CRITICAL_SECONDS,
         "codexCli": codex_cli,
         "hermers": {
-            "profileSource": "argument" if hermers_profiles is not None else "profile-dir-fallback",
+            "profileSource": "runtime_agents",
+            "profileRegistry": hermers_registry_meta,
+            "registryAgentProfiles": profile_names,
+            "scopeComplete": bool(hermers_registry_meta.get("scopeComplete"))
+            and not unregistered_hermers_profiles,
+            "unregisteredRequestedProfiles": unregistered_hermers_profiles,
             "profileCount": len(hermers_auth),
             "profiles": hermers_auth,
         },
         "openclaw": {
             "agentCount": len(openclaw_auth),
             "requestedAgentCount": requested_openclaw_agent_count,
+            "registryAgentIds": requested_openclaw_agent_ids,
+            "probeAgentIds": openclaw_agent_ids,
+            "omittedAgentIds": omitted_openclaw_agent_ids,
+            "scopeComplete": bool(requested_openclaw_agent_ids)
+            and "main" in requested_openclaw_agent_ids
+            and not omitted_openclaw_agent_ids
+            and not unregistered_requested_ids
+            and not unparsed_profiles
+            and all(
+                isinstance(openclaw_auth.get(agent_id), dict)
+                and openclaw_auth[agent_id].get("available") is True
+                for agent_id in openclaw_agent_ids
+            ),
+            "scopeIncompleteReason": (
+                "main-not-registered" if "main" not in requested_openclaw_agent_ids
+                else "probe-limit-exceeded" if omitted_openclaw_agent_ids
+                else "unregistered-requested-target" if unregistered_requested_ids
+                else "openclaw-probe-unavailable-or-partial" if unparsed_profiles
+                or any(
+                    not isinstance(openclaw_auth.get(agent_id), dict)
+                    or openclaw_auth[agent_id].get("available") is not True
+                    for agent_id in openclaw_agent_ids
+                )
+                else None
+            ),
             "agentLimit": AUTH_OPENCLAW_AGENT_LIMIT,
             "agents": openclaw_auth,
             "registrySource": registry.get("source"),
@@ -2981,6 +3090,7 @@ def auth_maintenance_action(
     reason: str,
     can_auto_run: bool = False,
     human_gate_required: bool = False,
+    mac_mirror_eligible: bool = False,
     evidence: Optional[Dict[str, Any]] = None,
 ) -> None:
     base_action_id = action_id
@@ -2989,6 +3099,16 @@ def auth_maintenance_action(
     while action_id in existing:
         action_id = f"{base_action_id}-{suffix}"
         suffix += 1
+    server_can_auto_run = bool(can_auto_run and AUTH_REFRESH_BROKER_ENABLED)
+    blocked_reason = (
+        ""
+        if server_can_auto_run
+        else "delegated-to-mac-codex"
+        if mac_mirror_eligible and not human_gate_required
+        else "refresh-broker-disabled"
+        if can_auto_run
+        else "manual-or-runtime-owned"
+    )
     actions.append(
         {
             "actionId": action_id,
@@ -2997,9 +3117,14 @@ def auth_maintenance_action(
             "kind": kind,
             "severity": severity,
             "reason": reason,
-            "canAutoRun": bool(can_auto_run and AUTH_REFRESH_BROKER_ENABLED),
-            "blockedReason": "" if can_auto_run and AUTH_REFRESH_BROKER_ENABLED else "refresh-broker-disabled" if can_auto_run else "manual-or-runtime-owned",
+            "canAutoRun": server_can_auto_run,
+            "blockedReason": blocked_reason,
             "humanGateRequired": bool(human_gate_required),
+            "localAutomation": {
+                "eligible": bool(mac_mirror_eligible and not human_gate_required),
+                "owner": "mac-codex",
+                "mode": "access-id-token-mirror",
+            },
             "tokenValuesRedacted": True,
             "evidence": evidence or {},
         }
@@ -3022,6 +3147,7 @@ def build_auth_maintenance_plan(auth: Dict[str, Any], findings: Iterable[Dict[st
             reason=f"Codex CLI OAuth status is {codex_status}; mirror a fresh access/id token from mac-codex",
             can_auto_run=False,
             human_gate_required=False,
+            mac_mirror_eligible=True,
             evidence={
                 "freshestAccessTokenExpiresAt": codex_cli.get("freshestAccessTokenExpiresAt"),
                 "freshestAccessTokenSecondsRemaining": codex_cli.get("freshestAccessTokenSecondsRemaining"),
@@ -3044,6 +3170,45 @@ def build_auth_maintenance_plan(auth: Dict[str, Any], findings: Iterable[Dict[st
 
     openclaw = auth.get("openclaw") if isinstance(auth.get("openclaw"), dict) else {}
     openclaw_agents = openclaw.get("agents") if isinstance(openclaw.get("agents"), dict) else {}
+    if openclaw.get("scopeComplete") is False:
+        auth_maintenance_action(
+            actions,
+            action_id="openclaw_registry_auth_scope_incomplete",
+            target="openclaw:runtime-registry-scope",
+            kind="scope-repair",
+            severity="warning",
+            reason="OpenClaw auth targets are incomplete relative to the active runtime_agents registry",
+            can_auto_run=False,
+            human_gate_required=True,
+            evidence={
+                "registryAgentIds": openclaw.get("registryAgentIds"),
+                "probeAgentIds": openclaw.get("probeAgentIds"),
+                "omittedAgentIds": openclaw.get("omittedAgentIds"),
+                "scopeIncompleteReason": openclaw.get("scopeIncompleteReason"),
+                "registrySource": openclaw.get("registrySource"),
+            },
+        )
+    hermers_auth_scope = auth.get("hermers") if isinstance(auth.get("hermers"), dict) else {}
+    hermers_registry = hermers_auth_scope.get("profileRegistry")
+    if hermers_auth_scope.get("scopeComplete") is False:
+        auth_maintenance_action(
+            actions,
+            action_id="hermers_runtime_profile_registry_unavailable",
+            target="hermers:runtime-registry",
+            kind="scope-repair",
+            severity="warning",
+            reason="Hermers OAuth profile targets could not be derived from active runtime_agents rows",
+            can_auto_run=False,
+            human_gate_required=True,
+            evidence={
+                "registrySource": hermers_registry.get("source") if isinstance(hermers_registry, dict) else None,
+                "registryError": hermers_registry.get("reason") if isinstance(hermers_registry, dict) else None,
+                "dbFile": hermers_registry.get("dbFile") if isinstance(hermers_registry, dict) else None,
+                "unparseableRecordCount": hermers_registry.get("unparseableRecordCount") if isinstance(hermers_registry, dict) else None,
+                "registryAgentProfiles": hermers_auth_scope.get("registryAgentProfiles"),
+                "unregisteredRequestedProfiles": hermers_auth_scope.get("unregisteredRequestedProfiles"),
+            },
+        )
     for agent_id, probe in sorted(openclaw_agents.items()):
         if not isinstance(probe, dict):
             continue
@@ -3074,7 +3239,8 @@ def build_auth_maintenance_plan(auth: Dict[str, Any], findings: Iterable[Dict[st
                     severity="high" if remaining is not None and int(remaining) <= 0 else "warning",
                     reason="OpenClaw OAuth profile is expired or nearing expiry",
                     can_auto_run=False,
-                    human_gate_required=True,
+                    human_gate_required=remaining is None,
+                    mac_mirror_eligible=remaining is not None and provider in AUTH_OPENAI_PROVIDER_IDS,
                     evidence={
                         "expiresAt": profile.get("expiresAt"),
                         "secondsRemaining": remaining,
@@ -3090,8 +3256,7 @@ def build_auth_maintenance_plan(auth: Dict[str, Any], findings: Iterable[Dict[st
         if not isinstance(summary, dict):
             continue
         status = auth_token_status(summary)
-        active_provider = str(summary.get("activeProvider") or "")
-        if active_provider and active_provider not in AUTH_OPENAI_PROVIDER_IDS:
+        if not hermers_openai_auth_candidate(summary):
             continue
         if status in {"access-expired", "access-critical"} and summary.get("hasRefreshToken"):
             auth_maintenance_action(
@@ -3103,6 +3268,7 @@ def build_auth_maintenance_plan(auth: Dict[str, Any], findings: Iterable[Dict[st
                 reason=f"Hermers profile OAuth status is {status}; refresh token is present",
                 can_auto_run=False,
                 human_gate_required=False,
+                mac_mirror_eligible=True,
                 evidence={
                     "activeProvider": summary.get("activeProvider"),
                     "freshestAccessTokenExpiresAt": summary.get("freshestAccessTokenExpiresAt"),
@@ -3162,12 +3328,33 @@ def build_auth_maintenance_plan(auth: Dict[str, Any], findings: Iterable[Dict[st
     status = "action-required" if actions else "ok"
     blocked_count = sum(1 for item in actions if item.get("blockedReason"))
     human_gate_count = sum(1 for item in actions if item.get("humanGateRequired"))
+    mirror_targets: Dict[str, Any] = {
+        "codexCli": codex_cli.get("exists") is True,
+        "hermersProfiles": sorted(
+            str(profile)
+            for profile, summary in hermers_profiles.items()
+            if isinstance(summary, dict) and hermers_openai_auth_candidate(summary)
+        ),
+        "openclawTargets": [],
+    }
+    for agent_id, probe in sorted(openclaw_agents.items()):
+        if not isinstance(probe, dict) or probe.get("available") is not True:
+            continue
+        for provider in sorted(openclaw_oauth_provider_groups(probe.get("profiles") or [])):
+            mirror_targets["openclawTargets"].append({"agentId": str(agent_id), "profileKind": provider})
     return {
         "schemaVersion": 1,
         "generatedAt": ts(),
         "status": status,
         "severity": severity,
         "refreshBrokerEnabled": bool(AUTH_REFRESH_BROKER_ENABLED),
+        "macCodexExecutor": {
+            "supported": True,
+            "refreshOwner": "mac-codex",
+            "mirrorMode": "access-id-token-mirror",
+            "refreshBrokerEnabled": False,
+            "targets": mirror_targets,
+        },
         "tokenValuesRedacted": True,
         "actionCount": len(actions),
         "blockedActionCount": blocked_count,
@@ -3177,7 +3364,7 @@ def build_auth_maintenance_plan(auth: Dict[str, Any], findings: Iterable[Dict[st
         "notes": [
             "Default mode is observe-only; no device-code login, token copy, or credential mutation is executed by this plan.",
             "mac-codex is the canonical OAuth refresh owner; dev-server runtimes should receive access/id-token mirrors, not reusable refresh tokens.",
-            "Use auth-maintenance --execute --allow-mirror from mac-codex to update Codex CLI, Hermers, and OpenClaw mirrors with backups and redacted evidence.",
+            "Mirror candidates marked localAutomation.eligible are executed by the mac-codex adapter; dev-server stabilityd never owns or rotates the refresh token.",
         ],
     }
 
@@ -3209,7 +3396,19 @@ def compact_mirror_summary(value: Any) -> Dict[str, Any]:
     }
 
 
-def run_mac_codex_oauth_mirror(*, apply: bool = True) -> Dict[str, Any]:
+def run_mac_codex_oauth_mirror(
+    *,
+    apply: bool = True,
+    action_ids: str = "",
+    target_scope: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if apply and platform.system() != "Darwin":
+        return {
+            "action": "mac_codex_oauth_mirror",
+            "result": "blocked",
+            "blockedReason": "mac-codex-refresh-owner-host-required",
+            "tokenValuesRedacted": True,
+        }
     script = AUTH_MIRROR_SCRIPT
     if not script.exists():
         return {
@@ -3230,6 +3429,27 @@ def run_mac_codex_oauth_mirror(*, apply: bool = True) -> Dict[str, Any]:
         cmd.append("--apply")
     else:
         cmd.append("--local-preflight")
+    if action_ids:
+        cmd.extend(["--action-ids", action_ids])
+    if target_scope is not None:
+        if not bool(target_scope.get("codexCli")):
+            cmd.append("--no-codex-cli")
+        if not bool(target_scope.get("hermersProfiles")):
+            cmd.append("--no-hermers")
+        elif isinstance(target_scope.get("hermersProfiles"), list):
+            cmd.extend(["--hermers-profiles", ",".join(str(x) for x in target_scope["hermersProfiles"])])
+        if isinstance(target_scope.get("openclawTargets"), list) and target_scope["openclawTargets"]:
+            encoded_targets = ",".join(
+                f"{item['agentId']}:{item['profileKind']}"
+                for item in target_scope["openclawTargets"]
+            )
+            cmd.extend(["--openclaw-targets", encoded_targets])
+        elif target_scope.get("openclawAgents"):
+            cmd.extend(["--openclaw-agents", ",".join(str(x) for x in target_scope["openclawAgents"])])
+            if target_scope.get("openclawProfileKinds"):
+                cmd.extend(["--openclaw-profile-kinds", ",".join(str(x) for x in target_scope["openclawProfileKinds"])])
+        else:
+            cmd.append("--no-openclaw")
     try:
         proc = run_cmd(cmd, timeout=AUTH_MIRROR_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -3294,7 +3514,6 @@ def execute_auth_maintenance_plan(
                 }
             raise
 
-        mirror_result: Optional[Dict[str, Any]] = None
         for item in selected:
             item_id = str(item.get("actionId") or "")
             kind = str(item.get("kind") or "")
@@ -3305,10 +3524,11 @@ def execute_auth_maintenance_plan(
                     "result": "dry_run",
                     "actionId": item_id,
                     "target": item.get("target"),
-                    "wouldRun": bool(allow_mirror and mirrorable),
-                    "blockedReason": item.get("blockedReason"),
+                    "wouldRun": False,
+                    "blockedReason": "mac-codex-local-executor-required" if allow_mirror and mirrorable else item.get("blockedReason"),
                     "mirrorAllowed": bool(allow_mirror),
                     "mirrorable": bool(mirrorable),
+                    "delegatedToMacCodex": bool((item.get("localAutomation") or {}).get("eligible")),
                     "tokenValuesRedacted": True,
                 }
             elif bool(item.get("humanGateRequired")):
@@ -3324,16 +3544,15 @@ def execute_auth_maintenance_plan(
                     "tokenValuesRedacted": True,
                 }
             elif allow_mirror and mirrorable:
-                if mirror_result is None:
-                    mirror_result = run_mac_codex_oauth_mirror(apply=True)
                 result = {
                     "action": "auth_refresh_broker",
-                    "result": mirror_result.get("result"),
+                    "result": "blocked",
                     "actionId": item_id,
                     "target": item.get("target"),
                     "kind": kind,
                     "mirrorAllowed": True,
-                    "mirror": mirror_result,
+                    "blockedReason": "mac-codex-local-executor-required",
+                    "delegatedToMacCodex": bool((item.get("localAutomation") or {}).get("eligible")),
                     "tokenValuesRedacted": True,
                 }
             elif not AUTH_REFRESH_BROKER_ENABLED:
@@ -6898,12 +7117,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     auth_p.add_argument("--fresh", action="store_true", help="collect a fresh auth-readiness snapshot instead of returning latest daemon evidence")
     auth_maint_p = sub.add_parser("auth-maintenance")
     auth_maint_p.add_argument("--fresh", action="store_true", help="build the maintenance plan from a fresh auth-readiness sample")
+    auth_maint_p.add_argument("--force-openclaw-probe", action="store_true", help="bypass the OpenClaw auth probe cache for post-mirror verification")
     auth_maint_p.add_argument("--execute", action="store_true", help="execute explicit auth-maintenance actions; mirror execution still requires --allow-mirror")
     auth_maint_p.add_argument("--dry-run", action="store_true", help="show auth-maintenance execution decisions without recording actions")
     auth_maint_p.add_argument("--allow-mirror", action="store_true", help="allow running the mac-codex OAuth mirror script for mirrorable actions")
     auth_maint_p.add_argument("--action-id", default="", help="execute or dry-run one maintenance action id")
     auth_mirror_p = sub.add_parser("auth-mirror")
     auth_mirror_p.add_argument("--apply", action="store_true", help="apply the mac-codex OAuth mirror; default runs the mirror script in its dry-run mode")
+    auth_mirror_p.add_argument("--action-ids", default="", help="stabilityd maintenance action ids included in remote evidence")
+    auth_mirror_p.add_argument("--no-codex-cli", dest="codex_cli", action="store_false")
+    auth_mirror_p.add_argument("--no-hermers", dest="hermers", action="store_false")
+    auth_mirror_p.add_argument("--no-openclaw", dest="openclaw", action="store_false")
+    auth_mirror_p.add_argument("--hermers-profiles", default="")
+    auth_mirror_p.add_argument("--openclaw-agents", default="")
+    auth_mirror_p.add_argument("--openclaw-profile-kinds", default="")
+    auth_mirror_p.add_argument("--openclaw-targets", default="")
+    auth_mirror_p.set_defaults(codex_cli=True, hermers=True, openclaw=True)
     sub.add_parser("profile-modes")
     sub.add_parser("desired-state")
     sub.add_parser("drift")
@@ -6954,12 +7183,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             return print_json(with_auth_freshness(latest_auth, "checkedAt", "latest"))
         conn = init_memory_kv_db()
         findings: List[Dict[str, Any]] = []
-        auth = auth_collect(conn, findings)
+        auth = auth_collect(conn, findings, force_openclaw_probe=args.fresh)
         auth["findings"] = findings
         return print_json(with_auth_freshness(auth, "checkedAt", "fresh"))
     if cmd == "auth-maintenance":
         latest = load_json(LATEST_PATH, {}) or {}
-        if args.execute and not args.fresh:
+        if (args.execute or args.force_openclaw_probe) and not args.fresh:
             args.fresh = True
         if not args.fresh:
             latest_plan = latest.get("authMaintenance") if isinstance(latest.get("authMaintenance"), dict) else load_json(AUTH_MAINTENANCE_PLAN_PATH, {}) or {}
@@ -6975,7 +7204,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             conn = init_memory_kv_db()
             findings = []
-            auth = auth_collect(conn, findings)
+            auth = auth_collect(conn, findings, force_openclaw_probe=args.force_openclaw_probe)
             plan = build_auth_maintenance_plan(auth, findings)
         if args.execute or args.dry_run:
             conn = init_db()
@@ -6990,7 +7219,35 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
         return print_json(with_auth_freshness(plan, "generatedAt", "fresh" if args.fresh else "latest"))
     if cmd == "auth-mirror":
-        return print_json(run_mac_codex_oauth_mirror(apply=args.apply))
+        scoped = bool(
+            not args.codex_cli
+            or not args.hermers
+            or not args.openclaw
+            or args.hermers_profiles
+            or args.openclaw_agents
+            or args.openclaw_profile_kinds
+            or args.openclaw_targets
+        )
+        scope = None
+        if scoped:
+            scope = {
+                "codexCli": args.codex_cli,
+                "hermersProfiles": args.hermers_profiles.split(",") if args.hermers_profiles else [],
+                "openclawTargets": [
+                    {"agentId": target.split(":", 1)[0], "profileKind": target.split(":", 1)[1]}
+                    for target in args.openclaw_targets.split(",")
+                    if ":" in target
+                ],
+                "openclawAgents": args.openclaw_agents.split(",") if args.openclaw_agents else [],
+                "openclawProfileKinds": args.openclaw_profile_kinds.split(",") if args.openclaw_profile_kinds else [],
+            }
+        return print_json(
+            run_mac_codex_oauth_mirror(
+                apply=args.apply,
+                action_ids=args.action_ids,
+                target_scope=scope,
+            )
+        )
     if cmd == "profile-modes":
         return print_json(read_json_or_empty(HERMERS_PROFILE_MODES_PATH))
     if cmd == "desired-state":

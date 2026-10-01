@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${1-}" == "auth-maintenance-local" ]]; then
+  shift
+  exec /usr/bin/python3 "${SCRIPT_DIR}/../scripts/mac_codex_oauth_mirror_maintenance.py" "$@"
+fi
 exec /usr/bin/python3 "${SCRIPT_DIR}/cat_agents_stabilityd.py" "$@"

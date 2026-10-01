@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.flashcat.cat-agents-stability-auth-mirror</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/Flashcat/cat-agents-stabilityd/bin/cat-agents-stability</string>
+		<string>auth-maintenance-local</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>WatchPaths</key>
+	<array>
+		<string>/Users/Flashcat/.codex/auth.json</string>
+	</array>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>StandardErrorPath</key>
+	<string>/Users/Flashcat/cat-agents-stabilityd/reports/auth-mirror/launchd.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/Flashcat/cat-agents-stabilityd/reports/auth-mirror/launchd.out.log</string>
+</dict>
+</plist>

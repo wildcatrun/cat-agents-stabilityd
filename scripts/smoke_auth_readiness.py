@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest import mock
 
 
 def make_jwt(exp: int, iat: int | None = None) -> str:
@@ -88,6 +89,24 @@ def main() -> int:
             ),
             encoding="utf-8",
         )
+        extra_hermers_profile = home / ".hermes" / "profiles" / "catheart"
+        extra_hermers_profile.mkdir(parents=True)
+        (extra_hermers_profile / "auth.json").write_text(
+            json.dumps(
+                {
+                    "active_provider": "openai-codex",
+                    "providers": {
+                        "openai-codex": {
+                            "tokens": {
+                                "access_token": make_jwt(now + 7200),
+                                "refresh_token": "refresh-redacted",
+                            }
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
 
         stabilityd = load_stabilityd(tmp)
         codex_summary = stabilityd.summarize_auth_json(stabilityd.CODEX_AUTH_PATH)
@@ -136,8 +155,21 @@ def main() -> int:
             "CREATE TABLE actions (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_epoch INTEGER NOT NULL, action_id TEXT, action TEXT, result TEXT, payload TEXT NOT NULL)"
         )
         conn.commit()
+        stabilityd.db_set(
+            conn,
+            "auth:openclaw:main",
+            {"agentId": "main", "checkedAtEpoch": stabilityd.epoch(), "available": True, "profiles": []},
+        )
+        with mock.patch.object(
+            stabilityd,
+            "run_cmd",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as fresh_probe_call:
+            forced_probe = stabilityd.cached_openclaw_auth_probe(conn, "main", force=True)
+        assert forced_probe["cached"] is False, forced_probe
+        fresh_probe_call.assert_called_once()
 
-        def fake_openclaw_probe(_conn, agent_id: str):
+        def fake_openclaw_probe(_conn, agent_id: str, **_kwargs):
             return {
                 "agentId": agent_id,
                 "available": True,
@@ -146,8 +178,66 @@ def main() -> int:
                 "profileCount": 2,
             }
 
+        stabilityd.workflow_runtime_registry_records = lambda: {
+            "source": "test",
+            "dbFile": "",
+            "records": [
+                {
+                    "agent_id": "catbody",
+                    "runtime": "hermes_acp",
+                    "platform": "hermers",
+                    "status": "active",
+                    "can_receive_dispatch": 1,
+                    "endpoint_ref": "hermers-profile:catbody",
+                },
+                {
+                    "agent_id": "cat_heart",
+                    "runtime": "hermes_acp",
+                    "platform": "hermers",
+                    "status": "active",
+                    "can_receive_dispatch": 1,
+                    "endpoint_ref": "hermers-profile:catheart",
+                },
+                {
+                    "agent_id": "main",
+                    "runtime": "openclaw",
+                    "platform": "openclaw",
+                    "status": "active",
+                    "can_receive_dispatch": 1,
+                },
+                {
+                    "agent_id": "cat_claw",
+                    "runtime": "openclaw",
+                    "platform": "openclaw",
+                    "status": "active",
+                    "can_receive_dispatch": 1,
+                },
+                {
+                    "agent_id": "legacy_route",
+                    "runtime": "openclaw",
+                    "platform": "openclaw",
+                    "execution_adapter": "openclaw_route_shell",
+                    "status": "active",
+                    "can_receive_dispatch": 1,
+                },
+            ],
+        }
+
+        openai_only_profile = dict(parsed["profiles"][0])
+        openai_only_profile["provider"] = "openai"
+        openai_only_profile["profileKind"] = "openai"
+        stabilityd.cached_openclaw_auth_probe = lambda _conn, agent_id, **_kwargs: {
+            "agentId": agent_id,
+            "available": True,
+            "cached": False,
+            "profiles": [openai_only_profile],
+            "profileCount": 1,
+        }
+        openai_only_findings = []
+        stabilityd.auth_collect(conn, openai_only_findings, ["catbody"])
+        assert "openclaw_oauth_required_provider_missing" not in {item["key"] for item in openai_only_findings}, openai_only_findings
+
         stabilityd.cached_openclaw_auth_probe = fake_openclaw_probe
-        stabilityd.workflow_runtime_registry_records = lambda: {"source": "test", "dbFile": "", "records": []}
         findings = []
         auth = stabilityd.auth_collect(conn, findings, ["catbody"])
         keys = {item["key"] for item in findings}
@@ -155,10 +245,82 @@ def main() -> int:
         assert "codex_cli_oauth_access_expired" in keys, findings
         assert "hermers_oauth_token_copy_drift" in keys, findings
         assert "openclaw_oauth_profile_expired" in keys, findings
+        assert "openai" in stabilityd.AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS, stabilityd.AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS
+        assert stabilityd.openclaw_required_provider_present({"openai-codex"}, {"openai"}) is True
+        assert stabilityd.openclaw_required_provider_present({"openai-codex"}, {"anthropic"}) is False
         plan = stabilityd.build_auth_maintenance_plan(auth, findings)
         action_ids = {item["actionId"] for item in plan["actions"]}
         assert plan["status"] == "action-required", plan
         assert plan["tokenValuesRedacted"] is True, plan
+        assert plan["macCodexExecutor"]["supported"] is True, plan
+        assert plan["macCodexExecutor"]["refreshBrokerEnabled"] is False, plan
+        assert plan["macCodexExecutor"]["targets"]["codexCli"] is True, plan
+        assert plan["macCodexExecutor"]["targets"]["hermersProfiles"] == ["catbody", "catheart"], plan
+        assert plan["macCodexExecutor"]["targets"]["openclawTargets"] == [
+            {"agentId": "cat_claw", "profileKind": "openai-codex"},
+            {"agentId": "main", "profileKind": "openai-codex"},
+        ], plan
+        assert auth["openclaw"]["scopeComplete"] is True, auth
+        assert auth["openclaw"]["registryAgentIds"] == ["main", "cat_claw"], auth
+        limited_findings = []
+        with mock.patch.object(stabilityd, "AUTH_OPENCLAW_AGENT_LIMIT", 1):
+            limited_auth = stabilityd.auth_collect(conn, limited_findings, ["catbody"])
+        assert limited_auth["openclaw"]["scopeComplete"] is False, limited_auth
+        assert limited_auth["openclaw"]["omittedAgentIds"] == ["cat_claw"], limited_auth
+        limited_plan = stabilityd.build_auth_maintenance_plan(limited_auth, limited_findings)
+        assert any(
+            item["actionId"] == "openclaw_registry_auth_scope_incomplete" and item["humanGateRequired"]
+            for item in limited_plan["actions"]
+        ), limited_plan
+        malformed_registry = {
+            "source": "test",
+            "dbFile": "",
+            "records": [
+                {
+                    "agent_id": "catbody",
+                    "runtime": "hermes_acp",
+                    "platform": "hermers",
+                    "status": "active",
+                    "can_receive_dispatch": 1,
+                    "endpoint_ref": "hermers-profile:catbody",
+                },
+                {
+                    "agent_id": "cat_heart",
+                    "runtime": "hermes_acp",
+                    "platform": "hermers",
+                    "status": "active",
+                    "can_receive_dispatch": 1,
+                    "endpoint_ref": "hermers-profile:",
+                },
+                {
+                    "agent_id": "old_route",
+                    "runtime": "openclaw_route_shell",
+                    "platform": "openclaw_route_shell",
+                    "status": "active",
+                    "can_receive_dispatch": 1,
+                    "endpoint_ref": "hermers-profile:oldroute",
+                },
+                {
+                    "agent_id": "main",
+                    "runtime": "openclaw",
+                    "platform": "openclaw",
+                    "status": "active",
+                    "can_receive_dispatch": 1,
+                },
+            ],
+        }
+        malformed_registry_findings = []
+        with mock.patch.object(stabilityd, "workflow_runtime_registry_records", return_value=malformed_registry):
+            malformed_registry_auth = stabilityd.auth_collect(conn, malformed_registry_findings)
+        assert malformed_registry_auth["hermers"]["scopeComplete"] is False, malformed_registry_auth
+        assert malformed_registry_auth["hermers"]["registryAgentProfiles"] == ["catbody"], malformed_registry_auth
+        malformed_registry_plan = stabilityd.build_auth_maintenance_plan(
+            malformed_registry_auth, malformed_registry_findings
+        )
+        assert any(
+            item["actionId"] == "hermers_runtime_profile_registry_unavailable" and item["humanGateRequired"]
+            for item in malformed_registry_plan["actions"]
+        ), malformed_registry_plan
         assert "codex_cli_mirror_required" in action_ids, plan
         assert "openclaw_main_openai-codex_reauth_or_sync" in action_ids, plan
         assert "openclaw_main_openai-codex_reauth_or_sync-2" not in action_ids, plan
@@ -166,46 +328,97 @@ def main() -> int:
         codex_mirror = next(item for item in plan["actions"] if item["actionId"] == "codex_cli_mirror_required")
         assert codex_mirror["kind"] == "mirror-from-mac-codex", codex_mirror
         assert codex_mirror["canAutoRun"] is False, codex_mirror
-        assert codex_mirror["blockedReason"] == "manual-or-runtime-owned", codex_mirror
+        assert codex_mirror["blockedReason"] == "delegated-to-mac-codex", codex_mirror
+        assert codex_mirror["localAutomation"] == {
+            "eligible": True,
+            "owner": "mac-codex",
+            "mode": "access-id-token-mirror",
+        }, codex_mirror
+        openclaw_sync = next(
+            item for item in plan["actions"]
+            if item["actionId"] == "openclaw_main_openai-codex_reauth_or_sync"
+        )
+        assert openclaw_sync["humanGateRequired"] is False, openclaw_sync
+        assert openclaw_sync["localAutomation"]["eligible"] is True, openclaw_sync
 
-        dry_run = stabilityd.execute_auth_maintenance_plan(conn, plan, action_id="codex_cli_mirror_required", dry_run=True)
+        expanded_plan = stabilityd.build_auth_maintenance_plan(
+            {
+                "codexCli": {"exists": True},
+                "hermers": {
+                    "profiles": {
+                        "catbody": {"activeProvider": "openai-codex"},
+                        "custom_profile": {"activeProvider": "openai"},
+                        "other_profile": {"activeProvider": "anthropic"},
+                    }
+                },
+                "openclaw": {
+                    "agents": {
+                        "main": {"available": True, "profiles": [{"provider": "openai"}]},
+                        "cat_claw": {"available": True, "profiles": [{"provider": "openai-codex"}]},
+                    }
+                },
+            },
+            [],
+        )
+        assert expanded_plan["macCodexExecutor"]["targets"] == {
+            "codexCli": True,
+            "hermersProfiles": ["catbody", "custom_profile"],
+            "openclawTargets": [
+                {"agentId": "cat_claw", "profileKind": "openai-codex"},
+                {"agentId": "main", "profileKind": "openai"},
+            ],
+        }, expanded_plan
+
+        incomplete_scope_plan = stabilityd.build_auth_maintenance_plan(
+            {
+                "codexCli": {"exists": True},
+                "hermers": {
+                    "profiles": {},
+                    "profileRegistry": {"available": False, "reason": "registry unavailable"},
+                    "scopeComplete": False,
+                    "registryAgentProfiles": [],
+                },
+                "openclaw": {
+                    "agents": {},
+                    "scopeComplete": False,
+                    "registryAgentIds": ["main", "cat_claw"],
+                    "probeAgentIds": ["main"],
+                    "omittedAgentIds": ["cat_claw"],
+                },
+            },
+            [],
+        )
+        gate_targets = {
+            item["target"] for item in incomplete_scope_plan["actions"] if item["humanGateRequired"]
+        }
+        assert "openclaw:runtime-registry-scope" in gate_targets, incomplete_scope_plan
+        assert "hermers:runtime-registry" in gate_targets, incomplete_scope_plan
+
+        dry_run = stabilityd.execute_auth_maintenance_plan(
+            conn,
+            plan,
+            action_id="codex_cli_mirror_required",
+            dry_run=True,
+            allow_mirror=True,
+        )
         assert dry_run["dryRun"] is True, dry_run
         assert dry_run["executions"][0]["result"] == "dry_run", dry_run
-        blocked_run = stabilityd.execute_auth_maintenance_plan(conn, plan, action_id="codex_cli_mirror_required", dry_run=False)
-        assert blocked_run["executions"][0]["result"] == "blocked", blocked_run
-        assert blocked_run["executions"][0]["blockedReason"] == "refresh-broker-disabled", blocked_run
-        fake_mirror = Path(tmp) / "fake_mac_codex_oauth_mirror.py"
-        fake_mirror.write_text(
-            "import json, sys\n"
-            "print(json.dumps({\n"
-            "  'schemaVersion': 1,\n"
-            "  'status': 'applied',\n"
-            "  'artifact': '/tmp/fake-artifact',\n"
-            "  'generatedAt': '2026-01-01T00:00:00Z',\n"
-            "  'targets': ['codex-cli'],\n"
-            "  'tokenValuesRedacted': True,\n"
-            "  'refreshOwner': 'mac-codex',\n"
-            "  'remoteRefreshTokenStored': False,\n"
-            "  'accessExpiresAt': '2026-01-02T00:00:00Z',\n"
-            "  'results': [{'target': 'codex-cli'}],\n"
-            "  'access_token': 'secret-access'\n"
-            "}))\n"
-            "print('refresh_token=secret-refresh', file=sys.stderr)\n",
-            encoding="utf-8",
-        )
-        stabilityd.AUTH_MIRROR_SCRIPT = fake_mirror
-        mirror_run = stabilityd.execute_auth_maintenance_plan(
+        assert dry_run["executions"][0]["wouldRun"] is False, dry_run
+        assert dry_run["executions"][0]["delegatedToMacCodex"] is True, dry_run
+        blocked_run = stabilityd.execute_auth_maintenance_plan(
             conn,
             plan,
             action_id="codex_cli_mirror_required",
             dry_run=False,
             allow_mirror=True,
         )
-        mirror_exec = mirror_run["executions"][0]
-        assert mirror_exec["result"] == "applied", mirror_run
-        assert mirror_exec["mirror"]["summary"]["status"] == "applied", mirror_run
-        assert "secret-access" not in mirror_exec["mirror"]["stdout"], mirror_run
-        assert "secret-refresh" not in mirror_exec["mirror"]["stderr"], mirror_run
+        assert blocked_run["executions"][0]["result"] == "blocked", blocked_run
+        assert blocked_run["executions"][0]["blockedReason"] == "mac-codex-local-executor-required", blocked_run
+        assert blocked_run["executions"][0]["delegatedToMacCodex"] is True, blocked_run
+        with mock.patch.object(stabilityd.platform, "system", return_value="Linux"):
+            server_mirror = stabilityd.run_mac_codex_oauth_mirror(apply=True)
+        assert server_mirror["result"] == "blocked", server_mirror
+        assert server_mirror["blockedReason"] == "mac-codex-refresh-owner-host-required", server_mirror
         gated_plan = {
             "actions": [
                 {
@@ -230,6 +443,20 @@ def main() -> int:
         assert "secret-a" not in redacted and "secret-r" not in redacted and "secret-i" not in redacted, redacted
 
         mirror_script = Path(__file__).resolve().parent / "mac_codex_oauth_mirror.py"
+        mirror_spec = importlib.util.spec_from_file_location("mac_codex_oauth_mirror_smoke", mirror_script)
+        assert mirror_spec is not None and mirror_spec.loader is not None
+        mirror_module = importlib.util.module_from_spec(mirror_spec)
+        mirror_spec.loader.exec_module(mirror_module)
+        compile(mirror_module.REMOTE_RECEIVER, "remote_mac_codex_oauth_mirror_receiver", "exec")
+        assert mirror_module.parse_openclaw_targets("main:openai,cat_claw:openai-codex") == [
+            {"agentId": "main", "profileKind": "openai"},
+            {"agentId": "cat_claw", "profileKind": "openai-codex"},
+        ]
+        try:
+            mirror_module.parse_openclaw_targets("../../.codex:openai")
+            raise AssertionError("unsafe OpenClaw target should be rejected")
+        except SystemExit:
+            pass
         fake_source_auth = Path(tmp) / "source-auth.json"
         future_exp = now + 7 * 86400
         fake_source_auth.write_text(
@@ -306,7 +533,7 @@ def main() -> int:
         assert dummy_preflight.returncode != 0, dummy_preflight.stdout
         assert "mirror refresh placeholder" in dummy_preflight.stderr, dummy_preflight.stderr
 
-        stabilityd.AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS = {"openai"}
+        stabilityd.AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS = {"anthropic"}
         findings = []
         missing_required_auth = stabilityd.auth_collect(conn, findings, ["catbody"])
         keys = {item["key"] for item in findings}
@@ -321,7 +548,7 @@ def main() -> int:
             "main",
         )
 
-        def fake_openclaw_fresh_probe(_conn, agent_id: str):
+        def fake_openclaw_fresh_probe(_conn, agent_id: str, **_kwargs):
             return {
                 "agentId": agent_id,
                 "available": True,

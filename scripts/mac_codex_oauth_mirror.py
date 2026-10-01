@@ -15,6 +15,8 @@ import datetime as dt
 import json
 import os
 import pathlib
+import platform
+import re
 import shlex
 import socket
 import subprocess
@@ -24,12 +26,16 @@ from typing import Any
 
 
 DUMMY_REFRESH = "MAC_CODEX_BROKER_REFRESH_DISABLED"
+SAFE_RUNTIME_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 DEFAULT_SERVER = "flashcat@106.54.53.146"
+DEFAULT_FALLBACK_SERVER = "flashcat@dev-server.tail8e094d.ts.net"
 DEFAULT_SSH_KEY = "/Users/Flashcat/.ssh/openclaw_server"
 DEFAULT_HERMERS_PROFILES = "catbody,catears,cateyes,catheart,catnose,catpenclaw"
 DEFAULT_OPENCLAW_AGENTS = "main"
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 DEFAULT_ARTIFACT_ROOT = "/home/flashcat/multi-agent-hedge-fund-framework/ops-artifacts/codex-working"
+DEFAULT_REMOTE_CODEX_AUTH = "/home/flashcat/.codex/auth.json"
+CANONICAL_LOCAL_CODEX_AUTH = pathlib.Path("/Users/Flashcat/.codex/auth.json")
 
 
 REMOTE_RECEIVER = r"""
@@ -38,9 +44,9 @@ import datetime as dt
 import json
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
-import stat
 import sys
 import tempfile
 import time
@@ -60,7 +66,35 @@ def exp_iso(exp):
     return dt.datetime.fromtimestamp(int(exp), dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 def ensure_dir(path):
-    pathlib.Path(path).mkdir(parents=True, exist_ok=True)
+    target = pathlib.Path(path)
+    if target.is_symlink():
+        raise ValueError("symlink-directory-target")
+    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if target.is_symlink():
+        raise ValueError("symlink-directory-target")
+    os.chmod(target, 0o700)
+
+def safe_target_path(root, target, label):
+    root_path = pathlib.Path(root)
+    target_path = pathlib.Path(target)
+    if root_path.is_symlink() or root_path.resolve() != root_path.absolute():
+        raise ValueError("symlink-" + label + "-root")
+    root_real = root_path.resolve()
+    try:
+        relative = target_path.relative_to(root_path)
+    except ValueError as exc:
+        raise ValueError("outside-" + label + "-root") from exc
+    cursor = root_path
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError("symlink-" + label + "-target")
+    resolved = target_path.resolve()
+    try:
+        resolved.relative_to(root_real)
+    except ValueError as exc:
+        raise ValueError("outside-" + label + "-root") from exc
+    return target_path
 
 def read_json(path, default):
     p = pathlib.Path(path)
@@ -93,21 +127,32 @@ def backup_file(path, backup_dir, label):
         return None
     ensure_dir(backup_dir)
     dest = pathlib.Path(backup_dir) / label
-    shutil.copy2(p, dest)
-    try:
-        os.chmod(dest, stat.S_IMODE(p.stat().st_mode) or 0o600)
-    except Exception:
-        os.chmod(dest, 0o600)
+    if dest.exists() or dest.is_symlink():
+        raise ValueError("backup-destination-already-exists")
+    shutil.copyfile(p, dest)
+    os.chmod(dest, 0o600)
     return str(dest)
 
 def backup_sqlite(path, backup_dir, label):
-    backups = []
-    for suffix in ("", "-wal", "-shm"):
-        src = pathlib.Path(path + suffix)
-        if src.exists():
-            dest_name = label + suffix.replace("-", ".")
-            backups.append(backup_file(src, backup_dir, dest_name))
-    return [item for item in backups if item]
+    source_path = pathlib.Path(path)
+    if not source_path.exists():
+        return []
+    ensure_dir(backup_dir)
+    dest = pathlib.Path(backup_dir) / label
+    if dest.exists() or dest.is_symlink():
+        raise ValueError("backup-destination-already-exists")
+    source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True, timeout=30)
+    target = sqlite3.connect(str(dest), timeout=30)
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+    os.chmod(dest, 0o600)
+    return [str(dest)]
+
+def safe_runtime_id(value):
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) is not None
 
 def mirror_tokens(payload):
     tokens = payload["tokens"]
@@ -118,7 +163,11 @@ def mirror_tokens(payload):
     }
 
 def apply_codex_cli(payload, artifact, dry_run):
+    root = pathlib.Path("/home/flashcat/.codex")
     path = pathlib.Path(payload.get("remoteCodexAuthPath") or "/home/flashcat/.codex/auth.json")
+    if path != root / "auth.json":
+        raise ValueError("invalid-remote-codex-auth-path")
+    path = safe_target_path(root, path, "codex-auth")
     backup = None if dry_run else backup_file(path, artifact / "backups", "codex-cli.auth.json")
     existing = read_json(path, {})
     mirrored = {
@@ -170,8 +219,16 @@ def hermers_entry(payload):
 
 def apply_hermers(payload, artifact, dry_run):
     results = []
+    profiles_root = pathlib.Path("/home/flashcat/.hermes/profiles")
+    if profiles_root.is_symlink():
+        raise ValueError("symlink-hermes-profiles-root")
     for profile in payload.get("hermersProfiles", []):
-        path = pathlib.Path(f"/home/flashcat/.hermes/profiles/{profile}/auth.json")
+        if not safe_runtime_id(profile):
+            raise ValueError("unsafe-hermers-profile-id")
+        profile_dir = profiles_root / profile
+        path = safe_target_path(profiles_root, profile_dir / "auth.json", "hermes-profile")
+        if not profile_dir.is_dir() or not path.is_file():
+            raise ValueError("missing-hermes-profile-auth")
         backup = None if dry_run else backup_file(path, artifact / "backups", f"hermers-{profile}.auth.json")
         auth = read_json(path, {"version": 1})
         if not isinstance(auth, dict):
@@ -218,14 +275,39 @@ def apply_hermers(payload, artifact, dry_run):
 
 def apply_openclaw(payload, artifact, dry_run):
     results = []
-    profile_kinds = payload.get("openclawProfileKinds") or ["openai", "openai-codex"]
-    for agent_id in payload.get("openclawAgents", []):
-        db_path = f"/home/flashcat/.openclaw/agents/{agent_id}/agent/openclaw-agent.sqlite"
-        if not pathlib.Path(db_path).exists():
-            results.append({"target": f"openclaw:{agent_id}", "missing": True, "path": db_path})
+    agents_root = pathlib.Path("/home/flashcat/.openclaw/agents")
+    if agents_root.is_symlink():
+        raise ValueError("symlink-openclaw-agents-root")
+    target_pairs = payload.get("openclawTargets")
+    if not target_pairs:
+        profile_kinds = payload.get("openclawProfileKinds") or ["openai", "openai-codex"]
+        target_pairs = [
+            {"agentId": agent_id, "profileKind": profile_kind}
+            for agent_id in payload.get("openclawAgents", [])
+            for profile_kind in profile_kinds
+        ]
+    targets_by_agent = {}
+    for item in target_pairs:
+        if not isinstance(item, dict):
+            raise ValueError("invalid-openclaw-target")
+        agent_id = item.get("agentId")
+        profile_kind = item.get("profileKind")
+        if not safe_runtime_id(agent_id) or profile_kind not in {"openai", "openai-codex"}:
+            raise ValueError("unsafe-openclaw-target")
+        targets_by_agent.setdefault(agent_id, set()).add(profile_kind)
+    for agent_id, profile_kinds_set in sorted(targets_by_agent.items()):
+        profile_kinds = sorted(profile_kinds_set)
+        agent_dir = agents_root / agent_id
+        agent_state_dir = agent_dir / "agent"
+        db_path = agent_state_dir / "openclaw-agent.sqlite"
+        db_path = safe_target_path(agents_root, db_path, "openclaw-agent")
+        if agent_dir.is_symlink() or agent_state_dir.is_symlink() or db_path.is_symlink():
+            raise ValueError("symlink-openclaw-agent-target")
+        if not db_path.exists():
+            results.append({"target": f"openclaw:{agent_id}", "missing": True, "path": str(db_path)})
             continue
-        backups = [] if dry_run else backup_sqlite(db_path, artifact / "backups", f"openclaw-{agent_id}.sqlite")
-        conn = sqlite3.connect(db_path)
+        backups = [] if dry_run else backup_sqlite(str(db_path), artifact / "backups", f"openclaw-{agent_id}.sqlite")
+        conn = sqlite3.connect(str(db_path), timeout=30)
         try:
             row = conn.execute(
                 "select store_json from auth_profile_store where store_key='primary'"
@@ -285,7 +367,7 @@ def apply_openclaw(payload, artifact, dry_run):
                 )
                 conn.commit()
             results.append({
-                "target": f"openclaw:{agent_id}",
+                "target": f"openclaw:{agent_id}:{','.join(profile_kinds)}",
                 "path": db_path,
                 "backups": backups,
                 "updatedProfiles": updated_keys,
@@ -314,9 +396,14 @@ def main():
         results.extend(apply_hermers(payload, artifact, dry_run))
     if "openclaw" in targets:
         results.extend(apply_openclaw(payload, artifact, dry_run))
+    incomplete = [
+        item for item in results
+        if item.get("missing") is True or (not dry_run and item.get("written") is not True)
+    ]
+    status = "dry-run" if dry_run else "partial-failure" if incomplete else "applied"
     summary = {
         "schemaVersion": 1,
-        "status": "dry-run" if dry_run else "applied",
+        "status": status,
         "artifact": str(artifact),
         "generatedAt": iso_now(),
         "source": payload.get("source"),
@@ -324,14 +411,18 @@ def main():
         "tokenValuesRedacted": True,
         "refreshOwner": "mac-codex",
         "remoteRefreshTokenStored": False,
+        "stabilityActionIds": [
+            str(item) for item in (payload.get("stabilityActionIds") or []) if str(item)
+        ],
         "accessExpiresAt": payload["accessExpiresAt"],
         "results": results,
     }
     (artifact / "index.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 1 if incomplete and not dry_run else 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 """
 
 
@@ -365,6 +456,72 @@ def inspect_jwt_expiry(token: str, label: str) -> tuple[int, int]:
     claims = decode_jwt(token, label)
     exp = int(claims.get("exp") or 0)
     return exp, exp - int(time.time())
+
+
+def inspect_codex_auth(path: pathlib.Path) -> dict[str, Any]:
+    """Return local mac-codex token timing without exposing token values."""
+    if not path.exists():
+        return {"status": "missing-auth-file", "path": str(path), "tokenValuesRedacted": True}
+    try:
+        data = json.loads(path.read_text())
+    except Exception as exc:
+        return {
+            "status": "invalid-auth-file",
+            "path": str(path),
+            "errorType": type(exc).__name__,
+            "tokenValuesRedacted": True,
+        }
+    tokens = data.get("tokens") if isinstance(data, dict) else None
+    if not isinstance(tokens, dict):
+        return {"status": "missing-tokens", "path": str(path), "tokenValuesRedacted": True}
+    access_token = tokens.get("access_token")
+    id_token = tokens.get("id_token")
+    refresh_token = tokens.get("refresh_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        return {"status": "missing-access-token", "path": str(path), "tokenValuesRedacted": True}
+    try:
+        access_exp, access_remaining = inspect_jwt_expiry(access_token, "access_token")
+    except Exception as exc:
+        return {
+            "status": "invalid-access-token",
+            "path": str(path),
+            "errorType": type(exc).__name__,
+            "tokenValuesRedacted": True,
+        }
+    id_exp = 0
+    id_remaining = None
+    if isinstance(id_token, str) and id_token.strip():
+        try:
+            id_exp, id_remaining = inspect_jwt_expiry(id_token, "id_token")
+        except Exception:
+            id_exp, id_remaining = 0, None
+    refresh_present = (
+        isinstance(refresh_token, str)
+        and bool(refresh_token.strip())
+        and refresh_token != DUMMY_REFRESH
+    )
+    try:
+        auth_mtime_epoch = int(path.stat().st_mtime)
+    except OSError:
+        auth_mtime_epoch = None
+    return {
+        "schemaVersion": 1,
+        "status": "ok",
+        "path": str(path),
+        "mode": oct(path.stat().st_mode & 0o777),
+        "authMode": data.get("auth_mode"),
+        "lastRefresh": data.get("last_refresh"),
+        "authMtimeEpoch": auth_mtime_epoch,
+        "accessExpiresAt": iso_from_epoch(access_exp),
+        "accessSecondsRemaining": access_remaining,
+        "idExpiresAt": iso_from_epoch(id_exp),
+        "idSecondsRemaining": id_remaining,
+        "idTokenFresh": id_remaining is not None and id_remaining > 0,
+        "refreshTokenPresent": refresh_present,
+        "refreshOwner": "mac-codex" if refresh_present else None,
+        "remoteRefreshTokenStored": False,
+        "tokenValuesRedacted": True,
+    }
 
 
 def load_codex_auth(path: pathlib.Path, min_ttl_seconds: int) -> dict[str, Any]:
@@ -409,6 +566,26 @@ def split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def parse_openclaw_targets(value: str) -> list[dict[str, str]]:
+    targets = []
+    for item in split_csv(value):
+        parts = item.split(":")
+        if (
+            len(parts) != 2
+            or not SAFE_RUNTIME_ID.fullmatch(parts[0])
+            or parts[1] not in {"openai", "openai-codex"}
+        ):
+            raise SystemExit("invalid or unsafe OpenClaw mirror target")
+        targets.append({"agentId": parts[0], "profileKind": parts[1]})
+    return targets
+
+
+def validate_runtime_ids(values: list[str], label: str) -> list[str]:
+    if any(not SAFE_RUNTIME_ID.fullmatch(item) for item in values):
+        raise SystemExit(f"invalid or unsafe {label} id")
+    return values
+
+
 def build_payload(args: argparse.Namespace) -> dict[str, Any]:
     auth_path = pathlib.Path(args.codex_auth).expanduser()
     source = load_codex_auth(auth_path, args.min_ttl_seconds)
@@ -419,6 +596,18 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         targets.append("hermers")
     if args.openclaw:
         targets.append("openclaw")
+    hermers_profiles = validate_runtime_ids(split_csv(args.hermers_profiles), "Hermes profile")
+    openclaw_agents = validate_runtime_ids(split_csv(args.openclaw_agents), "OpenClaw agent")
+    openclaw_profile_kinds = split_csv(args.openclaw_profile_kinds)
+    if any(item not in {"openai", "openai-codex"} for item in openclaw_profile_kinds):
+        raise SystemExit("unsupported OpenClaw OAuth provider kind")
+    openclaw_targets = parse_openclaw_targets(args.openclaw_targets)
+    if args.openclaw and not openclaw_targets:
+        openclaw_targets = [
+            {"agentId": agent_id, "profileKind": profile_kind}
+            for agent_id in openclaw_agents
+            for profile_kind in openclaw_profile_kinds
+        ]
     return {
         "schemaVersion": 1,
         "source": {
@@ -437,9 +626,11 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         "idExpiresAt": source["idExpiresAt"],
         "idSecondsRemaining": source["idSecondsRemaining"],
         "idTokenFresh": source["idTokenFresh"],
-        "hermersProfiles": split_csv(args.hermers_profiles),
-        "openclawAgents": split_csv(args.openclaw_agents),
-        "openclawProfileKinds": split_csv(args.openclaw_profile_kinds),
+        "hermersProfiles": hermers_profiles,
+        "openclawAgents": openclaw_agents,
+        "openclawProfileKinds": openclaw_profile_kinds,
+        "openclawTargets": openclaw_targets,
+        "stabilityActionIds": split_csv(args.stability_action_ids),
         "artifactRoot": args.artifact_root,
         "remoteCodexAuthPath": args.remote_codex_auth,
     }
@@ -447,23 +638,88 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
 
 def run_remote(args: argparse.Namespace, payload: dict[str, Any]) -> int:
     command = ["python3", "-c", REMOTE_RECEIVER]
-    ssh_cmd = ["ssh"]
-    if args.ssh_key:
-        ssh_cmd.extend(["-i", args.ssh_key])
-    ssh_cmd.extend(["-o", "BatchMode=yes", args.server, shlex.join(command)])
-    proc = subprocess.run(
-        ssh_cmd,
-        input=json.dumps(payload),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=args.timeout,
-    )
-    if proc.stdout:
-        print(proc.stdout, end="")
-    if proc.stderr:
-        print(proc.stderr, end="", file=sys.stderr)
-    return proc.returncode
+    servers = [args.server]
+    if args.fallback_server and args.fallback_server not in servers:
+        servers.append(args.fallback_server)
+    for index, server in enumerate(servers):
+        ssh_cmd = ["ssh"]
+        if args.ssh_key:
+            ssh_cmd.extend(["-i", args.ssh_key])
+        ssh_cmd.extend(
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "ConnectTimeout=8",
+                "-o",
+                "ServerAliveInterval=5",
+                "-o",
+                "ServerAliveCountMax=2",
+                server,
+                shlex.join(command),
+            ]
+        )
+        try:
+            proc = subprocess.run(
+                ssh_cmd,
+                input=json.dumps(payload),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=args.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            print(
+                json.dumps(
+                    {
+                        "status": "remote-timeout",
+                        "server": server,
+                        "fallbackAttempted": False,
+                        "fallbackAvailable": index + 1 < len(servers),
+                        "tokenValuesRedacted": True,
+                    }
+                ),
+                file=sys.stderr,
+            )
+            return 124
+        if proc.returncode == 0:
+            if proc.stdout:
+                print(proc.stdout, end="")
+            if proc.stderr:
+                print(proc.stderr, end="", file=sys.stderr)
+            return 0
+        transport_errors = (
+            "network is unreachable",
+            "no route to host",
+            "connect timed out",
+            "connection timed out",
+            "connection refused",
+            "could not resolve hostname",
+        )
+        is_transport_failure = any(
+            marker in proc.stderr.lower() for marker in transport_errors
+        )
+        if is_transport_failure and index + 1 < len(servers):
+            print(
+                json.dumps(
+                    {
+                        "status": "transport-fallback",
+                        "failedServer": server,
+                        "nextServer": servers[index + 1],
+                        "tokenValuesRedacted": True,
+                    }
+                ),
+                file=sys.stderr,
+            )
+            continue
+        if proc.stdout:
+            print(proc.stdout, end="")
+        if proc.stderr:
+            print(proc.stderr, end="", file=sys.stderr)
+        return proc.returncode
+    return 255
 
 
 def parse_args() -> argparse.Namespace:
@@ -471,19 +727,23 @@ def parse_args() -> argparse.Namespace:
         description="Mirror mac-codex OAuth access/id tokens to dev-server runtime stores without copying refresh tokens."
     )
     parser.add_argument("--server", default=DEFAULT_SERVER)
+    parser.add_argument("--fallback-server", default=DEFAULT_FALLBACK_SERVER)
     parser.add_argument("--ssh-key", default=DEFAULT_SSH_KEY)
     parser.add_argument("--codex-auth", default=os.path.expanduser("~/.codex/auth.json"))
     parser.add_argument("--artifact-root", default=DEFAULT_ARTIFACT_ROOT)
-    parser.add_argument("--remote-codex-auth", default="/home/flashcat/.codex/auth.json")
+    parser.add_argument("--remote-codex-auth", default=DEFAULT_REMOTE_CODEX_AUTH)
     parser.add_argument("--hermers-profiles", default=DEFAULT_HERMERS_PROFILES)
     parser.add_argument("--openclaw-agents", default=DEFAULT_OPENCLAW_AGENTS)
     parser.add_argument("--openclaw-profile-kinds", default="openai,openai-codex")
-    parser.add_argument("--min-ttl-seconds", type=int, default=3600)
+    parser.add_argument("--openclaw-targets", default="", help="precise agent/provider pairs as agent:provider,agent:provider")
+    parser.add_argument("--action-ids", dest="stability_action_ids", default="", help="stabilityd auth-maintenance action ids included in the mirror evidence")
+    parser.add_argument("--min-ttl-seconds", type=int, default=300)
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--apply", action="store_true", help="write remote stores; default validates local mac-codex auth without connecting to the development server")
     parser.add_argument("--remote-dry-run", action="store_true", help="connect to the development server and run the remote receiver in dry-run mode")
     parser.add_argument("--local-preflight", action="store_true", help="validate local mac-codex auth and print a redacted summary without connecting to the development server")
     parser.add_argument("--json-only", action="store_true", help="print only the final JSON payload")
+    parser.add_argument("--inspect-auth", action="store_true", help="print redacted mac-codex token expiry metadata without connecting or requiring unexpired tokens")
     parser.add_argument("--no-codex-cli", dest="codex_cli", action="store_false")
     parser.add_argument("--no-hermers", dest="hermers", action="store_false")
     parser.add_argument("--no-openclaw", dest="openclaw", action="store_false")
@@ -493,6 +753,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.inspect_auth:
+        print(json.dumps(inspect_codex_auth(pathlib.Path(args.codex_auth).expanduser()), ensure_ascii=False, indent=2))
+        return 0
+    if args.apply and platform.system() != "Darwin":
+        raise SystemExit("OAuth mirror apply is restricted to the mac-codex refresh-owner host")
+    if args.apply and pathlib.Path(args.codex_auth).expanduser().resolve() != CANONICAL_LOCAL_CODEX_AUTH:
+        raise SystemExit("OAuth mirror apply is restricted to /Users/Flashcat/.codex/auth.json")
+    if args.remote_codex_auth != DEFAULT_REMOTE_CODEX_AUTH:
+        raise SystemExit("remote Codex mirror destination is fixed by stabilityd policy")
     payload = build_payload(args)
     local_preflight = bool(args.local_preflight or (not args.apply and not args.remote_dry_run))
     local_summary = {
