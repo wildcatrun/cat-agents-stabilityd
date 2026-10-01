@@ -204,6 +204,7 @@ def main() -> int:
                     "platform": "openclaw",
                     "status": "active",
                     "can_receive_dispatch": 1,
+                    "endpoint_ref": "openclaw-agent:main",
                 },
                 {
                     "agent_id": "cat_claw",
@@ -211,7 +212,10 @@ def main() -> int:
                     "platform": "openclaw",
                     "status": "active",
                     "can_receive_dispatch": 1,
+                    "endpoint_ref": "openclaw-agent:cat_claw",
                 },
+                {"agent_id": "cat_brain", "runtime": "openclaw", "platform": "openclaw", "status": "active", "can_receive_dispatch": 1},
+                {"agent_id": "openclaw:cat_claw", "runtime": "openclaw", "platform": "openclaw", "status": "active", "can_receive_dispatch": 1},
                 {
                     "agent_id": "legacy_route",
                     "runtime": "openclaw",
@@ -260,8 +264,16 @@ def main() -> int:
             {"agentId": "cat_claw", "profileKind": "openai-codex"},
             {"agentId": "main", "profileKind": "openai-codex"},
         ], plan
+        assert plan["humanGateActionCount"] == 0, plan
         assert auth["openclaw"]["scopeComplete"] is True, auth
         assert auth["openclaw"]["registryAgentIds"] == ["main", "cat_claw"], auth
+        assert {item["agentId"] for item in auth["openclaw"]["unaddressableRegistryRows"]} == {
+            "cat_brain", "openclaw:cat_claw"
+        }, auth
+        assert {
+            item["agentId"]
+            for item in plan["macCodexExecutor"]["scopeWarnings"]["openclawUnaddressableRegistryRows"]
+        } == {"cat_brain", "openclaw:cat_claw"}, plan
         limited_findings = []
         with mock.patch.object(stabilityd, "AUTH_OPENCLAW_AGENT_LIMIT", 1):
             limited_auth = stabilityd.auth_collect(conn, limited_findings, ["catbody"])
@@ -306,6 +318,7 @@ def main() -> int:
                     "platform": "openclaw",
                     "status": "active",
                     "can_receive_dispatch": 1,
+                    "endpoint_ref": "openclaw-agent:main",
                 },
             ],
         }

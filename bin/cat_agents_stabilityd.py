@@ -2681,6 +2681,39 @@ def active_openclaw_agent_ids_from_registry(registry: Dict[str, Any]) -> List[st
     return sorted(agent_ids)
 
 
+def openclaw_auth_scope_from_registry(registry: Dict[str, Any]) -> Tuple[List[str], List[Dict[str, Any]]]:
+    records = registry.get("records") if isinstance(registry.get("records"), list) else []
+    agent_ids = set()
+    unaddressable: List[Dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("status") or "").strip() != "active":
+            continue
+        values = runtime_record_adapter_values(record)
+        if "openclaw_route_shell" in values:
+            continue
+        if str(record.get("runtime") or "").strip() != "openclaw" and str(record.get("platform") or "").strip() != "openclaw":
+            continue
+        if _snapshot_bool(record.get("can_receive_dispatch"), 1) == 0:
+            continue
+        agent_id = str(record.get("agent_id") or "").strip()
+        endpoint_ref = str(record.get("endpoint_ref") or "").strip()
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", agent_id)
+            or endpoint_ref != f"openclaw-agent:{agent_id}"
+        ):
+            unaddressable.append({
+                "agentId": agent_id or None,
+                "endpointRef": endpoint_ref or None,
+                "runtime": record.get("runtime"),
+                "platform": record.get("platform"),
+            })
+            continue
+        agent_ids.add(agent_id)
+    return sorted(agent_ids), unaddressable
+
+
 def add_auth_summary_findings(
     findings: List[Dict[str, Any]],
     *,
@@ -2854,7 +2887,17 @@ def auth_collect(
             sample=hermers_drift_samples[:10],
         )
 
-    registry_openclaw_agent_ids = active_openclaw_agent_ids_from_registry(registry)
+    registry_openclaw_agent_ids, unaddressable_openclaw_rows = openclaw_auth_scope_from_registry(registry)
+    if unaddressable_openclaw_rows:
+        add_finding(
+            findings,
+            "openclaw_auth_registry_rows_unaddressable",
+            "warning",
+            "auth",
+            "Active OpenClaw runtime_agents rows without a valid runtime-owned endpoint were excluded from auth targets",
+            rows=unaddressable_openclaw_rows[:20],
+            registrySource=registry.get("source"),
+        )
     if "main" not in registry_openclaw_agent_ids:
         add_finding(
             findings,
@@ -3045,6 +3088,7 @@ def auth_collect(
             "agentCount": len(openclaw_auth),
             "requestedAgentCount": requested_openclaw_agent_count,
             "registryAgentIds": requested_openclaw_agent_ids,
+            "unaddressableRegistryRows": unaddressable_openclaw_rows,
             "probeAgentIds": openclaw_agent_ids,
             "omittedAgentIds": omitted_openclaw_agent_ids,
             "scopeComplete": bool(requested_openclaw_agent_ids)
@@ -3184,6 +3228,7 @@ def build_auth_maintenance_plan(auth: Dict[str, Any], findings: Iterable[Dict[st
                 "registryAgentIds": openclaw.get("registryAgentIds"),
                 "probeAgentIds": openclaw.get("probeAgentIds"),
                 "omittedAgentIds": openclaw.get("omittedAgentIds"),
+                "unaddressableRegistryRows": openclaw.get("unaddressableRegistryRows"),
                 "scopeIncompleteReason": openclaw.get("scopeIncompleteReason"),
                 "registrySource": openclaw.get("registrySource"),
             },
@@ -3354,6 +3399,11 @@ def build_auth_maintenance_plan(auth: Dict[str, Any], findings: Iterable[Dict[st
             "mirrorMode": "access-id-token-mirror",
             "refreshBrokerEnabled": False,
             "targets": mirror_targets,
+            "scopeWarnings": {
+                "openclawUnaddressableRegistryRows": openclaw.get("unaddressableRegistryRows") or [],
+                "hermersUnparseableRegistryRecords": hermers_registry.get("unparseableRecordCount", 0)
+                if isinstance(hermers_registry, dict) else 0,
+            },
         },
         "tokenValuesRedacted": True,
         "actionCount": len(actions),
