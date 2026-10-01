@@ -8,11 +8,19 @@ import unittest
 import datetime as dt
 import tempfile
 import json
+import importlib.util
 from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import mac_codex_oauth_mirror_maintenance as maintenance
 import mac_codex_oauth_mirror as mirror_cli
+
+_stabilityd_path = pathlib.Path(__file__).resolve().parents[1] / "bin" / "cat_agents_stabilityd.py"
+_stabilityd_spec = importlib.util.spec_from_file_location("cat_agents_stabilityd_cli_test", _stabilityd_path)
+assert _stabilityd_spec and _stabilityd_spec.loader
+stabilityd_cli = importlib.util.module_from_spec(_stabilityd_spec)
+sys.modules[_stabilityd_spec.name] = stabilityd_cli
+_stabilityd_spec.loader.exec_module(stabilityd_cli)
 
 
 class MirrorDecisionTests(unittest.TestCase):
@@ -434,6 +442,17 @@ class MirrorDecisionTests(unittest.TestCase):
             maintenance.run_mirror(["codex_cli_mirror_required"], {"codexCli": True, "hermersProfiles": [], "openclawTargets": []})
         self.assertIn("--codex-auth", run.call_args.args[0])
         self.assertIn(str(maintenance.AUTH_PATH), run.call_args.args[0])
+
+    def test_auth_mirror_cli_accepts_and_forwards_canonical_auth_path(self):
+        auth_path = "/Users/Flashcat/.codex/auth.json"
+        completed = subprocess.CompletedProcess([], 0, '{"status":"ok"}', "")
+        with mock.patch.object(stabilityd_cli.platform, "system", return_value="Darwin"):
+            with mock.patch.object(stabilityd_cli, "run_cmd", return_value=completed) as run:
+                stabilityd_cli.main(["auth-mirror", "--apply", "--codex-auth", auth_path])
+        command = run.call_args.args[0]
+        self.assertIn("--apply", command)
+        self.assertIn("--codex-auth", command)
+        self.assertEqual(command[command.index("--codex-auth") + 1], auth_path)
 
     def test_remote_plan_fetch_bypasses_openclaw_auth_probe_cache(self):
         plan = {"schemaVersion": 1, "actions": []}

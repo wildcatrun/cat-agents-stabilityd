@@ -3451,6 +3451,7 @@ def run_mac_codex_oauth_mirror(
     apply: bool = True,
     action_ids: str = "",
     target_scope: Optional[Dict[str, Any]] = None,
+    codex_auth: str = "",
 ) -> Dict[str, Any]:
     if apply and platform.system() != "Darwin":
         return {
@@ -3475,6 +3476,8 @@ def run_mac_codex_oauth_mirror(
         str(AUTH_MIRROR_MIN_TTL_SECONDS),
         "--json-only",
     ]
+    if codex_auth:
+        cmd.extend(["--codex-auth", codex_auth])
     if apply:
         cmd.append("--apply")
     else:
@@ -7175,6 +7178,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     auth_mirror_p = sub.add_parser("auth-mirror")
     auth_mirror_p.add_argument("--apply", action="store_true", help="apply the mac-codex OAuth mirror; default runs the mirror script in its dry-run mode")
     auth_mirror_p.add_argument("--action-ids", default="", help="stabilityd maintenance action ids included in remote evidence")
+    auth_mirror_p.add_argument("--codex-auth", default="", help="canonical mac-codex auth.json path")
     auth_mirror_p.add_argument("--no-codex-cli", dest="codex_cli", action="store_false")
     auth_mirror_p.add_argument("--no-hermers", dest="hermers", action="store_false")
     auth_mirror_p.add_argument("--no-openclaw", dest="openclaw", action="store_false")
@@ -7296,6 +7300,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 apply=args.apply,
                 action_ids=args.action_ids,
                 target_scope=scope,
+                codex_auth=args.codex_auth,
             )
         )
     if cmd == "profile-modes":
