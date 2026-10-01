@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import fcntl
 import json
 import os
 import pathlib
@@ -22,11 +23,13 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from typing import Any
 
 
 DUMMY_REFRESH = "MAC_CODEX_BROKER_REFRESH_DISABLED"
 SAFE_RUNTIME_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+SAFE_ARTIFACT_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 DEFAULT_SERVER = "flashcat@106.54.53.146"
 DEFAULT_FALLBACK_SERVER = "flashcat@dev-server.tail8e094d.ts.net"
 DEFAULT_SSH_KEY = "/Users/Flashcat/.ssh/openclaw_server"
@@ -41,6 +44,7 @@ CANONICAL_LOCAL_CODEX_AUTH = pathlib.Path("/Users/Flashcat/.codex/auth.json")
 REMOTE_RECEIVER = r"""
 import base64
 import datetime as dt
+import fcntl
 import json
 import os
 import pathlib
@@ -50,6 +54,8 @@ import sqlite3
 import sys
 import tempfile
 import time
+
+RETAIN_SUCCESSFUL_MIRROR_ARTIFACTS = 3
 
 DUMMY_REFRESH = "MAC_CODEX_BROKER_REFRESH_DISABLED"
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
@@ -113,8 +119,11 @@ def write_json_atomic(path, payload, mode=0o600):
         with os.fdopen(fd, "w") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.chmod(tmp_name, mode)
         os.replace(tmp_name, p)
+        fsync_directory(p.parent)
     finally:
         try:
             os.unlink(tmp_name)
@@ -125,31 +134,157 @@ def backup_file(path, backup_dir, label):
     p = pathlib.Path(path)
     if not p.exists():
         return None
+    if p.is_symlink() or not p.is_file():
+        raise ValueError("unsafe-backup-source")
     ensure_dir(backup_dir)
     dest = pathlib.Path(backup_dir) / label
-    if dest.exists() or dest.is_symlink():
+    if dest.is_symlink():
         raise ValueError("backup-destination-already-exists")
-    shutil.copyfile(p, dest)
-    os.chmod(dest, 0o600)
+    if dest.exists():
+        if not dest.is_file():
+            raise ValueError("backup-destination-already-exists")
+        with dest.open("r", encoding="utf-8") as handle:
+            if not isinstance(json.load(handle), dict):
+                raise ValueError("existing-auth-backup-invalid")
+        os.chmod(dest, 0o600)
+        return str(dest)
+    remove_backup_temps(backup_dir, label)
+    before = p.stat()
+    fd, tmp_name = tempfile.mkstemp(prefix=label + ".", suffix=".tmp", dir=str(backup_dir))
+    try:
+        with p.open("rb") as source, os.fdopen(fd, "wb") as target:
+            shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+        after = p.stat()
+        if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+            raise ValueError("auth-backup-source-changed-during-copy")
+        if pathlib.Path(tmp_name).stat().st_size != before.st_size:
+            raise ValueError("auth-backup-size-mismatch")
+        with open(tmp_name, "r", encoding="utf-8") as handle:
+            if not isinstance(json.load(handle), dict):
+                raise ValueError("auth-backup-invalid")
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, dest)
+        fsync_directory(backup_dir)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
     return str(dest)
+
+def validate_sqlite_backup(path):
+    uri = pathlib.Path(path).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=30)
+    try:
+        result = conn.execute("PRAGMA quick_check").fetchone()
+        if not result or result[0] != "ok":
+            raise ValueError("sqlite-backup-integrity-check-failed")
+    except sqlite3.Error as exc:
+        raise ValueError("sqlite-backup-integrity-check-failed") from exc
+    finally:
+        conn.close()
+
+def fsync_directory(path):
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+def remove_backup_temps(backup_dir, label):
+    root = pathlib.Path(backup_dir)
+    for candidate in root.glob(label + ".*.tmp"):
+        if candidate.is_symlink() or candidate.is_file():
+            candidate.unlink(missing_ok=True)
 
 def backup_sqlite(path, backup_dir, label):
     source_path = pathlib.Path(path)
     if not source_path.exists():
         return []
+    if source_path.is_symlink() or not source_path.is_file():
+        raise ValueError("unsafe-backup-source")
     ensure_dir(backup_dir)
     dest = pathlib.Path(backup_dir) / label
-    if dest.exists() or dest.is_symlink():
+    if dest.is_symlink():
         raise ValueError("backup-destination-already-exists")
-    source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True, timeout=30)
-    target = sqlite3.connect(str(dest), timeout=30)
+    if dest.exists():
+        if not dest.is_file():
+            raise ValueError("backup-destination-already-exists")
+        validate_sqlite_backup(dest)
+        os.chmod(dest, 0o600)
+        return [str(dest)]
+    remove_backup_temps(backup_dir, label)
+    fd, tmp_name = tempfile.mkstemp(prefix=label + ".", suffix=".tmp", dir=str(backup_dir))
+    os.close(fd)
+    source = None
+    target = None
     try:
+        source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True, timeout=30)
+        target = sqlite3.connect(tmp_name, timeout=30)
         source.backup(target)
-    finally:
+        target.commit()
         target.close()
+        target = None
         source.close()
-    os.chmod(dest, 0o600)
+        source = None
+        validate_sqlite_backup(tmp_name)
+        with open(tmp_name, "rb") as handle:
+            os.fsync(handle.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, dest)
+        fsync_directory(backup_dir)
+    finally:
+        if target is not None:
+            target.close()
+        if source is not None:
+            source.close()
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
     return [str(dest)]
+
+def prune_successful_mirror_artifacts(artifact_root, current_artifact, protected_artifact_ids=None):
+    root = pathlib.Path(artifact_root)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("unsafe-mirror-artifact-root")
+    lock_path = root / ".mac-codex-oauth-retention.lock"
+    if lock_path.is_symlink():
+        raise ValueError("symlink-retention-lock")
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        candidates = []
+        for candidate in root.iterdir():
+            if candidate.is_symlink() or not candidate.is_dir():
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}-mac-codex-oauth-mirror", candidate.name):
+                continue
+            index_path = candidate / "index.json"
+            if index_path.is_symlink() or not index_path.is_file():
+                continue
+            index = read_json(index_path, {})
+            if isinstance(index, dict) and index.get("status") == "applied":
+                candidates.append((candidate.stat().st_mtime_ns, candidate))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        keep = {path for _mtime, path in candidates[:RETAIN_SUCCESSFUL_MIRROR_ARTIFACTS]}
+        keep.add(pathlib.Path(current_artifact))
+        protected = {str(item) for item in (protected_artifact_ids or []) if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(item))}
+        for _mtime, candidate in candidates:
+            artifact_id = candidate.name.removesuffix("-mac-codex-oauth-mirror")
+            if artifact_id in protected:
+                keep.add(candidate)
+        root_real = root.resolve()
+        for _mtime, candidate in candidates:
+            if candidate in keep or candidate.resolve().parent != root_real:
+                continue
+            shutil.rmtree(candidate)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 def safe_runtime_id(value):
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) is not None
@@ -380,14 +515,7 @@ def apply_openclaw(payload, artifact, dry_run):
             conn.close()
     return results
 
-def main():
-    payload = json.load(sys.stdin)
-    dry_run = bool(payload.get("dryRun", True))
-    artifact_root = pathlib.Path(payload.get("artifactRoot") or "/home/flashcat/multi-agent-hedge-fund-framework/ops-artifacts/codex-working")
-    stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S%z") or str(int(time.time()))
-    artifact = artifact_root / f"{stamp}-mac-codex-oauth-mirror"
-    ensure_dir(artifact / "logs")
-    ensure_dir(artifact / "backups")
+def execute_mirror_payload(payload, artifact, dry_run):
     results = []
     targets = set(payload.get("targets") or [])
     if "codex-cli" in targets:
@@ -414,12 +542,41 @@ def main():
         "stabilityActionIds": [
             str(item) for item in (payload.get("stabilityActionIds") or []) if str(item)
         ],
+        "artifactId": payload.get("artifactId"),
         "accessExpiresAt": payload["accessExpiresAt"],
         "results": results,
     }
-    (artifact / "index.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
+    write_json_atomic(artifact / "index.json", summary)
+    if status == "applied" and not dry_run:
+        prune_successful_mirror_artifacts(
+            artifact.parent,
+            artifact,
+            payload.get("protectedArtifactIds") or [],
+        )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 1 if incomplete and not dry_run else 0
+
+def main():
+    payload = json.load(sys.stdin)
+    dry_run = bool(payload.get("dryRun", True))
+    artifact_root = pathlib.Path(payload.get("artifactRoot") or "/home/flashcat/multi-agent-hedge-fund-framework/ops-artifacts/codex-working")
+    artifact_id = str(payload.get("artifactId") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", artifact_id):
+        raise ValueError("invalid-mirror-artifact-id")
+    artifact = artifact_root / f"{artifact_id}-mac-codex-oauth-mirror"
+    ensure_dir(artifact / "logs")
+    ensure_dir(artifact / "backups")
+    lock_path = artifact / ".mirror-operation.lock"
+    if lock_path.is_symlink():
+        raise ValueError("symlink-mirror-operation-lock")
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.fchmod(lock_fd, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return execute_mirror_payload(payload, artifact, dry_run)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 if __name__ == "__main__":
     sys.exit(main())
@@ -602,6 +759,9 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
     if any(item not in {"openai", "openai-codex"} for item in openclaw_profile_kinds):
         raise SystemExit("unsupported OpenClaw OAuth provider kind")
     openclaw_targets = parse_openclaw_targets(args.openclaw_targets)
+    artifact_id = args.mirror_operation_id or uuid.uuid4().hex
+    if not SAFE_ARTIFACT_ID.fullmatch(artifact_id):
+        raise SystemExit("invalid or unsafe mirror operation id")
     if args.openclaw and not openclaw_targets:
         openclaw_targets = [
             {"agentId": agent_id, "profileKind": profile_kind}
@@ -632,6 +792,10 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         "openclawTargets": openclaw_targets,
         "stabilityActionIds": split_csv(args.stability_action_ids),
         "artifactRoot": args.artifact_root,
+        "artifactId": artifact_id,
+        "protectedArtifactIds": validate_runtime_ids(
+            split_csv(args.protect_operation_ids), "protected mirror operation"
+        ),
         "remoteCodexAuthPath": args.remote_codex_auth,
     }
 
@@ -737,6 +901,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--openclaw-profile-kinds", default="openai,openai-codex")
     parser.add_argument("--openclaw-targets", default="", help="precise agent/provider pairs as agent:provider,agent:provider")
     parser.add_argument("--action-ids", dest="stability_action_ids", default="", help="stabilityd auth-maintenance action ids included in the mirror evidence")
+    parser.add_argument("--mirror-operation-id", default="", help="stable attempt id to reuse rollback backups across retries")
+    parser.add_argument("--protect-operation-ids", default="", help="unresolved mirror artifact IDs to keep during retention")
     parser.add_argument("--min-ttl-seconds", type=int, default=300)
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--apply", action="store_true", help="write remote stores; default validates local mac-codex auth without connecting to the development server")

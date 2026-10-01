@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -43,7 +44,8 @@ REFRESH_WINDOW_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_REFRESH_W
 REFRESH_RETRY_BASE_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_REFRESH_RETRY_BASE_SECONDS", "60"))
 REFRESH_RETRY_MAX_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_REFRESH_RETRY_MAX_SECONDS", str(15 * 60)))
 CONCURRENT_REFRESH_SETTLE_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_CONCURRENT_REFRESH_SETTLE_SECONDS", "15"))
-REMOTE_PLAN_POLL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_REMOTE_PLAN_POLL_SECONDS", str(15 * 60)))
+REMOTE_PLAN_POLL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_REMOTE_PLAN_POLL_SECONDS", "15"))
+REMOTE_PLAN_FRESH_POLL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_REMOTE_PLAN_FRESH_POLL_SECONDS", str(15 * 60)))
 MIRROR_MIN_TTL_SECONDS = 5 * 60
 CODEX_TIMEOUT_SECONDS = 180
 SSH_TIMEOUT_SECONDS = 90
@@ -57,6 +59,40 @@ def utc_now() -> dt.datetime:
 
 def iso_now() -> str:
     return utc_now().isoformat().replace("+00:00", "Z")
+
+
+def timestamp_epoch(value: Any) -> Optional[int]:
+    try:
+        text = str(value or "")
+        if not text:
+            return None
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return int(parsed.timestamp())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def plan_generation_epoch_ns(plan: Optional[Dict[str, Any]], success: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    try:
+        value = int(plan.get("generatedAtEpochNs")) if isinstance(plan, dict) else 0
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    try:
+        value = int(success.get("remotePlanGeneratedAtEpochNs")) if isinstance(success, dict) else 0
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    generated_at = plan.get("generatedAt") if isinstance(plan, dict) else None
+    if generated_at:
+        epoch_seconds = timestamp_epoch(generated_at)
+        return epoch_seconds * 1_000_000_000 if epoch_seconds is not None else None
+    epoch_seconds = timestamp_epoch(success.get("remotePlanGeneratedAt")) if isinstance(success, dict) else None
+    return epoch_seconds * 1_000_000_000 if epoch_seconds is not None else None
 
 
 def load_json(path: pathlib.Path) -> Optional[Dict[str, Any]]:
@@ -426,6 +462,39 @@ def source_changed(source: Dict[str, Any], success: Optional[Dict[str, Any]]) ->
         return False
 
 
+def filter_postchecked_mirror_actions(
+    actions: List[Dict[str, Any]],
+    plan: Dict[str, Any],
+    success: Optional[Dict[str, Any]],
+    *,
+    now_epoch: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    if not isinstance(success, dict) or success.get("postcheckOk") is not True:
+        return actions
+    now_epoch = int(now_epoch or time.time())
+    try:
+        last_mirror_epoch = int(success.get("mirrorCompletedAtEpoch") or 0)
+    except (TypeError, ValueError):
+        last_mirror_epoch = 0
+    if not last_mirror_epoch or now_epoch - last_mirror_epoch >= 6 * 60 * 60:
+        return actions
+    plan_epoch = plan_generation_epoch_ns(plan)
+    verified_epoch = plan_generation_epoch_ns(None, success)
+    same_or_older_snapshot = (
+        plan_epoch is not None
+        and verified_epoch is not None
+        and plan_epoch <= verified_epoch
+    )
+    legacy_snapshot = plan_epoch is None or verified_epoch is None
+    if not same_or_older_snapshot and not legacy_snapshot:
+        return actions
+    if success.get("sourceWide") is True:
+        scope = success.get("mirrorScope") if isinstance(success.get("mirrorScope"), dict) else {}
+        return [item for item in actions if not mirror_scope_contains(scope, item)]
+    action_ids = {str(item) for item in success.get("mirrorActionIds") or [] if str(item)}
+    return [item for item in actions if str(item.get("actionId") or "") not in action_ids]
+
+
 def refresh_condition_key(source: Dict[str, Any]) -> str:
     return "|".join(
         [
@@ -537,6 +606,127 @@ def mirror_retry_deferred(
         return False
     now_epoch = now_epoch or int(time.time())
     return now_epoch - attempted_at < retry_after
+
+
+def mirror_operation_id_for_attempt(
+    previous: Optional[Dict[str, Any]],
+    source: Dict[str, Any],
+    action_ids: List[str],
+    scope: Optional[Dict[str, Any]],
+    source_wide: bool,
+) -> str:
+    prior = previous.get("lastMirrorAttempt") if isinstance(previous, dict) else None
+    if (
+        isinstance(prior, dict)
+        and prior.get("result") in {"failed", "postcheck-pending"}
+        and prior.get("refreshConditionKey") == refresh_condition_key(source)
+        and prior.get("sourceWide") is source_wide
+        and prior.get("mirrorScope") == scope
+    ):
+        prior_ids = sorted({str(item) for item in prior.get("actionIds") or [] if str(item)})
+        current_ids = sorted({str(item) for item in action_ids if str(item)})
+        if source_wide or prior_ids == current_ids:
+            prior_id = str(prior.get("operationId") or "")
+            if SAFE_RUNTIME_ID.fullmatch(prior_id):
+                return prior_id
+    return uuid.uuid4().hex
+
+
+def protected_mirror_operation_ids(previous: Optional[Dict[str, Any]]) -> List[str]:
+    stored_ids = previous.get("pendingMirrorOperationIds") if isinstance(previous, dict) else []
+    protected = {
+        str(item)
+        for item in (stored_ids or [])
+        if str(item)
+    }
+    attempt = previous.get("lastMirrorAttempt") if isinstance(previous, dict) else None
+    if isinstance(attempt, dict) and attempt.get("result") in {"failed", "postcheck-pending", "blocked"}:
+        operation_id = str(attempt.get("operationId") or "")
+        if SAFE_RUNTIME_ID.fullmatch(operation_id):
+            protected.add(operation_id)
+    return sorted(item for item in protected if SAFE_RUNTIME_ID.fullmatch(item))
+
+
+def mark_last_mirror_postcheck_resolved(previous: Dict[str, Any]) -> None:
+    attempt = previous.get("lastMirrorAttempt") if isinstance(previous, dict) else None
+    if not isinstance(attempt, dict) or attempt.get("applyResult") != "applied":
+        return
+    if not SAFE_RUNTIME_ID.fullmatch(str(attempt.get("operationId") or "")):
+        return
+    previous["lastMirrorAttempt"] = {
+        **attempt,
+        "result": "applied",
+        "postcheckStatus": "ok",
+    }
+
+
+def mirror_actions_already_postchecked(
+    plan: Optional[Dict[str, Any]], success: Optional[Dict[str, Any]]
+) -> bool:
+    if not isinstance(plan, dict) or not isinstance(success, dict) or success.get("postcheckOk") is not True:
+        return False
+    current_epoch = plan_generation_epoch_ns(plan)
+    verified_epoch = plan_generation_epoch_ns(None, success)
+    return current_epoch is not None and verified_epoch is not None and current_epoch <= verified_epoch
+
+
+def remote_plan_fetch_policy(
+    previous: Optional[Dict[str, Any]],
+    plan: Optional[Dict[str, Any]],
+    source: Dict[str, Any],
+    *,
+    now_epoch: Optional[int] = None,
+) -> Tuple[bool, bool]:
+    now_epoch = int(now_epoch or time.time())
+    try:
+        last_plan_epoch = int(previous.get("remotePlanFetchedAtEpoch") or 0) if isinstance(previous, dict) else 0
+    except (TypeError, ValueError):
+        last_plan_epoch = 0
+    try:
+        last_fresh_epoch = int(previous.get("remoteFreshPlanFetchedAtEpoch") or 0) if isinstance(previous, dict) else 0
+    except (TypeError, ValueError):
+        last_fresh_epoch = 0
+    poll_due = plan is None or not last_plan_epoch or now_epoch - last_plan_epoch >= REMOTE_PLAN_POLL_SECONDS
+    fresh_due = plan is None or not last_fresh_epoch or now_epoch - last_fresh_epoch >= REMOTE_PLAN_FRESH_POLL_SECONDS
+    success = last_success(previous)
+    stale_duplicate = mirror_actions_already_postchecked(plan, success)
+    urgent_actions = [item for item in eligible_mirror_actions(plan or {}) if not stale_duplicate]
+    urgent_ids = [str(item.get("actionId") or "") for item in urgent_actions if str(item.get("actionId") or "")]
+    plan_is_fresh = bool(plan and (plan.get("source") == "fresh" or plan.get("freshEnough") is True))
+    urgent_due = (
+        bool(urgent_ids)
+        and not plan_is_fresh
+        and not mirror_retry_deferred(previous, source, urgent_ids, now_epoch)
+    )
+    force_fresh = fresh_due or urgent_due
+    return poll_due or force_fresh, force_fresh
+
+
+def latest_plan_has_unvalidated_mac_request(
+    plan: Optional[Dict[str, Any]],
+    success: Optional[Dict[str, Any]],
+    previous: Optional[Dict[str, Any]] = None,
+    source: Optional[Dict[str, Any]] = None,
+    now_epoch: Optional[int] = None,
+) -> bool:
+    if not isinstance(plan, dict) or plan.get("source") == "fresh":
+        return False
+    if mirror_actions_already_postchecked(plan, success):
+        return False
+    action_ids = [
+        str(item.get("actionId") or "")
+        for item in eligible_mirror_actions(plan)
+        if str(item.get("actionId") or "")
+    ]
+    if not action_ids:
+        return False
+    if source is None:
+        return True
+    now_epoch = int(now_epoch or time.time())
+    return any(
+        not mirror_retry_deferred(previous, source, [action_id], now_epoch)
+        for action_id in action_ids
+    )
 
 
 def classify_codex_failure(stderr: str) -> Tuple[str, bool]:
@@ -718,7 +908,9 @@ def transport_failure(stderr: str) -> bool:
     )
 
 
-def fetch_remote_plan() -> Tuple[Dict[str, Any], str, List[Dict[str, Any]], pathlib.Path]:
+def fetch_remote_plan(
+    *, force_openclaw_probe: bool = False
+) -> Tuple[Dict[str, Any], str, List[Dict[str, Any]], pathlib.Path]:
     plan_file = REMOTE_PLAN_FILE
     errors: List[Dict[str, Any]] = []
     for index, server in enumerate((SERVER, FALLBACK_SERVER)):
@@ -738,7 +930,10 @@ def fetch_remote_plan() -> Tuple[Dict[str, Any], str, List[Dict[str, Any]], path
             "-o",
             "ServerAliveCountMax=2",
             server,
-            REMOTE_CLI + " auth-maintenance --fresh --force-openclaw-probe",
+            REMOTE_CLI
+            + " auth-maintenance --fresh --force-openclaw-probe"
+            if force_openclaw_probe
+            else REMOTE_CLI + " auth-maintenance",
         ]
         try:
             with tmp_file.open("w", encoding="utf-8") as out:
@@ -779,7 +974,12 @@ def fetch_remote_plan() -> Tuple[Dict[str, Any], str, List[Dict[str, Any]], path
     raise RuntimeError(json.dumps(errors, ensure_ascii=False))
 
 
-def run_mirror(action_ids: List[str], scope: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def run_mirror(
+    action_ids: List[str],
+    scope: Optional[Dict[str, Any]] = None,
+    operation_id: Optional[str] = None,
+    protected_operation_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     command = [
         str(CLI), "auth-mirror", "--apply", "--codex-auth", str(AUTH_PATH),
         "--action-ids", ",".join(action_ids),
@@ -799,6 +999,10 @@ def run_mirror(action_ids: List[str], scope: Optional[Dict[str, Any]] = None) ->
             command.extend(["--openclaw-targets", encoded_targets])
         else:
             command.append("--no-openclaw")
+    if operation_id:
+        command.extend(["--mirror-operation-id", operation_id])
+    if protected_operation_ids:
+        command.extend(["--protect-operation-ids", ",".join(protected_operation_ids)])
     proc = subprocess.run(
         command,
         stdout=subprocess.PIPE,
@@ -831,9 +1035,17 @@ def write_attempt(
     transport_errors: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     success = last_success(previous)
+    pending_operation_ids = set(protected_mirror_operation_ids(previous))
     last_mirror_attempt = None
     if isinstance(previous, dict) and isinstance(previous.get("lastMirrorAttempt"), dict):
         last_mirror_attempt = previous.get("lastMirrorAttempt")
+        prior_operation_id = str(last_mirror_attempt.get("operationId") or "")
+        if (
+            last_mirror_attempt.get("result") == "applied"
+            and last_mirror_attempt.get("postcheckStatus") == "ok"
+            and SAFE_RUNTIME_ID.fullmatch(prior_operation_id)
+        ):
+            pending_operation_ids.discard(prior_operation_id)
     if source_refresh_attempt is None and isinstance(previous, dict):
         prior_attempt = previous.get("sourceRefreshAttempt")
         if isinstance(prior_attempt, dict):
@@ -843,12 +1055,21 @@ def write_attempt(
             remote_plan_fetched_at_epoch = int(previous.get("remotePlanFetchedAtEpoch"))
         except (TypeError, ValueError):
             remote_plan_fetched_at_epoch = None
+    remote_fresh_plan_fetched_at_epoch = None
+    if isinstance(previous, dict):
+        try:
+            remote_fresh_plan_fetched_at_epoch = int(previous.get("remoteFreshPlanFetchedAtEpoch"))
+        except (TypeError, ValueError):
+            remote_fresh_plan_fetched_at_epoch = None
+    if plan and plan.get("source") == "fresh":
+        remote_fresh_plan_fetched_at_epoch = remote_plan_fetched_at_epoch or int(time.time())
     now = iso_now()
     summary: Dict[str, Any] = {
         "checkedAt": now,
         "status": status,
         "remoteServer": server,
         "remotePlanFetchedAtEpoch": remote_plan_fetched_at_epoch,
+        "remoteFreshPlanFetchedAtEpoch": remote_fresh_plan_fetched_at_epoch,
         "remoteStatus": plan.get("status") if plan else None,
         "remoteSeverity": plan.get("severity") if plan else None,
         "remoteActionCount": plan.get("actionCount") if plan else None,
@@ -902,8 +1123,22 @@ def write_attempt(
             "result": attempt_result,
             "applyResult": "applied" if apply_succeeded else "failed",
             "postcheckStatus": postcheck_status,
+            "operationId": mirror.get("operationId") if mirror else None,
+            "sourceWide": mirror.get("sourceWide") is True if mirror else False,
+            "mirrorScope": mirror.get("mirrorScope") if mirror else None,
         }
         summary["lastMirrorAttempt"] = last_mirror_attempt
+        operation_id = str(last_mirror_attempt.get("operationId") or "")
+        if SAFE_RUNTIME_ID.fullmatch(operation_id):
+            if attempt_result == "applied":
+                pending_operation_ids.discard(operation_id)
+                if last_mirror_attempt.get("sourceWide") is True:
+                    pending_operation_ids.clear()
+            else:
+                pending_operation_ids.add(operation_id)
+    summary["pendingMirrorOperationIds"] = sorted(
+        item for item in pending_operation_ids if SAFE_RUNTIME_ID.fullmatch(item)
+    )
     if mirror and mirror.get("result") == "applied":
         success = {
             "checkedAt": now,
@@ -916,8 +1151,11 @@ def write_attempt(
             "mirrorCompletedAtEpoch": int(time.time()),
             "postcheckOk": (mirror.get("postcheck") or {}).get("status") == "ok",
             "postcheckStatus": (mirror.get("postcheck") or {}).get("status") or "not-run",
+            "remotePlanGeneratedAt": plan.get("generatedAt") if plan else None,
+            "remotePlanGeneratedAtEpochNs": plan.get("generatedAtEpochNs") if plan else None,
             "sourceWide": mirror.get("sourceWide") is True,
             "mirrorScope": mirror.get("mirrorScope"),
+            "operationId": mirror.get("operationId"),
         }
     if success:
         summary["lastSuccessfulMirror"] = success
@@ -992,7 +1230,7 @@ def main() -> int:
         plan = load_json(REMOTE_PLAN_FILE)
         server = str(previous.get("remoteServer") or "") if isinstance(previous, dict) else ""
         try:
-            last_plan_epoch = int(previous.get("remotePlanFetchedAtEpoch")) if isinstance(previous, dict) else 0
+            last_plan_epoch = int(previous.get("remotePlanFetchedAtEpoch") or 0) if isinstance(previous, dict) else 0
         except (TypeError, ValueError):
             last_plan_epoch = 0
         same_source_generation = bool(
@@ -1017,10 +1255,21 @@ def main() -> int:
         )
         source_sync_retry_deferred = changed and mirror_retry_deferred(previous, source, now_epoch=now_epoch)
         refresh_advanced = bool(source_refresh_attempt and source_refresh_attempt.get("result") == "token-advanced")
-        fetch_plan = (
-            plan is None
-            or not last_plan_epoch
-            or now_epoch - last_plan_epoch >= REMOTE_PLAN_POLL_SECONDS
+        fetch_plan, force_openclaw_probe = remote_plan_fetch_policy(
+            previous,
+            plan,
+            source,
+            now_epoch=now_epoch,
+        )
+        force_openclaw_probe = bool(
+            force_openclaw_probe
+            or (changed and not cached_gate_block and not source_sync_retry_deferred)
+            or refresh_advanced
+            or postcheck_query_retry
+        )
+        fetch_plan = bool(
+            fetch_plan
+            or force_openclaw_probe
             or (changed and not cached_gate_block and not source_sync_retry_deferred)
             or refresh_advanced
             or postcheck_query_retry
@@ -1029,7 +1278,9 @@ def main() -> int:
         plan_fetched_at_epoch = last_plan_epoch or None
         if fetch_plan:
             try:
-                plan, server, transport_errors, _plan_file = fetch_remote_plan()
+                plan, server, transport_errors, _plan_file = fetch_remote_plan(
+                    force_openclaw_probe=force_openclaw_probe
+                )
                 plan_fetched_at_epoch = int(time.time())
             except Exception as exc:
                 summary = write_attempt(
@@ -1039,6 +1290,39 @@ def main() -> int:
                     source_refresh_attempt=source_refresh_attempt,
                     error="remote-plan-unavailable",
                     transport_errors=json.loads(str(exc)) if str(exc).startswith("[") else [],
+                )
+                emit_summary(summary, previous)
+                return 1
+        if (
+            fetch_plan
+            and not force_openclaw_probe
+            and latest_plan_has_unvalidated_mac_request(
+                plan,
+                pending_success,
+                previous,
+                source,
+                now_epoch,
+            )
+        ):
+            try:
+                plan, server, request_errors, _plan_file = fetch_remote_plan(
+                    force_openclaw_probe=True
+                )
+                transport_errors.extend(request_errors)
+                plan_fetched_at_epoch = int(time.time())
+            except Exception as exc:
+                summary = write_attempt(
+                    previous,
+                    status="remote-unreachable",
+                    source=source,
+                    plan=plan,
+                    server=server,
+                    source_refresh_attempt=source_refresh_attempt,
+                    remote_plan_fetched_at_epoch=plan_fetched_at_epoch,
+                    error="fresh-auth-request-plan-unavailable",
+                    transport_errors=transport_errors + (
+                        json.loads(str(exc)) if str(exc).startswith("[") else []
+                    ),
                 )
                 emit_summary(summary, previous)
                 return 1
@@ -1081,13 +1365,7 @@ def main() -> int:
                 saved_success["postcheckOk"] = True
                 saved_success["postcheckStatus"] = "ok"
                 previous["lastSuccessfulMirror"] = saved_success
-                previous_attempt = previous.get("lastMirrorAttempt")
-                if isinstance(previous_attempt, dict) and previous_attempt.get("result") == "postcheck-pending":
-                    previous["lastMirrorAttempt"] = {
-                        **previous_attempt,
-                        "result": "applied",
-                        "postcheckStatus": "ok",
-                    }
+                mark_last_mirror_postcheck_resolved(previous)
                 summary = write_attempt(
                     previous,
                     status="postcheck-recovered",
@@ -1153,13 +1431,12 @@ def main() -> int:
         else:
             success = last_success(previous)
             if success and success.get("postcheckOk") is True and source.get("accessExpiresAt") == success.get("sourceAccessExpiresAt") and source.get("lastRefresh") == success.get("sourceLastRefresh"):
-                last_action_ids = {str(item) for item in success.get("mirrorActionIds") or [] if str(item)}
-                try:
-                    last_mirror_epoch = int(success.get("mirrorCompletedAtEpoch") or 0)
-                except (TypeError, ValueError):
-                    last_mirror_epoch = 0
-                if now_epoch - last_mirror_epoch < 6 * 60 * 60:
-                    selected = [item for item in selected if str(item.get("actionId") or "") not in last_action_ids]
+                selected = filter_postchecked_mirror_actions(
+                    selected,
+                    plan,
+                    success,
+                    now_epoch=now_epoch,
+                )
             if selected:
                 selected_ids = [str(item.get("actionId") or "") for item in selected]
                 if mirror_retry_deferred(previous, source, selected_ids, now_epoch):
@@ -1213,17 +1490,33 @@ def main() -> int:
             )
             emit_summary(summary, previous)
             return 1 if status in {"source-reauth-required", "source-refresh-pending"} else 0
-        mirror_result: Optional[Dict[str, Any]] = None
+        action_ids = [str(x.get("actionId") or "") for x in selected if str(x.get("actionId") or "")]
+        source_wide = any(bool(item.get("localSourceChange")) for item in selected)
+        operation_id = mirror_operation_id_for_attempt(
+            previous, source, action_ids, mirror_scope, source_wide
+        )
+        mirror_result: Optional[Dict[str, Any]] = {
+            "operationId": operation_id,
+            "sourceWide": source_wide,
+            "mirrorScope": mirror_scope,
+        }
         try:
             if int(source.get("accessSecondsRemaining") or 0) < MIRROR_MIN_TTL_SECONDS:
                 raise RuntimeError("source-access-token-below-mirror-min-ttl")
-            action_ids = [str(x.get("actionId") or "") for x in selected if str(x.get("actionId") or "")]
-            mirror_result = run_mirror(action_ids, mirror_scope)
-            source_wide = any(bool(item.get("localSourceChange")) for item in selected)
+            applied_result = run_mirror(
+                action_ids,
+                mirror_scope,
+                operation_id,
+                protected_mirror_operation_ids(previous),
+            )
+            applied_result.update(mirror_result)
+            mirror_result = applied_result
             mirror_result["sourceWide"] = source_wide
             mirror_result["mirrorScope"] = mirror_scope
             try:
-                post_plan, post_server, post_errors, _post_plan_file = fetch_remote_plan()
+                post_plan, post_server, post_errors, _post_plan_file = fetch_remote_plan(
+                    force_openclaw_probe=True
+                )
             except Exception as exc:
                 mirror_result["postcheck"] = {"status": "unavailable"}
                 raise RuntimeError("mirror-postcheck-unavailable") from exc
@@ -1240,6 +1533,7 @@ def main() -> int:
             mirror_result["postcheck"] = {
                 "status": "ok" if not unresolved_ids else "unresolved-actions",
                 "checkedAt": iso_now(),
+                "remotePlanGeneratedAt": post_plan.get("generatedAt"),
                 "unresolvedActionIds": unresolved_ids,
                 "tokenValuesRedacted": True,
             }

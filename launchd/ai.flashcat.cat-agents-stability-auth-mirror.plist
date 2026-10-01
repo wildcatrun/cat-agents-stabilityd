@@ -12,7 +12,7 @@
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StartInterval</key>
-	<integer>60</integer>
+	<integer>15</integer>
 	<key>WatchPaths</key>
 	<array>
 		<string>/Users/Flashcat/.codex/auth.json</string>
@@ -20,7 +20,7 @@
 	<key>ProcessType</key>
 	<string>Background</string>
 	<key>ThrottleInterval</key>
-	<integer>30</integer>
+	<integer>10</integer>
 	<key>StandardErrorPath</key>
 	<string>/Users/Flashcat/cat-agents-stabilityd/reports/auth-mirror/launchd.err.log</string>
 	<key>StandardOutPath</key>

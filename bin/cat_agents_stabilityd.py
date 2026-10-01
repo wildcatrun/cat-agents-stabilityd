@@ -201,7 +201,11 @@ HERMERS_PROFILE_PROTECTED_IDS = {
 }
 AUTH_WARN_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_WARN_SECONDS", str(72 * 3600)))
 AUTH_CRITICAL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_CRITICAL_SECONDS", str(24 * 3600)))
-AUTH_OPENCLAW_PROBE_TTL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_SECONDS", str(3600)))
+AUTH_OPENCLAW_PROBE_TTL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_SECONDS", str(15 * 60)))
+AUTH_OPENCLAW_PROBE_NEAR_TTL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_NEAR_SECONDS", "60"))
+AUTH_OPENCLAW_PROBE_URGENT_TTL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_URGENT_SECONDS", "30"))
+AUTH_OPENCLAW_PROBE_URGENT_WINDOW_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_URGENT_WINDOW_SECONDS", str(15 * 60)))
+AUTH_OPENCLAW_PROBE_ERROR_TTL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_ERROR_SECONDS", "60"))
 AUTH_OPENCLAW_PROBE_TIMEOUT_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_TIMEOUT_SECONDS", "8"))
 AUTH_OPENCLAW_AGENT_LIMIT = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_LIMIT", "32"))
 AUTH_OPENCLAW_AGENT_IDS = [
@@ -661,13 +665,61 @@ def parse_openclaw_auth_list(text: str, agent_id: str) -> Dict[str, Any]:
     }
 
 
+def openclaw_auth_probe_cache_ttl(cached: Dict[str, Any], *, now_epoch: Optional[int] = None) -> int:
+    """Use a slower auth probe normally and tighten it as token expiry approaches."""
+    now_epoch = int(now_epoch or epoch())
+    if cached.get("available") is not True:
+        return max(1, AUTH_OPENCLAW_PROBE_ERROR_TTL_SECONDS)
+    try:
+        checked_epoch = int(cached.get("checkedAtEpoch") or now_epoch)
+    except (TypeError, ValueError):
+        checked_epoch = now_epoch
+    age = max(0, now_epoch - checked_epoch)
+    profiles = cached.get("profiles") if isinstance(cached.get("profiles"), list) else []
+    provider_remaining: Dict[str, List[int]] = {}
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        provider = str(profile.get("provider") or profile.get("profileKind") or "")
+        if provider not in AUTH_OPENAI_PROVIDER_IDS:
+            continue
+        try:
+            expires_epoch = int(profile.get("expiresEpoch"))
+        except (TypeError, ValueError):
+            try:
+                provider_remaining.setdefault(provider, []).append(int(profile.get("secondsRemaining")) - age)
+            except (TypeError, ValueError):
+                continue
+        else:
+            provider_remaining.setdefault(provider, []).append(expires_epoch - now_epoch)
+    # Stale copies for the same provider must not force urgent probes while a
+    # fresher usable profile remains valid; the plan is routed by that winner.
+    remaining_values = [max(values) for values in provider_remaining.values() if values]
+    if any(value <= max(1, AUTH_OPENCLAW_PROBE_URGENT_WINDOW_SECONDS) for value in remaining_values):
+        return max(1, AUTH_OPENCLAW_PROBE_URGENT_TTL_SECONDS)
+    if any(value <= AUTH_CRITICAL_SECONDS for value in remaining_values):
+        return max(1, AUTH_OPENCLAW_PROBE_NEAR_TTL_SECONDS)
+    return max(1, AUTH_OPENCLAW_PROBE_TTL_SECONDS)
+
+
 def cached_openclaw_auth_probe(conn: sqlite3.Connection, agent_id: str, *, force: bool = False) -> Dict[str, Any]:
     cache_key = f"auth:openclaw:{agent_id}"
     cached = db_get(conn, cache_key, {}) or {}
     cached_epoch = int(cached.get("checkedAtEpoch") or 0) if isinstance(cached, dict) else 0
-    if not force and cached_epoch and epoch() - cached_epoch < AUTH_OPENCLAW_PROBE_TTL_SECONDS:
+    now_epoch = epoch()
+    cache_ttl = openclaw_auth_probe_cache_ttl(cached, now_epoch=now_epoch) if isinstance(cached, dict) else AUTH_OPENCLAW_PROBE_TTL_SECONDS
+    if not force and cached_epoch and now_epoch - cached_epoch < cache_ttl:
         result = dict(cached)
+        result["profiles"] = [dict(item) if isinstance(item, dict) else item for item in (cached.get("profiles") or [])]
+        for profile in result["profiles"]:
+            if isinstance(profile, dict) and profile.get("expiresEpoch") is not None:
+                try:
+                    profile["secondsRemaining"] = int(profile["expiresEpoch"]) - now_epoch
+                except (TypeError, ValueError):
+                    pass
         result["cached"] = True
+        result["cacheTtlSeconds"] = cache_ttl
+        result["nextProbeDueAtEpoch"] = cached_epoch + cache_ttl
         return result
     try:
         out = run_cmd(["openclaw", "models", "auth", "list", "--agent", agent_id], timeout=AUTH_OPENCLAW_PROBE_TIMEOUT_SECONDS)
@@ -685,6 +737,8 @@ def cached_openclaw_auth_probe(conn: sqlite3.Connection, agent_id: str, *, force
             "unparsedProfileLineCount": parsed.get("unparsedProfileLineCount") or 0,
             "unparsedProfileLines": parsed.get("unparsedProfileLines") or [],
         }
+        result["cacheTtlSeconds"] = openclaw_auth_probe_cache_ttl(result, now_epoch=result["checkedAtEpoch"])
+        result["nextProbeDueAtEpoch"] = result["checkedAtEpoch"] + result["cacheTtlSeconds"]
         if out.returncode != 0:
             result["error"] = redact_auth_text(out.stderr or out.stdout or "", 1000)
     except Exception as exc:
@@ -3118,6 +3172,10 @@ def auth_collect(
             "registrySource": registry.get("source"),
             "registryDbFile": registry.get("dbFile"),
             "probeTtlSeconds": AUTH_OPENCLAW_PROBE_TTL_SECONDS,
+            "nearExpiryProbeTtlSeconds": AUTH_OPENCLAW_PROBE_NEAR_TTL_SECONDS,
+            "urgentProbeTtlSeconds": AUTH_OPENCLAW_PROBE_URGENT_TTL_SECONDS,
+            "urgentProbeWindowSeconds": AUTH_OPENCLAW_PROBE_URGENT_WINDOW_SECONDS,
+            "probeErrorTtlSeconds": AUTH_OPENCLAW_PROBE_ERROR_TTL_SECONDS,
             "probeTimeoutSeconds": AUTH_OPENCLAW_PROBE_TIMEOUT_SECONDS,
             "requiredProviders": sorted(AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS),
         },
@@ -3390,6 +3448,7 @@ def build_auth_maintenance_plan(auth: Dict[str, Any], findings: Iterable[Dict[st
     return {
         "schemaVersion": 1,
         "generatedAt": ts(),
+        "generatedAtEpochNs": time.time_ns(),
         "status": status,
         "severity": severity,
         "refreshBrokerEnabled": bool(AUTH_REFRESH_BROKER_ENABLED),
@@ -3452,6 +3511,8 @@ def run_mac_codex_oauth_mirror(
     action_ids: str = "",
     target_scope: Optional[Dict[str, Any]] = None,
     codex_auth: str = "",
+    mirror_operation_id: str = "",
+    protect_operation_ids: str = "",
 ) -> Dict[str, Any]:
     if apply and platform.system() != "Darwin":
         return {
@@ -3478,6 +3539,10 @@ def run_mac_codex_oauth_mirror(
     ]
     if codex_auth:
         cmd.extend(["--codex-auth", codex_auth])
+    if mirror_operation_id:
+        cmd.extend(["--mirror-operation-id", mirror_operation_id])
+    if protect_operation_ids:
+        cmd.extend(["--protect-operation-ids", protect_operation_ids])
     if apply:
         cmd.append("--apply")
     else:
@@ -5484,6 +5549,9 @@ def build_lane_policy(
             "warnSeconds": AUTH_WARN_SECONDS,
             "criticalSeconds": AUTH_CRITICAL_SECONDS,
             "openclawProbeTtlSeconds": AUTH_OPENCLAW_PROBE_TTL_SECONDS,
+            "openclawNearExpiryProbeTtlSeconds": AUTH_OPENCLAW_PROBE_NEAR_TTL_SECONDS,
+            "openclawUrgentProbeTtlSeconds": AUTH_OPENCLAW_PROBE_URGENT_TTL_SECONDS,
+            "openclawUrgentProbeWindowSeconds": AUTH_OPENCLAW_PROBE_URGENT_WINDOW_SECONDS,
             "tokenValuesRedacted": True,
         },
         "hermers": {
@@ -7179,6 +7247,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     auth_mirror_p.add_argument("--apply", action="store_true", help="apply the mac-codex OAuth mirror; default runs the mirror script in its dry-run mode")
     auth_mirror_p.add_argument("--action-ids", default="", help="stabilityd maintenance action ids included in remote evidence")
     auth_mirror_p.add_argument("--codex-auth", default="", help="canonical mac-codex auth.json path")
+    auth_mirror_p.add_argument("--mirror-operation-id", default="", help="stable retry id for reusing this attempt's rollback backups")
+    auth_mirror_p.add_argument("--protect-operation-ids", default="", help="unresolved mirror artifacts to retain")
     auth_mirror_p.add_argument("--no-codex-cli", dest="codex_cli", action="store_false")
     auth_mirror_p.add_argument("--no-hermers", dest="hermers", action="store_false")
     auth_mirror_p.add_argument("--no-openclaw", dest="openclaw", action="store_false")
@@ -7301,6 +7371,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 action_ids=args.action_ids,
                 target_scope=scope,
                 codex_auth=args.codex_auth,
+                mirror_operation_id=args.mirror_operation_id,
+                protect_operation_ids=args.protect_operation_ids,
             )
         )
     if cmd == "profile-modes":

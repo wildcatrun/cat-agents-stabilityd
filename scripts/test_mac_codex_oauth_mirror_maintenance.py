@@ -8,6 +8,8 @@ import unittest
 import datetime as dt
 import tempfile
 import json
+import os
+import sqlite3
 import importlib.util
 from unittest import mock
 
@@ -141,14 +143,50 @@ class MirrorDecisionTests(unittest.TestCase):
             ],
         }
         with mock.patch.object(maintenance.subprocess, "run", return_value=completed) as run:
-            maintenance.run_mirror(["hermers_catbody_token_sync"], scope)
+            maintenance.run_mirror(
+                ["hermers_catbody_token_sync"],
+                scope,
+                "retry-operation-123",
+                ["unresolved-operation-456"],
+            )
         command = run.call_args.args[0]
         self.assertIn("--no-codex-cli", command)
         self.assertIn("--hermers-profiles", command)
         self.assertIn("catbody", command)
         self.assertIn("--openclaw-targets", command)
         self.assertIn("main:openai,cat_claw:openai-codex", command)
+        self.assertIn("--mirror-operation-id", command)
+        self.assertEqual(command[command.index("--mirror-operation-id") + 1], "retry-operation-123")
+        self.assertIn("--protect-operation-ids", command)
+        self.assertEqual(command[command.index("--protect-operation-ids") + 1], "unresolved-operation-456")
         self.assertNotIn("--openclaw-agents", command)
+
+    def test_failed_mirror_reuses_operation_id_only_for_same_generation_and_scope(self):
+        source = {"accessExpiresAt": "2026-10-09T15:14:22Z", "lastRefresh": "2026-09-29T15:14:22Z"}
+        action_ids = ["hermers_catbody_token_sync"]
+        scope = {"codexCli": False, "hermersProfiles": ["catbody"], "openclawTargets": []}
+        prior = {
+            "lastMirrorAttempt": {
+                "result": "failed",
+                "operationId": "retry-operation-123",
+                "refreshConditionKey": maintenance.refresh_condition_key(source),
+                "actionIds": action_ids,
+                "sourceWide": False,
+                "mirrorScope": scope,
+            }
+        }
+        self.assertEqual(
+            maintenance.mirror_operation_id_for_attempt(prior, source, action_ids, scope, False),
+            "retry-operation-123",
+        )
+        self.assertNotEqual(
+            maintenance.mirror_operation_id_for_attempt(prior, source, action_ids, {**scope, "hermersProfiles": ["cateyes"]}, False),
+            "retry-operation-123",
+        )
+        self.assertNotEqual(
+            maintenance.mirror_operation_id_for_attempt(prior, {**source, "lastRefresh": "new-generation"}, action_ids, scope, False),
+            "retry-operation-123",
+        )
 
     def test_source_expiry_or_refresh_timestamp_advances_detect_as_changed(self):
         success = {
@@ -357,13 +395,45 @@ class MirrorDecisionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="auth-refresh-test-") as tmp:
             latest = pathlib.Path(tmp) / "latest.json"
             with mock.patch.object(maintenance, "LATEST_FILE", latest):
-                self._assert_unavailable_postcheck_state()
+                summary = self._assert_unavailable_postcheck_state()
+                self.assertEqual(
+                    maintenance.protected_mirror_operation_ids(summary),
+                    ["pending-operation-123"],
+                )
+                recovered_previous = dict(summary)
+                recovered_previous["lastMirrorAttempt"] = {
+                    **summary["lastMirrorAttempt"],
+                    "result": "applied",
+                    "postcheckStatus": "ok",
+                }
+                recovered = maintenance.write_attempt(
+                    recovered_previous,
+                    status="postcheck-recovered",
+                    source={"accessExpiresAt": "2026-10-09T15:14:22Z", "lastRefresh": "2026-09-29T15:14:22Z"},
+                )
+                self.assertEqual(recovered["pendingMirrorOperationIds"], [])
+                for blocked_result in ("blocked", "failed"):
+                    blocked_previous = dict(summary)
+                    blocked_previous["lastMirrorAttempt"] = {
+                        **summary["lastMirrorAttempt"],
+                        "result": blocked_result,
+                        "postcheckStatus": "blocked" if blocked_result == "blocked" else "unresolved-actions",
+                        "applyResult": "applied",
+                    }
+                    maintenance.mark_last_mirror_postcheck_resolved(blocked_previous)
+                    recovered = maintenance.write_attempt(
+                        blocked_previous,
+                        status="postcheck-recovered",
+                        source={"accessExpiresAt": "2026-10-09T15:14:22Z", "lastRefresh": "2026-09-29T15:14:22Z"},
+                    )
+                    self.assertEqual(recovered["pendingMirrorOperationIds"], [])
 
     def _assert_unavailable_postcheck_state(self):
         source = {"accessExpiresAt": "2026-10-09T15:14:22Z", "lastRefresh": "2026-09-29T15:14:22Z"}
         actions = [{"actionId": "source-generation", "localSourceChange": True}]
         mirror = {
             "result": "applied",
+            "operationId": "pending-operation-123",
             "sourceWide": True,
             "mirrorScope": {"codexCli": True, "hermersProfiles": ["catbody"], "openclawTargets": []},
             "postcheck": {"status": "unavailable"},
@@ -381,6 +451,8 @@ class MirrorDecisionTests(unittest.TestCase):
         self.assertEqual(summary["lastSuccessfulMirror"]["postcheckOk"], False)
         self.assertEqual(summary["lastSuccessfulMirror"]["postcheckStatus"], "unavailable")
         self.assertEqual(summary["lastMirrorAttempt"]["result"], "postcheck-pending")
+        self.assertEqual(summary["pendingMirrorOperationIds"], ["pending-operation-123"])
+        return summary
 
     def test_remote_receiver_rejects_symlink_escape_and_secures_auth_backups(self):
         namespace = {"__name__": "remote_receiver_test"}
@@ -402,6 +474,79 @@ class MirrorDecisionTests(unittest.TestCase):
             backup = namespace["backup_file"](source, backups, "auth.json")
             self.assertEqual(pathlib.Path(backup).stat().st_mode & 0o777, 0o600)
             self.assertEqual(backups.stat().st_mode & 0o777, 0o700)
+            original = pathlib.Path(backup).read_text(encoding="utf-8")
+            source.write_text('{"refresh_token":"changed-after-first-attempt"}\n', encoding="utf-8")
+            self.assertEqual(namespace["backup_file"](source, backups, "auth.json"), backup)
+            self.assertEqual(pathlib.Path(backup).read_text(encoding="utf-8"), original)
+            broken_backups = base / "interrupted-artifact" / "backups"
+            with mock.patch.object(namespace["shutil"], "copyfileobj", side_effect=OSError("simulated copy interruption")):
+                with self.assertRaisesRegex(OSError, "simulated copy interruption"):
+                    namespace["backup_file"](source, broken_backups, "auth.json")
+            self.assertFalse((broken_backups / "auth.json").exists())
+            self.assertEqual(list(broken_backups.glob("auth.json.*.tmp")), [])
+            broken_backups.mkdir(parents=True, exist_ok=True)
+            corrupt_backup = broken_backups / "auth.json"
+            corrupt_backup.write_text("partial json", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                namespace["backup_file"](source, broken_backups, "auth.json")
+
+            database = base / "auth.sqlite"
+            connection = sqlite3.connect(database)
+            connection.execute("create table state(value text)")
+            connection.execute("insert into state values ('before')")
+            connection.commit()
+            connection.close()
+            db_backup = namespace["backup_sqlite"](str(database), backups, "auth.sqlite")
+            connection = sqlite3.connect(database)
+            connection.execute("insert into state values ('after')")
+            connection.commit()
+            connection.close()
+            self.assertEqual(namespace["backup_sqlite"](str(database), backups, "auth.sqlite"), db_backup)
+            connection = sqlite3.connect(db_backup[0])
+            self.assertEqual(connection.execute("select value from state").fetchall(), [("before",)])
+            connection.close()
+            pathlib.Path(db_backup[0]).write_text("partial sqlite", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "sqlite-backup-integrity-check-failed"):
+                namespace["backup_sqlite"](str(database), backups, "auth.sqlite")
+
+    def test_mirror_backup_retention_keeps_three_successes_and_all_unresolved_artifacts(self):
+        namespace = {"__name__": "remote_receiver_test"}
+        exec(compile(mirror_cli.REMOTE_RECEIVER, "remote_receiver.py", "exec"), namespace)
+        with tempfile.TemporaryDirectory(prefix="auth-refresh-retention-test-") as tmp:
+            root = pathlib.Path(tmp)
+            successful = []
+            for index in range(4):
+                artifact = root / f"operation-{index}-mac-codex-oauth-mirror"
+                artifact.mkdir()
+                (artifact / "index.json").write_text(json.dumps({"status": "applied"}), encoding="utf-8")
+                os.utime(artifact, ns=(index + 1, index + 1))
+                successful.append(artifact)
+            unresolved = root / "failed-op-mac-codex-oauth-mirror"
+            unresolved.mkdir()
+            (unresolved / "index.json").write_text(json.dumps({"status": "partial-failure"}), encoding="utf-8")
+            namespace["prune_successful_mirror_artifacts"](root, successful[-1], ["operation-0"])
+            retained = {path.name for path in root.glob("*-mac-codex-oauth-mirror") if path.is_dir()}
+            self.assertEqual(
+                retained,
+                {
+                    "operation-0-mac-codex-oauth-mirror",
+                    "operation-1-mac-codex-oauth-mirror",
+                    "operation-2-mac-codex-oauth-mirror",
+                    "operation-3-mac-codex-oauth-mirror",
+                    "failed-op-mac-codex-oauth-mirror",
+                },
+            )
+            namespace["prune_successful_mirror_artifacts"](root, successful[-1], [])
+            retained = {path.name for path in root.glob("*-mac-codex-oauth-mirror") if path.is_dir()}
+            self.assertEqual(
+                retained,
+                {
+                    "operation-1-mac-codex-oauth-mirror",
+                    "operation-2-mac-codex-oauth-mirror",
+                    "operation-3-mac-codex-oauth-mirror",
+                    "failed-op-mac-codex-oauth-mirror",
+                },
+            )
 
     def test_codex_refresh_request_has_no_user_config_or_local_tools(self):
         source = {
@@ -448,16 +593,24 @@ class MirrorDecisionTests(unittest.TestCase):
         completed = subprocess.CompletedProcess([], 0, '{"status":"ok"}', "")
         with mock.patch.object(stabilityd_cli.platform, "system", return_value="Darwin"):
             with mock.patch.object(stabilityd_cli, "run_cmd", return_value=completed) as run:
-                stabilityd_cli.main(["auth-mirror", "--apply", "--codex-auth", auth_path])
+                stabilityd_cli.main([
+                    "auth-mirror", "--apply", "--codex-auth", auth_path,
+                    "--mirror-operation-id", "retry-operation-123",
+                    "--protect-operation-ids", "unresolved-operation-456",
+                ])
         command = run.call_args.args[0]
         self.assertIn("--apply", command)
         self.assertIn("--codex-auth", command)
         self.assertEqual(command[command.index("--codex-auth") + 1], auth_path)
+        self.assertIn("--mirror-operation-id", command)
+        self.assertEqual(command[command.index("--mirror-operation-id") + 1], "retry-operation-123")
+        self.assertIn("--protect-operation-ids", command)
+        self.assertEqual(command[command.index("--protect-operation-ids") + 1], "unresolved-operation-456")
 
     def test_remote_openclaw_mirror_result_uses_json_serializable_path(self):
         self.assertIn('"path": str(db_path)', mirror_cli.REMOTE_RECEIVER)
 
-    def test_remote_plan_fetch_bypasses_openclaw_auth_probe_cache(self):
+    def test_remote_plan_poll_is_lightweight_and_fresh_probe_bypasses_openclaw_cache(self):
         plan = {"schemaVersion": 1, "actions": []}
         with tempfile.TemporaryDirectory(prefix="auth-refresh-plan-test-") as tmp:
             plan_path = pathlib.Path(tmp) / "remote-plan.json"
@@ -470,8 +623,271 @@ class MirrorDecisionTests(unittest.TestCase):
                 with mock.patch.object(maintenance.subprocess, "run", side_effect=fake_ssh) as run:
                     fetched, _server, _errors, _path = maintenance.fetch_remote_plan()
             remote_command = run.call_args.args[0][-1]
+            self.assertTrue(remote_command.endswith("auth-maintenance"), remote_command)
+            self.assertEqual(fetched, plan)
+            with mock.patch.object(maintenance, "REMOTE_PLAN_FILE", plan_path):
+                with mock.patch.object(maintenance.subprocess, "run", side_effect=fake_ssh) as run:
+                    fetched, _server, _errors, _path = maintenance.fetch_remote_plan(force_openclaw_probe=True)
+            remote_command = run.call_args.args[0][-1]
             self.assertTrue(remote_command.endswith("auth-maintenance --fresh --force-openclaw-probe"), remote_command)
             self.assertEqual(fetched, plan)
+
+    def test_remote_plan_schedule_uses_15_second_request_polls_and_15_minute_fresh_probes(self):
+        previous = {
+            "remotePlanFetchedAtEpoch": 1000,
+            "remoteFreshPlanFetchedAtEpoch": 1000,
+        }
+        plan = {"schemaVersion": 1, "actions": []}
+        self.assertEqual(
+            maintenance.remote_plan_fetch_policy(previous, plan, {}, now_epoch=1010),
+            (False, False),
+        )
+        self.assertEqual(
+            maintenance.remote_plan_fetch_policy(previous, plan, {}, now_epoch=1015),
+            (True, False),
+        )
+        self.assertEqual(
+            maintenance.remote_plan_fetch_policy(previous, plan, {}, now_epoch=1900),
+            (True, True),
+        )
+
+    def test_server_auth_request_forces_probe_but_respects_retry_backoff(self):
+        action = {
+            "actionId": "hermers_catbody_token_sync_or_refresh",
+            "target": "hermers:catbody",
+            "kind": "sync-or-refresh",
+            "humanGateRequired": False,
+            "localAutomation": {"eligible": True, "owner": "mac-codex", "mode": "access-id-token-mirror"},
+        }
+        plan = {
+            "schemaVersion": 1,
+            "macCodexExecutor": {
+                "supported": True,
+                "refreshOwner": "mac-codex",
+                "refreshBrokerEnabled": False,
+            },
+            "actions": [action],
+        }
+        previous = {"remotePlanFetchedAtEpoch": 1000, "remoteFreshPlanFetchedAtEpoch": 1000}
+        self.assertEqual(
+            maintenance.remote_plan_fetch_policy(previous, plan, {}, now_epoch=1010),
+            (True, True),
+        )
+        failed = {
+            **previous,
+            "lastMirrorAttempt": {
+                "result": "failed",
+                "refreshConditionKey": maintenance.refresh_condition_key({}),
+                "actionIds": [action["actionId"]],
+                "attemptedAtEpoch": 1005,
+                "retryAfterSeconds": 60,
+            },
+        }
+        self.assertEqual(
+            maintenance.remote_plan_fetch_policy(failed, plan, {}, now_epoch=1010),
+            (False, False),
+        )
+
+    def test_new_action_in_lightweight_fetch_requires_fresh_validation(self):
+        plan = {
+            "schemaVersion": 1,
+            "generatedAtEpochNs": 1_000_000_100,
+            "macCodexExecutor": {
+                "supported": True,
+                "refreshOwner": "mac-codex",
+                "refreshBrokerEnabled": False,
+            },
+            "actions": [{
+                "actionId": "openclaw_main_openai_reauth_or_sync",
+                "target": "openclaw:main:openai",
+                "humanGateRequired": False,
+                "localAutomation": {"eligible": True, "owner": "mac-codex", "mode": "access-id-token-mirror"},
+            }],
+        }
+        self.assertTrue(maintenance.latest_plan_has_unvalidated_mac_request(plan, None))
+        self.assertFalse(
+            maintenance.latest_plan_has_unvalidated_mac_request({**plan, "source": "fresh"}, None)
+        )
+        success = {
+            "postcheckOk": True,
+            "remotePlanGeneratedAtEpochNs": plan["generatedAtEpochNs"],
+        }
+        self.assertFalse(maintenance.latest_plan_has_unvalidated_mac_request(plan, success))
+
+    def test_new_request_does_not_force_probe_during_mirror_backoff(self):
+        source = {"accessExpiresAt": "2026-10-09T15:14:22Z", "lastRefresh": "2026-09-29T15:14:22Z"}
+        plan = {
+            "schemaVersion": 1,
+            "macCodexExecutor": {
+                "supported": True,
+                "refreshOwner": "mac-codex",
+                "refreshBrokerEnabled": False,
+            },
+            "actions": [{
+                "actionId": "openclaw_main_openai_reauth_or_sync",
+                "target": "openclaw:main:openai",
+                "humanGateRequired": False,
+                "localAutomation": {"eligible": True, "owner": "mac-codex", "mode": "access-id-token-mirror"},
+            }],
+        }
+        previous = {
+            "lastMirrorAttempt": {
+                "result": "failed",
+                "refreshConditionKey": maintenance.refresh_condition_key(source),
+                "actionIds": ["openclaw_main_openai_reauth_or_sync"],
+                "attemptedAtEpoch": 1005,
+                "retryAfterSeconds": 60,
+            }
+        }
+        self.assertFalse(
+            maintenance.latest_plan_has_unvalidated_mac_request(plan, None, previous, source, 1010)
+        )
+        self.assertFalse(
+            maintenance.latest_plan_has_unvalidated_mac_request(plan, None, previous, source, 1064)
+        )
+        self.assertTrue(
+            maintenance.latest_plan_has_unvalidated_mac_request(plan, None, previous, source, 1065)
+        )
+
+    def test_openclaw_auth_probe_cache_ttl_accelerates_near_expiry(self):
+        now = 1_800_000_000
+
+        def cached_with_remaining(remaining):
+            return {
+                "available": True,
+                "checkedAtEpoch": now,
+                "profiles": [{
+                    "provider": "openai",
+                    "expiresEpoch": now + remaining,
+                    "secondsRemaining": remaining,
+                }],
+            }
+
+        self.assertEqual(
+            stabilityd_cli.openclaw_auth_probe_cache_ttl(cached_with_remaining(48 * 3600), now_epoch=now),
+            stabilityd_cli.AUTH_OPENCLAW_PROBE_TTL_SECONDS,
+        )
+        self.assertEqual(
+            stabilityd_cli.openclaw_auth_probe_cache_ttl(cached_with_remaining(23 * 3600), now_epoch=now),
+            stabilityd_cli.AUTH_OPENCLAW_PROBE_NEAR_TTL_SECONDS,
+        )
+        self.assertEqual(
+            stabilityd_cli.openclaw_auth_probe_cache_ttl(cached_with_remaining(5 * 60), now_epoch=now),
+            stabilityd_cli.AUTH_OPENCLAW_PROBE_URGENT_TTL_SECONDS,
+        )
+        self.assertEqual(
+            stabilityd_cli.openclaw_auth_probe_cache_ttl({"available": False}, now_epoch=now),
+            stabilityd_cli.AUTH_OPENCLAW_PROBE_ERROR_TTL_SECONDS,
+        )
+        stale_and_fresh = cached_with_remaining(48 * 3600)
+        stale_and_fresh["profiles"].append({
+            "provider": "openai",
+            "expiresEpoch": now - 60,
+            "secondsRemaining": -60,
+        })
+        stale_and_fresh["profiles"][0]["provider"] = "openai"
+        self.assertEqual(
+            stabilityd_cli.openclaw_auth_probe_cache_ttl(stale_and_fresh, now_epoch=now),
+            stabilityd_cli.AUTH_OPENCLAW_PROBE_TTL_SECONDS,
+        )
+
+    def test_cached_openclaw_probe_updates_expiry_countdown_and_due_time(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)")
+        now = 1_800_000_000
+        stabilityd_cli.db_set(
+            conn,
+            "auth:openclaw:main",
+            {
+                "agentId": "main",
+                "checkedAtEpoch": now - 5,
+                "available": True,
+                "profiles": [{"provider": "openai", "expiresEpoch": now + 10, "secondsRemaining": 15}],
+            },
+        )
+        with mock.patch.object(stabilityd_cli, "epoch", return_value=now):
+            result = stabilityd_cli.cached_openclaw_auth_probe(conn, "main")
+        self.assertTrue(result["cached"])
+        self.assertEqual(result["profiles"][0]["secondsRemaining"], 10)
+        self.assertEqual(result["cacheTtlSeconds"], stabilityd_cli.AUTH_OPENCLAW_PROBE_URGENT_TTL_SECONDS)
+        self.assertEqual(result["nextProbeDueAtEpoch"], now - 5 + result["cacheTtlSeconds"])
+
+    def test_postchecked_snapshot_suppression_allows_a_newer_expiry_request(self):
+        action = {"actionId": "openclaw_main_openai_reauth_or_sync", "target": "openclaw:main:openai"}
+        selected = [action]
+        success = {
+            "postcheckOk": True,
+            "postcheckStatus": "ok",
+            "mirrorCompletedAtEpoch": 1000,
+            "remotePlanGeneratedAt": "2026-10-01T10:00:05Z",
+            "mirrorActionIds": [action["actionId"]],
+            "sourceWide": False,
+        }
+        old_plan = {"generatedAt": "2026-10-01T10:00:00Z"}
+        new_plan = {"generatedAt": "2026-10-01T10:00:30Z"}
+        self.assertEqual(
+            maintenance.filter_postchecked_mirror_actions(selected, old_plan, success, now_epoch=1010),
+            [],
+        )
+        self.assertEqual(
+            maintenance.filter_postchecked_mirror_actions(selected, new_plan, success, now_epoch=1010),
+            selected,
+        )
+
+    def test_sourcewide_postcheck_suppresses_only_actions_from_that_plan_snapshot(self):
+        selected = [
+            {"actionId": "hermers_catbody_token_sync_or_refresh", "target": "hermers:catbody"},
+            {"actionId": "openclaw_main_openai_reauth_or_sync", "target": "openclaw:main:openai"},
+        ]
+        success = {
+            "postcheckOk": True,
+            "mirrorCompletedAtEpoch": 1000,
+            "remotePlanGeneratedAt": "2026-10-01T10:00:05Z",
+            "sourceWide": True,
+            "mirrorScope": {
+                "codexCli": True,
+                "hermersProfiles": ["catbody"],
+                "openclawTargets": [{"agentId": "main", "profileKind": "openai"}],
+            },
+        }
+        old_plan = {"generatedAt": "2026-10-01T10:00:00Z"}
+        new_plan = {"generatedAt": "2026-10-01T10:00:30Z"}
+        self.assertEqual(
+            maintenance.filter_postchecked_mirror_actions(selected, old_plan, success, now_epoch=1010),
+            [],
+        )
+        self.assertEqual(
+            maintenance.filter_postchecked_mirror_actions(selected, new_plan, success, now_epoch=1010),
+            selected,
+        )
+
+    def test_plan_generation_nanoseconds_distinguish_same_second_snapshots(self):
+        action = {"actionId": "openclaw_main_openai_reauth_or_sync", "target": "openclaw:main:openai"}
+        selected = [action]
+        success = {
+            "postcheckOk": True,
+            "mirrorCompletedAtEpoch": 1000,
+            "remotePlanGeneratedAt": "2026-10-01T10:00:00Z",
+            "remotePlanGeneratedAtEpochNs": 1_000_000_200,
+            "mirrorActionIds": [action["actionId"]],
+            "sourceWide": False,
+        }
+        old_plan = {
+            "generatedAt": "2026-10-01T10:00:00Z",
+            "generatedAtEpochNs": 1_000_000_100,
+        }
+        new_plan = {
+            "generatedAt": "2026-10-01T10:00:00Z",
+            "generatedAtEpochNs": 1_000_000_300,
+        }
+        self.assertEqual(
+            maintenance.filter_postchecked_mirror_actions(selected, old_plan, success, now_epoch=1010),
+            [],
+        )
+        self.assertEqual(
+            maintenance.filter_postchecked_mirror_actions(selected, new_plan, success, now_epoch=1010),
+            selected,
+        )
 
     def test_mtime_only_change_does_not_trigger_duplicate_mirror_when_expiry_is_known(self):
         self.assertFalse(
