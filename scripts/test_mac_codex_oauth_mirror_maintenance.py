@@ -454,6 +454,9 @@ class MirrorDecisionTests(unittest.TestCase):
         self.assertIn("--codex-auth", command)
         self.assertEqual(command[command.index("--codex-auth") + 1], auth_path)
 
+    def test_remote_openclaw_mirror_result_uses_json_serializable_path(self):
+        self.assertIn('"path": str(db_path)', mirror_cli.REMOTE_RECEIVER)
+
     def test_remote_plan_fetch_bypasses_openclaw_auth_probe_cache(self):
         plan = {"schemaVersion": 1, "actions": []}
         with tempfile.TemporaryDirectory(prefix="auth-refresh-plan-test-") as tmp:

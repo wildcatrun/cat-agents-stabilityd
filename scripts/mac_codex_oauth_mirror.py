@@ -368,7 +368,7 @@ def apply_openclaw(payload, artifact, dry_run):
                 conn.commit()
             results.append({
                 "target": f"openclaw:{agent_id}:{','.join(profile_kinds)}",
-                "path": db_path,
+                "path": str(db_path),
                 "backups": backups,
                 "updatedProfiles": updated_keys,
                 "wouldWrite": bool(dry_run),
