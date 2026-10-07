@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "workflowSchemaVersion": 1,
+  "generatedAt": "2000-01-01T00:00:00Z",
+  "records": [
+    {
+      "agentId": "main",
+      "runtime": "openclaw",
+      "displayName": "Cat Brain",
+      "role": "governance",
+      "status": "active",
+      "platform": "openclaw",
+      "executionAdapter": "openclaw",
+      "endpointRef": "openclaw-agent:main",
+      "canReceiveDispatch": true,
+      "canStartWorkflow": false,
+      "gatewayProxyAllowed": false
+    }
+  ],
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "captureMethod": "compile only two source-hash-pinned AST functions after stripping copied annotations; use canonical records with explicit capability values",
+  "baselineSymbolSha256": {
+    "_snapshot_bool": "a9c9ad87958e8442d45b00c7fb7ddc7f8090d2372202ced94255f75e787681ff",
+    "_registry_snapshot_records": "31139f0222b205368bc02c172a26405b5be00948e2a4223412a55d0ed289b068"
+  },
+  "expectedRecords": [
+    {
+      "agent_key": "openclaw:main",
+      "agent_id": "main",
+      "runtime": "openclaw",
+      "display_name": "Cat Brain",
+      "role": "governance",
+      "status": "active",
+      "platform": "openclaw",
+      "execution_adapter": "openclaw",
+      "im_ingress_owner": "",
+      "im_ingress_adapter": "",
+      "workflow_ingress_adapter": "",
+      "can_receive_dispatch": 1,
+      "can_start_workflow": 0,
+      "gateway_proxy_allowed": 0,
+      "endpoint_ref": "openclaw-agent:main",
+      "updated_at": "2000-01-01T00:00:00Z"
+    }
+  ]
+}

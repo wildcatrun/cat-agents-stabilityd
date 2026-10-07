@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "captureMethod": "compile one source-hash-pinned AST function with annotations removed and restricted builtins; compare parsed payload only",
+  "baselineSymbol": "extract_json_payload",
+  "baselineSymbolSha256": "36510b6c756204b46dac98930d99fa3296ab47dceb6cd8c3ef89dac8e4340f82",
+  "cases": [
+    {
+      "name": "bare-object",
+      "input": "{\"ok\":true,\"items\":[1,\"猫\"]}",
+      "expectedPayload": {
+        "ok": true,
+        "items": [
+          1,
+          "猫"
+        ]
+      }
+    },
+    {
+      "name": "migration-preamble-object",
+      "input": "Legacy state migration warning Authorization: Bearer FIXTURE_SECRET_DO_NOT_PERSIST\n{\"ok\":true,\"source\":\"fixture\"}",
+      "expectedPayload": {
+        "ok": true,
+        "source": "fixture"
+      }
+    },
+    {
+      "name": "invalid-object-start-before-valid-array",
+      "input": "noise {invalid; payload follows: [1,2,3]",
+      "expectedPayload": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "name": "valid-object-with-trailing-text",
+      "input": "{\"items\":[\"a\",2]}\ntrailing status note",
+      "expectedPayload": {
+        "items": [
+          "a",
+          2
+        ]
+      }
+    }
+  ]
+}

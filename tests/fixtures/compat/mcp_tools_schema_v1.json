@@ -1,0 +1,237 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "source": "Captured by invoking pinned baseline handle_request(tools/list); only names and inputSchema are contractual in this fixture.",
+  "tools": {
+    "stability_status": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "stability_findings": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "stability_lanes": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "stability_profile_modes": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "stability_actions": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ]
+        },
+        "limit": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": false
+    },
+    "stability_runbook": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "stability_desired_state": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "stability_drift_check": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "stability_workflow_evidence": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "stability_auth_readiness": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ]
+        },
+        "fresh": {
+          "type": "boolean"
+        },
+        "timeout": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": false
+    },
+    "stability_auth_maintenance": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ]
+        },
+        "fresh": {
+          "type": "boolean"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "execute": {
+          "type": "boolean"
+        },
+        "action_id": {
+          "type": "string"
+        },
+        "allow_mirror": {
+          "type": "boolean"
+        },
+        "timeout": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": false
+    },
+    "stability_auth_mirror": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ]
+        },
+        "apply": {
+          "type": "boolean"
+        },
+        "timeout": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": false
+    },
+    "stability_doctor_dry_run": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ]
+        },
+        "timeout": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": false
+    },
+    "stability_server_snapshot": {
+      "type": "object",
+      "properties": {
+        "max_files": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": false
+    },
+    "stability_package_status": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additiveCandidateTools": [
+    "stability_action_classes",
+    "stability_nodes",
+    "stability_preflight",
+    "stability_recovery",
+    "stability_surfaces"
+  ]
+}

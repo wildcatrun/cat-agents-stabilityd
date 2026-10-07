@@ -1,0 +1,33 @@
+{
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "sourcePath": "bin/cat_agents_stabilityd.py",
+  "sourceFileSha256": "d0bce493b3422d48da976682fdc801fee764b7025bedb169564a6c91aa041a97",
+  "symbols": {
+    "init_db": {
+      "source": "def init_db() -> sqlite3.Connection:\n    ensure_dirs()\n    conn = sqlite3.connect(str(STATE_DB))\n    conn.execute(\"PRAGMA journal_mode=WAL\")\n    conn.execute(\"PRAGMA synchronous=NORMAL\")\n    conn.execute(\n        \"CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)\"\n    )\n    conn.execute(\n        \"CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_epoch INTEGER NOT NULL, source TEXT, component TEXT, severity TEXT, key TEXT, payload TEXT NOT NULL)\"\n    )\n    conn.execute(\n        \"CREATE TABLE IF NOT EXISTS actions (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_epoch INTEGER NOT NULL, action_id TEXT, action TEXT, result TEXT, payload TEXT NOT NULL)\"\n    )\n    conn.commit()\n    return conn",
+      "sourceSha256": "a7e8f98c5f0a763ab5294df7f8034e85b841631705d829fef03b4f42df605cba",
+      "astSha256": "3dc778d2c9c2f37982195b2447091509cc5eea39816c454b5a5c64abb1fb5fc5"
+    },
+    "db_get": {
+      "source": "def db_get(conn: sqlite3.Connection, key: str, default: Any = None) -> Any:\n    row = conn.execute(\"SELECT value FROM kv WHERE key = ?\", (key,)).fetchone()\n    if not row:\n        return default\n    try:\n        return json.loads(row[0])\n    except Exception:\n        return default",
+      "sourceSha256": "ee27c916605a8a890363e9ce1dd07e6cad2c7be391bb981526ec808ef4988866",
+      "astSha256": "04142e4d56ce0bfa8baad1b50bd5e00b6b71be3b8508d9781add66272c926e0c"
+    },
+    "db_set": {
+      "source": "def db_set(conn: sqlite3.Connection, key: str, value: Any) -> None:\n    conn.execute(\n        \"INSERT INTO kv(key, value, updated_at) VALUES(?, ?, ?) \"\n        \"ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at\",\n        (key, json.dumps(value, ensure_ascii=False), epoch()),\n    )\n    conn.commit()",
+      "sourceSha256": "02360564e4e274d9823106dcaf45e43ea45c7acc65b508d82d965130bb60a792",
+      "astSha256": "fd66f4d3bcef5517bec3afd977c25c05e8b9b11c1dbebc428c424919aced837a"
+    },
+    "recent_restart_history": {
+      "source": "def recent_restart_history(conn: sqlite3.Connection) -> List[int]:\n    history = db_get(conn, \"stabilityd_gateway_restart_history\", []) or []\n    cutoff = epoch() - RESTART_WINDOW_SECONDS\n    return [int(x) for x in history if int(x) >= cutoff]",
+      "sourceSha256": "a059062c329a7b6d1d2df63bd3882ca4f683d39d458867c544c7214e96b7cba7",
+      "astSha256": "6e5ea8302daf14e9be4faf7010a05149cc9d8a5933aec2693f6f1f40baa648a4"
+    },
+    "recent_hermers_gateway_restart_history": {
+      "source": "def recent_hermers_gateway_restart_history(conn: sqlite3.Connection) -> List[Dict[str, Any]]:\n    history = db_get(conn, \"stabilityd_hermers_gateway_restart_history\", []) or []\n    cutoff = epoch() - RESTART_WINDOW_SECONDS\n    normalized = []\n    for item in history:\n        try:\n            if isinstance(item, dict):\n                ts_epoch = int(item.get(\"tsEpoch\") or 0)\n                profile = str(item.get(\"profile\") or \"\")\n            else:\n                ts_epoch = int(item or 0)\n                profile = \"\"\n        except Exception:\n            continue\n        if ts_epoch >= cutoff:\n            normalized.append({\"tsEpoch\": ts_epoch, \"profile\": profile})\n    return normalized",
+      "sourceSha256": "4b0a9432c90383a50226c042fe5d6f5638e4e4e24a57a45eec81548ccf9a7364",
+      "astSha256": "bb4e8f95af41b90b2d8333e751061b1e967fcaafc11560300e980f0186793a8e"
+    }
+  },
+  "rollbackBoundary": "Old version ignores action_ledger; restore observe/actuator-off until uncertain effects are reviewed."
+}

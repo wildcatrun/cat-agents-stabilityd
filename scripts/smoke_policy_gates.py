@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import socket
 import tempfile
 from pathlib import Path
 
@@ -149,24 +150,41 @@ Plugin version drift: 1 active official plugins not on gateway 2026.6.8
         stabilityd.ensure_dirs()
         lease_path = stabilityd.LEASE_DIR / "job-lease.json"
         run_path = stabilityd.RUNS_BY_RUN_DIR / "run-1.json"
+        stabilityd.current_host_generation = lambda: "fixture-node:boot"
         stabilityd.write_json_atomic(
             lease_path,
-            {"jobId": "job-1", "runId": "run-1", "expiresAtMs": stabilityd.now_ms() - 1000},
+            {"jobId": "job-1", "runId": "run-1",
+             "leaseOwner": f"{socket.gethostname()}:987654321",
+             "workloadOwner": {"host": socket.gethostname(), "pid": 987654322},
+             "workloadState": "running",
+             "dispatchState": "not-started",
+             "expiresAtMs": stabilityd.now_ms() - 1000},
         )
         stabilityd.write_json_atomic(
             run_path,
-            {"jobId": "job-1", "runId": "run-1", "status": "running", "startedAtMs": stabilityd.now_ms() - 5000},
+            {"jobId": "job-1", "runId": "run-1", "status": "running",
+             "startedAtMs": stabilityd.now_ms() - 5000, "dispatchState": "not-started"},
         )
-        cron_actions = stabilityd.cron_actuate(
-            {
-                "cron": {
-                    "storageStatus": {"storage": "sqlite"},
-                    "staleRunning": [{"jobId": "job-1", "ageMs": 999999, "thresholdMs": 1}],
-                    "expiredLeases": [{"path": str(lease_path), "jobId": "job-1", "runId": "run-1"}],
-                }
-            },
-            {"canMutateCronState": False, "cronMutationBlockedReason": "openclaw-sqlite-cron-storage"},
-        )
+        real_os_kill = stabilityd.os.kill
+        def fixture_owner_is_absent(_pid, _signal):
+            raise ProcessLookupError
+        stabilityd.os.kill = fixture_owner_is_absent
+        try:
+            cron_actions = stabilityd.cron_actuate(
+                {
+                    "generationId": "fixture-generation",
+                    "cron": {
+                        "storageStatus": {"storage": "sqlite"},
+                        "staleRunning": [{"jobId": "job-1", "ageMs": 999999, "thresholdMs": 1}],
+                        "expiredLeases": [{"path": str(lease_path), "jobId": "job-1", "runId": "run-1"}],
+                    }
+                },
+                {"canMutateCronState": False, "canReapExpiredLeases": True,
+                 "cronMutationBlockedReason": "openclaw-sqlite-cron-storage",
+                 "updatedAtEpoch": stabilityd.epoch(), "validUntilEpoch": stabilityd.epoch() + 60},
+            )
+        finally:
+            stabilityd.os.kill = real_os_kill
         checks["sqlite_cron_blocks_legacy_job_mutation"] = any(
             item.get("result") == "legacy_jobs_mutation_blocked_by_sqlite_storage" for item in cron_actions
         )
@@ -206,8 +224,7 @@ Plugin version drift: 1 active official plugins not on gateway 2026.6.8
                     "idleSinceEpoch": now_s - 11,
                     "lastSeenEpoch": now_s - 1,
                 }
-            },
-        )
+            }, )
         idle_lsp = stabilityd.update_hermers_lsp_idle_state(conn, [lsp_process])[0]
         checks["idle_lsp_unchanged_cpu_candidate"] = bool(idle_lsp.get("idleCandidate"))
         active_lsp = stabilityd.update_hermers_lsp_idle_state(conn, [{**lsp_process, "cpuTicks": 101}])[0]
@@ -226,23 +243,35 @@ Plugin version drift: 1 active official plugins not on gateway 2026.6.8
             },
         ]
         original_proc_cpu_ticks = stabilityd.proc_cpu_ticks
+        original_read_process_identity = stabilityd.read_process_identity
         try:
+            identity = {
+                "status": "known", "pid": 12345, "starttime": 99, "uid": 1000, "euid": 1000,
+                "bootId": "fixture-boot", "cmdlineDigest": "fixture-cmd", "cgroupDigest": "fixture-cgroup",
+            }
+            stabilityd.read_process_identity = lambda _pid: dict(identity)
+            lsp_identity = {
+                **lsp_process, "processIdentity": dict(identity), "agentIds": ["cat_nose"],
+                "registryProfile": "catnose", "registryProfileMatched": True,
+                "registryScopeComplete": True,
+            }
             stabilityd.proc_cpu_ticks = lambda _pid: 1
             checks["idle_lsp_zero_baseline_cpu_advance_blocks"] = stabilityd.verify_hermers_idle_lsp(
                 12345,
                 "catnose",
-                {**lsp_process, "cpuTicks": 0, "idleObservedSeconds": 11},
+                {**lsp_identity, "cpuTicks": 0, "idleObservedSeconds": 11},
                 verify_rows,
             ) == (False, "cpu-advanced-after-snapshot")
             stabilityd.proc_cpu_ticks = lambda _pid: 0
             checks["idle_lsp_zero_baseline_unchanged_allows_verify"] = stabilityd.verify_hermers_idle_lsp(
                 12345,
                 "catnose",
-                {**lsp_process, "cpuTicks": 0, "idleObservedSeconds": 11},
+                {**lsp_identity, "cpuTicks": 0, "idleObservedSeconds": 11},
                 verify_rows,
             ) == (True, "verified-idle-lsp")
         finally:
             stabilityd.proc_cpu_ticks = original_proc_cpu_ticks
+            stabilityd.read_process_identity = original_read_process_identity
         conn.close()
 
         failed = [name for name, ok in checks.items() if not ok]

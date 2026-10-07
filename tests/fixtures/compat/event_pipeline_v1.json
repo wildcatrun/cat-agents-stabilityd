@@ -1,0 +1,2352 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "sourceHashes": {
+    "append_jsonl": "b3ceb0aa6274c4471fc9926ac71412e9e2ffb327d14fe22c782e560654647723",
+    "db_record_event": "c107d3fca312a5901eb8fa8a05de4c7f47ab142db226f8854a7d146fa250b9f8",
+    "tail_jsonl": "4fd4b47649d308ed2d344efc6615154494ab31279c4a65f6cf6f3bd1f583b838",
+    "main_events_branch": "07e4f3e43f57257e2cdfe5f86b3d1daafde10cafae6990efc25025a53b582d29"
+  },
+  "captureMethod": "Compile only three source-hash-pinned writer/reader functions and the events CLI branch; use synthetic events, a temporary SQLite DB, and temporary JSONL",
+  "eventCount": 53,
+  "cliLimit": 50,
+  "inputEvents": [
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244800,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-000",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 0
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244801,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-001",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 1
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244802,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-002",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 2
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244803,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-003",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 3
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244804,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-004",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 4
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244805,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-005",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 5
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244806,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-006",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 6
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244807,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-007",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 7
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244808,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-008",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 8
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244809,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-009",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 9
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244810,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-010",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 10
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244811,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-011",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 11
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244812,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-012",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 12
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244813,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-013",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 13
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244814,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-014",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 14
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244815,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-015",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 15
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244816,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-016",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 16
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244817,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-017",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 17
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244818,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-018",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 18
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244819,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-019",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 19
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244820,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-020",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 20
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244821,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-021",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 21
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244822,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-022",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 22
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244823,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-023",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 23
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244824,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-024",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 24
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244825,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-025",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 25
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244826,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-026",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 26
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244827,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-027",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 27
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244828,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-028",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 28
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244829,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-029",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 29
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244830,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-030",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 30
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244831,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-031",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 31
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244832,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-032",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 32
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244833,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-033",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 33
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244834,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-034",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 34
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244835,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-035",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 35
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244836,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-036",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 36
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244837,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-037",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 37
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244838,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-038",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 38
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244839,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-039",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 39
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244840,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-040",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 40
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244841,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-041",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 41
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244842,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-042",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 42
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244843,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-043",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 43
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244844,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-044",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 44
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244845,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-045",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 45
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244846,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-046",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 46
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244847,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-047",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 47
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244848,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-048",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 48
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244849,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-049",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 49
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244850,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-050",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 50
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244851,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-051",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 51
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244852,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-052",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 52
+      }
+    }
+  ],
+  "expectedRows": [
+    {
+      "id": 1,
+      "ts_epoch": 1791244800,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-000",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244800, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-000\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 0}}"
+    },
+    {
+      "id": 2,
+      "ts_epoch": 1791244801,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-001",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244801, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-001\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 1}}"
+    },
+    {
+      "id": 3,
+      "ts_epoch": 1791244802,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-002",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244802, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-002\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 2}}"
+    },
+    {
+      "id": 4,
+      "ts_epoch": 1791244803,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-003",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244803, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-003\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 3}}"
+    },
+    {
+      "id": 5,
+      "ts_epoch": 1791244804,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-004",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244804, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-004\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 4}}"
+    },
+    {
+      "id": 6,
+      "ts_epoch": 1791244805,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-005",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244805, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-005\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 5}}"
+    },
+    {
+      "id": 7,
+      "ts_epoch": 1791244806,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-006",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244806, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-006\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 6}}"
+    },
+    {
+      "id": 8,
+      "ts_epoch": 1791244807,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-007",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244807, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-007\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 7}}"
+    },
+    {
+      "id": 9,
+      "ts_epoch": 1791244808,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-008",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244808, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-008\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 8}}"
+    },
+    {
+      "id": 10,
+      "ts_epoch": 1791244809,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-009",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244809, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-009\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 9}}"
+    },
+    {
+      "id": 11,
+      "ts_epoch": 1791244810,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-010",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244810, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-010\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 10}}"
+    },
+    {
+      "id": 12,
+      "ts_epoch": 1791244811,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-011",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244811, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-011\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 11}}"
+    },
+    {
+      "id": 13,
+      "ts_epoch": 1791244812,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-012",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244812, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-012\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 12}}"
+    },
+    {
+      "id": 14,
+      "ts_epoch": 1791244813,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-013",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244813, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-013\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 13}}"
+    },
+    {
+      "id": 15,
+      "ts_epoch": 1791244814,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-014",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244814, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-014\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 14}}"
+    },
+    {
+      "id": 16,
+      "ts_epoch": 1791244815,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-015",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244815, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-015\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 15}}"
+    },
+    {
+      "id": 17,
+      "ts_epoch": 1791244816,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-016",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244816, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-016\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 16}}"
+    },
+    {
+      "id": 18,
+      "ts_epoch": 1791244817,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-017",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244817, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-017\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 17}}"
+    },
+    {
+      "id": 19,
+      "ts_epoch": 1791244818,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-018",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244818, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-018\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 18}}"
+    },
+    {
+      "id": 20,
+      "ts_epoch": 1791244819,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-019",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244819, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-019\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 19}}"
+    },
+    {
+      "id": 21,
+      "ts_epoch": 1791244820,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-020",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244820, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-020\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 20}}"
+    },
+    {
+      "id": 22,
+      "ts_epoch": 1791244821,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-021",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244821, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-021\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 21}}"
+    },
+    {
+      "id": 23,
+      "ts_epoch": 1791244822,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-022",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244822, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-022\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 22}}"
+    },
+    {
+      "id": 24,
+      "ts_epoch": 1791244823,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-023",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244823, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-023\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 23}}"
+    },
+    {
+      "id": 25,
+      "ts_epoch": 1791244824,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-024",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244824, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-024\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 24}}"
+    },
+    {
+      "id": 26,
+      "ts_epoch": 1791244825,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-025",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244825, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-025\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 25}}"
+    },
+    {
+      "id": 27,
+      "ts_epoch": 1791244826,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-026",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244826, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-026\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 26}}"
+    },
+    {
+      "id": 28,
+      "ts_epoch": 1791244827,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-027",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244827, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-027\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 27}}"
+    },
+    {
+      "id": 29,
+      "ts_epoch": 1791244828,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-028",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244828, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-028\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 28}}"
+    },
+    {
+      "id": 30,
+      "ts_epoch": 1791244829,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-029",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244829, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-029\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 29}}"
+    },
+    {
+      "id": 31,
+      "ts_epoch": 1791244830,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-030",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244830, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-030\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 30}}"
+    },
+    {
+      "id": 32,
+      "ts_epoch": 1791244831,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-031",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244831, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-031\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 31}}"
+    },
+    {
+      "id": 33,
+      "ts_epoch": 1791244832,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-032",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244832, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-032\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 32}}"
+    },
+    {
+      "id": 34,
+      "ts_epoch": 1791244833,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-033",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244833, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-033\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 33}}"
+    },
+    {
+      "id": 35,
+      "ts_epoch": 1791244834,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-034",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244834, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-034\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 34}}"
+    },
+    {
+      "id": 36,
+      "ts_epoch": 1791244835,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-035",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244835, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-035\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 35}}"
+    },
+    {
+      "id": 37,
+      "ts_epoch": 1791244836,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-036",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244836, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-036\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 36}}"
+    },
+    {
+      "id": 38,
+      "ts_epoch": 1791244837,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-037",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244837, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-037\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 37}}"
+    },
+    {
+      "id": 39,
+      "ts_epoch": 1791244838,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-038",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244838, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-038\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 38}}"
+    },
+    {
+      "id": 40,
+      "ts_epoch": 1791244839,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-039",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244839, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-039\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 39}}"
+    },
+    {
+      "id": 41,
+      "ts_epoch": 1791244840,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-040",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244840, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-040\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 40}}"
+    },
+    {
+      "id": 42,
+      "ts_epoch": 1791244841,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-041",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244841, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-041\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 41}}"
+    },
+    {
+      "id": 43,
+      "ts_epoch": 1791244842,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-042",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244842, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-042\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 42}}"
+    },
+    {
+      "id": 44,
+      "ts_epoch": 1791244843,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-043",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244843, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-043\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 43}}"
+    },
+    {
+      "id": 45,
+      "ts_epoch": 1791244844,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-044",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244844, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-044\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 44}}"
+    },
+    {
+      "id": 46,
+      "ts_epoch": 1791244845,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-045",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244845, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-045\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 45}}"
+    },
+    {
+      "id": 47,
+      "ts_epoch": 1791244846,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-046",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244846, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-046\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 46}}"
+    },
+    {
+      "id": 48,
+      "ts_epoch": 1791244847,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-047",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244847, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-047\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 47}}"
+    },
+    {
+      "id": 49,
+      "ts_epoch": 1791244848,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-048",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244848, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-048\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 48}}"
+    },
+    {
+      "id": 50,
+      "ts_epoch": 1791244849,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-049",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244849, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-049\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 49}}"
+    },
+    {
+      "id": 51,
+      "ts_epoch": 1791244850,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-050",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244850, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-050\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 50}}"
+    },
+    {
+      "id": 52,
+      "ts_epoch": 1791244851,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-051",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244851, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-051\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 51}}"
+    },
+    {
+      "id": 53,
+      "ts_epoch": 1791244852,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-052",
+      "payload": "{\"ts\": \"2026-10-06T00:00:00Z\", \"tsEpoch\": 1791244852, \"source\": \"cat-agents-stabilityd\", \"component\": \"fixture-component\", \"severity\": \"warning\", \"key\": \"fixture-event-052\", \"message\": \"synthetic evidence event\", \"evidence\": {\"sequence\": 52}}"
+    }
+  ],
+  "expectedCliEvents": [
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244803,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-003",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 3
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244804,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-004",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 4
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244805,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-005",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 5
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244806,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-006",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 6
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244807,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-007",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 7
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244808,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-008",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 8
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244809,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-009",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 9
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244810,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-010",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 10
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244811,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-011",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 11
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244812,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-012",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 12
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244813,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-013",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 13
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244814,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-014",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 14
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244815,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-015",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 15
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244816,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-016",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 16
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244817,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-017",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 17
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244818,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-018",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 18
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244819,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-019",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 19
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244820,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-020",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 20
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244821,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-021",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 21
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244822,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-022",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 22
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244823,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-023",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 23
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244824,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-024",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 24
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244825,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-025",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 25
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244826,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-026",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 26
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244827,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-027",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 27
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244828,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-028",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 28
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244829,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-029",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 29
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244830,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-030",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 30
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244831,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-031",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 31
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244832,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-032",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 32
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244833,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-033",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 33
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244834,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-034",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 34
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244835,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-035",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 35
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244836,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-036",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 36
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244837,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-037",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 37
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244838,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-038",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 38
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244839,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-039",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 39
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244840,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-040",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 40
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244841,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-041",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 41
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244842,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-042",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 42
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244843,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-043",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 43
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244844,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-044",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 44
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244845,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-045",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 45
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244846,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-046",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 46
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244847,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-047",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 47
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244848,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-048",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 48
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244849,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-049",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 49
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244850,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-050",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 50
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244851,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-051",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 51
+      }
+    },
+    {
+      "ts": "2026-10-06T00:00:00Z",
+      "tsEpoch": 1791244852,
+      "source": "cat-agents-stabilityd",
+      "component": "fixture-component",
+      "severity": "warning",
+      "key": "fixture-event-052",
+      "message": "synthetic evidence event",
+      "evidence": {
+        "sequence": 52
+      }
+    }
+  ],
+  "appendFailureEvent": {
+    "ts": "2026-10-06T00:00:00Z",
+    "tsEpoch": 1791244853,
+    "source": "cat-agents-stabilityd",
+    "component": "fixture-component",
+    "severity": "warning",
+    "key": "fixture-event-053",
+    "message": "synthetic evidence event",
+    "evidence": {
+      "sequence": 53
+    }
+  },
+  "appendFailure": {
+    "exceptionType": "OSError",
+    "committedDatabaseRows": 54,
+    "jsonlLineCount": 53,
+    "cliEvents": [
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244803,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-003",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 3
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244804,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-004",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 4
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244805,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-005",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 5
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244806,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-006",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 6
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244807,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-007",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 7
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244808,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-008",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 8
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244809,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-009",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 9
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244810,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-010",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 10
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244811,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-011",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 11
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244812,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-012",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 12
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244813,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-013",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 13
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244814,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-014",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 14
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244815,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-015",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 15
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244816,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-016",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 16
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244817,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-017",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 17
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244818,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-018",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 18
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244819,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-019",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 19
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244820,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-020",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 20
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244821,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-021",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 21
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244822,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-022",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 22
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244823,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-023",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 23
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244824,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-024",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 24
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244825,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-025",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 25
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244826,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-026",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 26
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244827,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-027",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 27
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244828,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-028",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 28
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244829,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-029",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 29
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244830,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-030",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 30
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244831,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-031",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 31
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244832,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-032",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 32
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244833,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-033",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 33
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244834,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-034",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 34
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244835,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-035",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 35
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244836,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-036",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 36
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244837,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-037",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 37
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244838,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-038",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 38
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244839,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-039",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 39
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244840,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-040",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 40
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244841,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-041",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 41
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244842,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-042",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 42
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244843,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-043",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 43
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244844,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-044",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 44
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244845,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-045",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 45
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244846,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-046",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 46
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244847,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-047",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 47
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244848,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-048",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 48
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244849,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-049",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 49
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244850,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-050",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 50
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244851,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-051",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 51
+        }
+      },
+      {
+        "ts": "2026-10-06T00:00:00Z",
+        "tsEpoch": 1791244852,
+        "source": "cat-agents-stabilityd",
+        "component": "fixture-component",
+        "severity": "warning",
+        "key": "fixture-event-052",
+        "message": "synthetic evidence event",
+        "evidence": {
+          "sequence": 52
+        }
+      }
+    ],
+    "semantics": "SQLite commit precedes JSONL append; failure propagates and the event is not CLI-visible"
+  }
+}

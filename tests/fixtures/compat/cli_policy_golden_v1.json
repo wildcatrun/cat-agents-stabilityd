@@ -1,0 +1,678 @@
+{
+  "schemaVersion": 1,
+  "fixtureKind": "captured-pinned-baseline-policy-projection",
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "baselineSymbols": [
+    "bin/cat_agents_stabilityd.py:add_finding",
+    "bin/cat_agents_stabilityd.py:max_severity",
+    "bin/cat_agents_stabilityd.py:build_lane_policy",
+    "bin/cat_agents_stabilityd.py:policy_from_findings",
+    "bin/cat_agents_stabilityd.py:build_repair_gate_from_policy"
+  ],
+  "sourceMethod": "Expected policy and repair-gate projections were captured by executing the pinned baseline module in memory via git show, with SQLite :memory: and patched time/restart-history/recovery dependencies. No daemon entry point, collector, persistent database, filesystem mutation, tool handler, or network path was invoked.",
+  "approvedDifferenceAllowlist": [
+    "volatile timestamps and generation identifiers are excluded from comparison",
+    "unrelated policy fields may be added without changing this projection",
+    "fixture-only values and source annotations are not runtime compatibility guarantees"
+  ],
+  "cases": [
+    {
+      "name": "observe",
+      "input": {
+        "nowEpoch": 1000,
+        "mode": "healthy",
+        "severity": "info",
+        "keys": [],
+        "streaks": {},
+        "gateway": {
+          "active": true,
+          "portOk": true
+        },
+        "canMutateCron": true,
+        "canResetSession": true,
+        "shouldPauseCron": false,
+        "shouldDeferControlPlaneHeavy": false,
+        "deferUntilEpoch": 0,
+        "restartStorm": false,
+        "cooldownActive": false,
+        "recovery": {
+          "domains": {
+            "cron": {
+              "healthyStreak": 10
+            }
+          }
+        }
+      },
+      "expected": {
+        "findingSeverity": "info",
+        "repairGateStatus": "ready",
+        "repairGateReason": "normal",
+        "directAdmission": "open",
+        "directReasons": [],
+        "heavyReports": "run",
+        "deferUntilEpoch": 0,
+        "cronState": "normal",
+        "cronAdmission": "open",
+        "cronMutateStateAllowed": true,
+        "cronMaxConcurrency": 3,
+        "sessionResetAllowed": true,
+        "mainSessionResetAllowed": true,
+        "protectedDirectSessionKeys": [
+          "agent:main:telegram:direct:8390724843"
+        ],
+        "decisionProjection": {
+          "mode": "healthy",
+          "severity": "info",
+          "restartCandidate": false,
+          "restartReason": "no-actionable-streak",
+          "restartBlockedReasons": [],
+          "canRestartGateway": false,
+          "gatewayRestartEnabled": true,
+          "canMutateCronState": true,
+          "canResetSession": true,
+          "shouldPauseNonCriticalCron": false,
+          "deferControlPlaneHeavyReports": false,
+          "controlPlaneBackpressureUntilEpoch": 0,
+          "restartStorm": false,
+          "cooldownUntilEpoch": 0,
+          "policyGrantMarkerPresent": false
+        }
+      }
+    },
+    {
+      "name": "soft-pressure",
+      "input": {
+        "nowEpoch": 1000,
+        "mode": "channel-stalled",
+        "severity": "warning",
+        "keys": [
+          "telegram_updates_consumer_lag"
+        ],
+        "streaks": {
+          "telegram_updates_consumer_lag": {
+            "count": 2
+          }
+        },
+        "gateway": {
+          "active": true,
+          "portOk": true
+        },
+        "canMutateCron": false,
+        "canResetSession": true,
+        "shouldPauseCron": true,
+        "shouldDeferControlPlaneHeavy": false,
+        "deferUntilEpoch": 0,
+        "restartStorm": false,
+        "cooldownActive": false,
+        "recovery": {
+          "domains": {
+            "cron": {
+              "healthyStreak": 0
+            }
+          }
+        }
+      },
+      "expected": {
+        "findingSeverity": "warning",
+        "repairGateStatus": "blocked",
+        "repairGateReason": "channel-stalled",
+        "directAdmission": "priority-only",
+        "directReasons": [
+          "channel-pressure"
+        ],
+        "heavyReports": "run",
+        "deferUntilEpoch": 0,
+        "cronState": "constrained",
+        "cronAdmission": "critical-only",
+        "cronMutateStateAllowed": false,
+        "cronMaxConcurrency": 1,
+        "sessionResetAllowed": true,
+        "mainSessionResetAllowed": true,
+        "protectedDirectSessionKeys": [
+          "agent:main:telegram:direct:8390724843"
+        ],
+        "decisionProjection": {
+          "mode": "channel-stalled",
+          "severity": "warning",
+          "restartCandidate": false,
+          "restartReason": "no-actionable-streak",
+          "restartBlockedReasons": [],
+          "canRestartGateway": false,
+          "gatewayRestartEnabled": true,
+          "canMutateCronState": false,
+          "canResetSession": true,
+          "shouldPauseNonCriticalCron": true,
+          "deferControlPlaneHeavyReports": false,
+          "controlPlaneBackpressureUntilEpoch": 0,
+          "restartStorm": false,
+          "cooldownUntilEpoch": 0,
+          "policyGrantMarkerPresent": false
+        }
+      }
+    },
+    {
+      "name": "restart-storm",
+      "input": {
+        "nowEpoch": 1000,
+        "mode": "restart-storm",
+        "severity": "critical",
+        "keys": [
+          "session_problem_backlog"
+        ],
+        "streaks": {
+          "session_problem_backlog": {
+            "count": 3
+          }
+        },
+        "gateway": {
+          "active": true,
+          "portOk": true
+        },
+        "canMutateCron": false,
+        "canResetSession": false,
+        "shouldPauseCron": true,
+        "shouldDeferControlPlaneHeavy": true,
+        "deferUntilEpoch": 1500,
+        "restartStorm": true,
+        "cooldownActive": false,
+        "recovery": {
+          "domains": {
+            "cron": {
+              "healthyStreak": 0
+            }
+          }
+        }
+      },
+      "expected": {
+        "findingSeverity": "critical",
+        "repairGateStatus": "blocked",
+        "repairGateReason": "restart-storm",
+        "directAdmission": "priority-only",
+        "directReasons": [
+          "restart-storm"
+        ],
+        "heavyReports": "defer",
+        "deferUntilEpoch": 1500,
+        "cronState": "constrained",
+        "cronAdmission": "limited",
+        "cronMutateStateAllowed": false,
+        "cronMaxConcurrency": 1,
+        "sessionResetAllowed": false,
+        "mainSessionResetAllowed": false,
+        "protectedDirectSessionKeys": [
+          "agent:main:telegram:direct:8390724843"
+        ],
+        "decisionProjection": {
+          "mode": "restart-storm",
+          "severity": "critical",
+          "restartCandidate": false,
+          "restartReason": "no-actionable-streak",
+          "restartBlockedReasons": [
+            "restart-storm"
+          ],
+          "canRestartGateway": false,
+          "gatewayRestartEnabled": true,
+          "canMutateCronState": false,
+          "canResetSession": false,
+          "shouldPauseNonCriticalCron": true,
+          "deferControlPlaneHeavyReports": true,
+          "controlPlaneBackpressureUntilEpoch": 2800,
+          "restartStorm": true,
+          "cooldownUntilEpoch": 0,
+          "policyGrantMarkerPresent": false
+        }
+      }
+    },
+    {
+      "name": "gateway-hard-failure-actuator-disabled",
+      "input": {
+        "nowEpoch": 5000,
+        "severity": "critical",
+        "keys": [
+          "gateway_service_down"
+        ],
+        "streaks": {
+          "gateway_service_down": {
+            "count": 3
+          }
+        },
+        "gateway": {
+          "active": false,
+          "portOk": false
+        },
+        "canMutateCron": false,
+        "canResetSession": false,
+        "shouldPauseCron": false,
+        "shouldDeferControlPlaneHeavy": false,
+        "deferUntilEpoch": 0,
+        "restartStorm": false,
+        "cooldownActive": false,
+        "lastGatewayRestartAt": 0,
+        "gatewayRestartEnabled": false,
+        "recovery": {
+          "domains": {
+            "cron": {
+              "healthyStreak": 0
+            }
+          }
+        },
+        "mode": "gateway-unreachable"
+      },
+      "expected": {
+        "decisionProjection": {
+          "mode": "gateway-unreachable",
+          "severity": "critical",
+          "restartCandidate": true,
+          "restartReason": "gateway-basic-health-failed",
+          "restartBlockedReasons": [
+            "restart-actuator-disabled"
+          ],
+          "canRestartGateway": false,
+          "gatewayRestartEnabled": false,
+          "canMutateCronState": false,
+          "canResetSession": false,
+          "shouldPauseNonCriticalCron": false,
+          "deferControlPlaneHeavyReports": false,
+          "controlPlaneBackpressureUntilEpoch": 0,
+          "restartStorm": false,
+          "cooldownUntilEpoch": 0,
+          "policyGrantMarkerPresent": false
+        },
+        "directAdmission": "closed",
+        "directReasons": [
+          "gateway-unavailable"
+        ],
+        "heavyReports": "run",
+        "deferUntilEpoch": 0,
+        "cronState": "blocked",
+        "cronAdmission": "closed",
+        "cronMutateStateAllowed": false,
+        "cronMaxConcurrency": 0,
+        "sessionResetAllowed": false,
+        "mainSessionResetAllowed": false,
+        "protectedDirectSessionKeys": [
+          "agent:main:telegram:direct:8390724843"
+        ],
+        "findingSeverity": "critical",
+        "repairGateStatus": "blocked",
+        "repairGateReason": "gateway-unreachable,restart-actuator-disabled"
+      }
+    },
+    {
+      "name": "startup-grace-hard-failure",
+      "input": {
+        "nowEpoch": 5000,
+        "severity": "critical",
+        "keys": [
+          "gateway_service_down"
+        ],
+        "streaks": {
+          "gateway_service_down": {
+            "count": 3
+          }
+        },
+        "gateway": {
+          "active": false,
+          "portOk": false,
+          "startupGraceActive": true
+        },
+        "canMutateCron": false,
+        "canResetSession": false,
+        "shouldPauseCron": false,
+        "shouldDeferControlPlaneHeavy": false,
+        "deferUntilEpoch": 0,
+        "restartStorm": false,
+        "cooldownActive": false,
+        "lastGatewayRestartAt": 0,
+        "gatewayRestartEnabled": true,
+        "recovery": {
+          "domains": {
+            "cron": {
+              "healthyStreak": 0
+            }
+          }
+        },
+        "mode": "gateway-unreachable"
+      },
+      "expected": {
+        "decisionProjection": {
+          "mode": "gateway-unreachable",
+          "severity": "critical",
+          "restartCandidate": true,
+          "restartReason": "gateway-basic-health-failed",
+          "restartBlockedReasons": [
+            "startup-grace"
+          ],
+          "canRestartGateway": false,
+          "gatewayRestartEnabled": true,
+          "canMutateCronState": false,
+          "canResetSession": false,
+          "shouldPauseNonCriticalCron": false,
+          "deferControlPlaneHeavyReports": false,
+          "controlPlaneBackpressureUntilEpoch": 0,
+          "restartStorm": false,
+          "cooldownUntilEpoch": 0,
+          "policyGrantMarkerPresent": false
+        },
+        "directAdmission": "closed",
+        "directReasons": [
+          "gateway-unavailable"
+        ],
+        "heavyReports": "run",
+        "deferUntilEpoch": 0,
+        "cronState": "blocked",
+        "cronAdmission": "closed",
+        "cronMutateStateAllowed": false,
+        "cronMaxConcurrency": 0,
+        "sessionResetAllowed": false,
+        "mainSessionResetAllowed": false,
+        "protectedDirectSessionKeys": [
+          "agent:main:telegram:direct:8390724843"
+        ],
+        "findingSeverity": "critical",
+        "repairGateStatus": "blocked",
+        "repairGateReason": "gateway-unreachable,startup-grace"
+      }
+    },
+    {
+      "name": "cooldown-and-restart-storm",
+      "input": {
+        "nowEpoch": 5000,
+        "severity": "critical",
+        "keys": [
+          "gateway_service_down"
+        ],
+        "streaks": {
+          "gateway_service_down": {
+            "count": 3
+          }
+        },
+        "gateway": {
+          "active": false,
+          "portOk": false
+        },
+        "canMutateCron": false,
+        "canResetSession": false,
+        "shouldPauseCron": true,
+        "shouldDeferControlPlaneHeavy": true,
+        "deferUntilEpoch": 6800,
+        "restartStorm": true,
+        "cooldownActive": true,
+        "lastGatewayRestartAt": 4900,
+        "gatewayRestartEnabled": true,
+        "recovery": {
+          "domains": {
+            "cron": {
+              "healthyStreak": 0
+            }
+          }
+        },
+        "mode": "restart-storm"
+      },
+      "expected": {
+        "decisionProjection": {
+          "mode": "restart-storm",
+          "severity": "critical",
+          "restartCandidate": true,
+          "restartReason": "gateway-basic-health-failed",
+          "restartBlockedReasons": [
+            "restart-storm"
+          ],
+          "canRestartGateway": false,
+          "gatewayRestartEnabled": true,
+          "canMutateCronState": false,
+          "canResetSession": false,
+          "shouldPauseNonCriticalCron": true,
+          "deferControlPlaneHeavyReports": true,
+          "controlPlaneBackpressureUntilEpoch": 6800,
+          "restartStorm": true,
+          "cooldownUntilEpoch": 6700,
+          "policyGrantMarkerPresent": false
+        },
+        "directAdmission": "closed",
+        "directReasons": [
+          "cooldown",
+          "gateway-unavailable",
+          "restart-storm"
+        ],
+        "heavyReports": "defer",
+        "deferUntilEpoch": 6800,
+        "cronState": "blocked",
+        "cronAdmission": "closed",
+        "cronMutateStateAllowed": false,
+        "cronMaxConcurrency": 0,
+        "sessionResetAllowed": false,
+        "mainSessionResetAllowed": false,
+        "protectedDirectSessionKeys": [
+          "agent:main:telegram:direct:8390724843"
+        ],
+        "findingSeverity": "critical",
+        "repairGateStatus": "blocked",
+        "repairGateReason": "restart-storm"
+      }
+    },
+    {
+      "name": "cron-session-severe-pressure",
+      "input": {
+        "nowEpoch": 5000,
+        "severity": "critical",
+        "keys": [
+          "gateway_congestion_logs",
+          "session_problem_backlog"
+        ],
+        "streaks": {
+          "gateway_congestion_logs": {
+            "count": 3
+          },
+          "session_problem_backlog": {
+            "count": 3
+          }
+        },
+        "gateway": {
+          "active": true,
+          "portOk": true
+        },
+        "canMutateCron": true,
+        "canResetSession": true,
+        "shouldPauseCron": true,
+        "shouldDeferControlPlaneHeavy": true,
+        "deferUntilEpoch": 6800,
+        "restartStorm": false,
+        "cooldownActive": false,
+        "lastGatewayRestartAt": 0,
+        "gatewayRestartEnabled": true,
+        "recovery": {
+          "domains": {
+            "cron": {
+              "healthyStreak": 0
+            }
+          }
+        },
+        "mode": "cron-congested"
+      },
+      "expected": {
+        "decisionProjection": {
+          "mode": "cron-congested",
+          "severity": "critical",
+          "restartCandidate": false,
+          "restartReason": "no-actionable-streak",
+          "restartBlockedReasons": [],
+          "canRestartGateway": false,
+          "gatewayRestartEnabled": true,
+          "canMutateCronState": true,
+          "canResetSession": true,
+          "shouldPauseNonCriticalCron": true,
+          "deferControlPlaneHeavyReports": true,
+          "controlPlaneBackpressureUntilEpoch": 6800,
+          "restartStorm": false,
+          "cooldownUntilEpoch": 0,
+          "policyGrantMarkerPresent": false
+        },
+        "directAdmission": "priority-only",
+        "directReasons": [
+          "gateway-congestion"
+        ],
+        "heavyReports": "defer",
+        "deferUntilEpoch": 6800,
+        "cronState": "constrained",
+        "cronAdmission": "critical-only",
+        "cronMutateStateAllowed": true,
+        "cronMaxConcurrency": 1,
+        "sessionResetAllowed": true,
+        "mainSessionResetAllowed": false,
+        "protectedDirectSessionKeys": [
+          "agent:main:telegram:direct:8390724843"
+        ],
+        "findingSeverity": "critical",
+        "repairGateStatus": "ready",
+        "repairGateReason": "normal"
+      }
+    },
+    {
+      "name": "recovering-evidence",
+      "input": {
+        "nowEpoch": 5000,
+        "severity": "warning",
+        "keys": [
+          "telegram_updates_consumer_lag"
+        ],
+        "streaks": {},
+        "gateway": {
+          "active": true,
+          "portOk": true
+        },
+        "canMutateCron": false,
+        "canResetSession": true,
+        "shouldPauseCron": true,
+        "shouldDeferControlPlaneHeavy": false,
+        "deferUntilEpoch": 0,
+        "restartStorm": false,
+        "cooldownActive": false,
+        "lastGatewayRestartAt": 0,
+        "gatewayRestartEnabled": true,
+        "recovery": {
+          "domains": {
+            "cron": {
+              "healthyStreak": 2,
+              "pressureStreak": 0
+            }
+          }
+        },
+        "mode": "channel-stalled"
+      },
+      "expected": {
+        "decisionProjection": {
+          "mode": "channel-stalled",
+          "severity": "warning",
+          "restartCandidate": false,
+          "restartReason": "no-actionable-streak",
+          "restartBlockedReasons": [],
+          "canRestartGateway": false,
+          "gatewayRestartEnabled": true,
+          "canMutateCronState": false,
+          "canResetSession": true,
+          "shouldPauseNonCriticalCron": true,
+          "deferControlPlaneHeavyReports": false,
+          "controlPlaneBackpressureUntilEpoch": 0,
+          "restartStorm": false,
+          "cooldownUntilEpoch": 0,
+          "policyGrantMarkerPresent": false
+        },
+        "directAdmission": "priority-only",
+        "directReasons": [
+          "channel-pressure"
+        ],
+        "heavyReports": "run",
+        "deferUntilEpoch": 0,
+        "cronState": "constrained",
+        "cronAdmission": "critical-only",
+        "cronMutateStateAllowed": false,
+        "cronMaxConcurrency": 1,
+        "sessionResetAllowed": true,
+        "mainSessionResetAllowed": true,
+        "protectedDirectSessionKeys": [
+          "agent:main:telegram:direct:8390724843"
+        ],
+        "findingSeverity": "warning",
+        "repairGateStatus": "blocked",
+        "repairGateReason": "channel-stalled"
+      }
+    },
+    {
+      "name": "critical-no-actionable-streak",
+      "input": {
+        "nowEpoch": 5000,
+        "severity": "critical",
+        "keys": [
+          "fixture_critical_observation"
+        ],
+        "streaks": {},
+        "gateway": {
+          "active": true,
+          "portOk": true
+        },
+        "canMutateCron": true,
+        "canResetSession": true,
+        "shouldPauseCron": false,
+        "shouldDeferControlPlaneHeavy": false,
+        "deferUntilEpoch": 0,
+        "restartStorm": false,
+        "cooldownActive": false,
+        "lastGatewayRestartAt": 0,
+        "gatewayRestartEnabled": true,
+        "recovery": {
+          "domains": {
+            "cron": {
+              "healthyStreak": 0
+            }
+          }
+        },
+        "mode": "degraded"
+      },
+      "expected": {
+        "decisionProjection": {
+          "mode": "degraded",
+          "severity": "critical",
+          "restartCandidate": false,
+          "restartReason": "no-actionable-streak",
+          "restartBlockedReasons": [],
+          "canRestartGateway": false,
+          "gatewayRestartEnabled": true,
+          "canMutateCronState": true,
+          "canResetSession": true,
+          "shouldPauseNonCriticalCron": false,
+          "deferControlPlaneHeavyReports": false,
+          "controlPlaneBackpressureUntilEpoch": 0,
+          "restartStorm": false,
+          "cooldownUntilEpoch": 0,
+          "policyGrantMarkerPresent": false
+        },
+        "directAdmission": "open",
+        "directReasons": [],
+        "heavyReports": "run",
+        "deferUntilEpoch": 0,
+        "cronState": "constrained",
+        "cronAdmission": "limited",
+        "cronMutateStateAllowed": true,
+        "cronMaxConcurrency": 1,
+        "sessionResetAllowed": true,
+        "mainSessionResetAllowed": true,
+        "protectedDirectSessionKeys": [
+          "agent:main:telegram:direct:8390724843"
+        ],
+        "findingSeverity": "critical",
+        "repairGateStatus": "ready",
+        "repairGateReason": "normal"
+      }
+    }
+  ],
+  "invariants": {
+    "protectedIdentities": [
+      "main",
+      "cat_heart",
+      "catheart",
+      "cat_claw"
+    ],
+    "unknownCommandAuthorization": "denied"
+  }
+}

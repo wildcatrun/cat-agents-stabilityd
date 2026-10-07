@@ -179,8 +179,9 @@ def main() -> int:
             }
 
         stabilityd.workflow_runtime_registry_records = lambda: {
-            "source": "test",
+            "source": "db",
             "dbFile": "",
+            "writeEligible": True,
             "records": [
                 {
                     "agent_id": "catbody",
@@ -202,6 +203,7 @@ def main() -> int:
                     "agent_id": "main",
                     "runtime": "openclaw",
                     "platform": "openclaw",
+                    "execution_adapter": "openclaw",
                     "status": "active",
                     "can_receive_dispatch": 1,
                     "endpoint_ref": "openclaw-agent:main",
@@ -210,12 +212,13 @@ def main() -> int:
                     "agent_id": "cat_claw",
                     "runtime": "openclaw",
                     "platform": "openclaw",
+                    "execution_adapter": "openclaw",
                     "status": "active",
                     "can_receive_dispatch": 1,
                     "endpoint_ref": "openclaw-agent:cat_claw",
                 },
-                {"agent_id": "cat_brain", "runtime": "openclaw", "platform": "openclaw", "status": "active", "can_receive_dispatch": 1},
-                {"agent_id": "openclaw:cat_claw", "runtime": "openclaw", "platform": "openclaw", "status": "active", "can_receive_dispatch": 1},
+                {"agent_id": "cat_brain", "runtime": "openclaw", "platform": "openclaw", "execution_adapter": "openclaw", "status": "active", "can_receive_dispatch": 1},
+                {"agent_id": "openclaw:cat_claw", "runtime": "openclaw", "platform": "openclaw", "execution_adapter": "openclaw", "status": "active", "can_receive_dispatch": 1},
                 {
                     "agent_id": "legacy_route",
                     "runtime": "openclaw",

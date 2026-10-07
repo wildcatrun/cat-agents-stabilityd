@@ -104,12 +104,17 @@ def parse_json_output(result: dict[str, Any], fallback: Any) -> Any:
 
 
 def stability_cli_args(action: str, args: dict[str, Any]) -> list[str]:
-    allowed = {"status", "snapshot", "policy", "lanes", "profile-modes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook", "auth-readiness", "auth-maintenance", "auth-mirror", "doctor", "repair", "once"}
+    allowed = {"status", "snapshot", "policy", "lanes", "nodes", "surfaces", "preflight", "recovery", "action-classes", "profile-modes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook", "auth-readiness", "auth-maintenance", "auth-mirror", "doctor", "repair", "once"}
     if action not in allowed:
         raise ValueError(f"unsupported stability action: {action}")
     cmd = [action]
     if action == "actions" and args.get("limit") is not None:
         cmd.extend(["--limit", str(args.get("limit"))])
+    if action == "recovery" and args.get("limit") is not None:
+        limit = args.get("limit")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("recovery limit must be an integer from 1 to 1000")
+        cmd.extend(["--limit", str(limit)])
     if action == "auth-readiness" and bool(args.get("fresh")):
         cmd.append("--fresh")
     if action == "auth-maintenance":
@@ -171,6 +176,26 @@ def findings(args: dict[str, Any]) -> dict[str, Any]:
 
 def lanes(args: dict[str, Any]) -> dict[str, Any]:
     return stability_call({**args, "action": "lanes"})
+
+
+def nodes(args: dict[str, Any]) -> dict[str, Any]:
+    return stability_call({**args, "action": "nodes"})
+
+
+def surfaces(args: dict[str, Any]) -> dict[str, Any]:
+    return stability_call({**args, "action": "surfaces"})
+
+
+def preflight(args: dict[str, Any]) -> dict[str, Any]:
+    return stability_call({**args, "action": "preflight"})
+
+
+def recovery(args: dict[str, Any]) -> dict[str, Any]:
+    return stability_call({**args, "action": "recovery"})
+
+
+def action_classes(args: dict[str, Any]) -> dict[str, Any]:
+    return stability_call({**args, "action": "action-classes"})
 
 
 def profile_modes(args: dict[str, Any]) -> dict[str, Any]:
@@ -255,6 +280,26 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "stability_lanes": {
         "description": "Return current cat-agents-stability lane policy.",
+        "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
+    },
+    "stability_nodes": {
+        "description": "Return offline-first node inventory, freshness, service coverage and explicit prohibited-scope states. It performs no remote probes.",
+        "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
+    },
+    "stability_surfaces": {
+        "description": "Return allowlisted cross-runtime surface metadata coverage; fixture evidence is labeled and no secrets or runtime calls are read.",
+        "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
+    },
+    "stability_preflight": {
+        "description": "Read-only summary of published generation freshness, policy state, node and surface coverage, and blockers. It never grants authorization or calls an actuator.",
+        "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
+    },
+    "stability_recovery": {
+        "description": "Read the versioned action ledger without creating or migrating it; summarize unresolved recovery candidates with redacted digests. Uncertain effects are never replayed or cleared by this tool.",
+        "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 1000}}, "additionalProperties": False},
+    },
+    "stability_action_classes": {
+        "description": "Return explicit read/evidence/mutate classifications and authorization/effect boundaries for known commands and actuators. Unknown classes are prohibited.",
         "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
     },
     "stability_profile_modes": {
@@ -360,6 +405,16 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
                 payload = findings(arguments)
             elif name == "stability_lanes":
                 payload = lanes(arguments)
+            elif name == "stability_nodes":
+                payload = nodes(arguments)
+            elif name == "stability_surfaces":
+                payload = surfaces(arguments)
+            elif name == "stability_preflight":
+                payload = preflight(arguments)
+            elif name == "stability_recovery":
+                payload = recovery(arguments)
+            elif name == "stability_action_classes":
+                payload = action_classes(arguments)
             elif name == "stability_profile_modes":
                 payload = profile_modes(arguments)
             elif name == "stability_actions":

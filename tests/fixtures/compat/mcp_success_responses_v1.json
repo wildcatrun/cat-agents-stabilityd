@@ -1,0 +1,128 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "captureMethod": "only four source-hash-pinned AST symbols are selected; two constants use ast.literal_eval and only tool_result/handle_request function definitions are compiled with a synthetic future-annotations import; status and audit patched",
+  "executionBoundary": {
+    "selectedConstants": {
+      "SERVER_NAME": "07884ffb78237eb487ea106a57320ab7395d2f9dad3dc05bf45535c83970abe5",
+      "SERVER_VERSION": "0013616b28badf0ae948fcc35026a9016d32ab50e4fd1e67088de3a454c36e58"
+    },
+    "selectedFunctions": {
+      "tool_result": "fda9f0981afc4c8b1ca214417828ba1c2cd67b0a13570cc559f80ada811df13c",
+      "handle_request": "68c4529a6b8df8267d484d4a4bb830720c0f4165ef81e518ca81e122bb25dbfb"
+    },
+    "allOtherModuleStatements": "not compiled or executed"
+  },
+  "cases": [
+    {
+      "name": "initialize-default-protocol",
+      "request": {
+        "id": "fixture-init-default",
+        "method": "initialize",
+        "params": {}
+      },
+      "expected": {
+        "jsonrpc": "2.0",
+        "id": "fixture-init-default",
+        "result": {
+          "protocolVersion": "2025-06-18",
+          "capabilities": {
+            "tools": {}
+          },
+          "serverInfo": {
+            "name": "cat-agents-stability",
+            "version": "0.1.0"
+          }
+        }
+      }
+    },
+    {
+      "name": "initialize-explicit-protocol",
+      "request": {
+        "id": "fixture-init-explicit",
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-03-26"
+        }
+      },
+      "expected": {
+        "jsonrpc": "2.0",
+        "id": "fixture-init-explicit",
+        "result": {
+          "protocolVersion": "2025-03-26",
+          "capabilities": {
+            "tools": {}
+          },
+          "serverInfo": {
+            "name": "cat-agents-stability",
+            "version": "0.1.0"
+          }
+        }
+      }
+    },
+    {
+      "name": "tools-call-status-success-envelope",
+      "request": {
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+          "name": "stability_status",
+          "arguments": {
+            "source": "local"
+          }
+        }
+      },
+      "handler": "status",
+      "payload": {
+        "source": "local",
+        "action": "status",
+        "result": {
+          "ok": true,
+          "returncode": 0,
+          "stdout": "{\"severity\":\"low\"}",
+          "stderr": ""
+        },
+        "json": {
+          "severity": "low",
+          "note": "猫状态正常",
+          "items": [
+            1,
+            true,
+            null
+          ]
+        }
+      },
+      "expected": {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\n  \"source\": \"local\",\n  \"action\": \"status\",\n  \"result\": {\n    \"ok\": true,\n    \"returncode\": 0,\n    \"stdout\": \"{\\\"severity\\\":\\\"low\\\"}\",\n    \"stderr\": \"\"\n  },\n  \"json\": {\n    \"severity\": \"low\",\n    \"note\": \"猫状态正常\",\n    \"items\": [\n      1,\n      true,\n      null\n    ]\n  }\n}"
+            }
+          ],
+          "structuredContent": {
+            "source": "local",
+            "action": "status",
+            "result": {
+              "ok": true,
+              "returncode": 0,
+              "stdout": "{\"severity\":\"low\"}",
+              "stderr": ""
+            },
+            "json": {
+              "severity": "low",
+              "note": "猫状态正常",
+              "items": [
+                1,
+                true,
+                null
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,615 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "sourceHashes": {
+    "functions": {
+      "auth_token_status": "c15e22fdac22bb9ad0633e94ee489c2e8edc0d69cf2c4dcec2f2dcb6d33db213",
+      "openclaw_oauth_provider_groups": "3c2152a7e1d973bb59be1c293ab59aa19fb5dcc95626a5f7eaa7f8d767dc97fc",
+      "hermers_openai_auth_candidate": "86079e5803b77cf75b43f0f42fc54f1163f7604cc8e0a77e205fcf3415f519cc",
+      "max_severity": "888d3f29e901da76e93cab0e3288b526385b6635c69af0560e159fb90c3377cb",
+      "auth_maintenance_action": "15d81e9303a5b9687092d5356327c965a8c627f6bb95ad587838d4ddfa1979ea",
+      "build_auth_maintenance_plan": "8a2370855c576433a6c4327d24e2c8e6990adc0db625036a80257bb584d15c26"
+    },
+    "constants": {
+      "AUTH_WARN_SECONDS": "2f3a7d43097a27ffd3e8094aa4facda6820d6929bf69c832a802a3ec14f23a0f",
+      "AUTH_CRITICAL_SECONDS": "70cc3329ac2c37049abe2ecb4c67a85163d01d2375232f039dc34c320f4a0ccc",
+      "AUTH_OPENAI_PROVIDER_IDS": "358d2910ff4be43a6609e26f6e0a7860702d02307d10e209c17d359893831467",
+      "AUTH_REFRESH_BROKER_ENABLED": "3f0bb84f1894fcd3c7d71b7e1769b60b5b0af52a81ca947fe61554f2437afbb9",
+      "SEVERITY_RANK": "480256d83b915e8df0223d35b498e359e10d81b598b81c3d0b60c7c85bf88bd5"
+    }
+  },
+  "constants": {
+    "AUTH_WARN_SECONDS": 259200,
+    "AUTH_CRITICAL_SECONDS": 86400,
+    "AUTH_OPENAI_PROVIDER_IDS": [
+      "openai",
+      "openai-codex"
+    ],
+    "AUTH_REFRESH_BROKER_ENABLED": false,
+    "SEVERITY_RANK": {
+      "ok": 0,
+      "info": 1,
+      "warning": 2,
+      "high": 3,
+      "critical": 4
+    }
+  },
+  "captureMethod": "Compile only six source-hash-pinned pure functions with restricted builtins, frozen constants, fixed generatedAt/time_ns, and synthetic auth/findings; no daemon import or runtime call",
+  "cases": [
+    {
+      "name": "refresh-owner-and-action-routing",
+      "auth": {
+        "codexCli": {
+          "exists": true,
+          "hasAccessToken": true,
+          "hasRefreshToken": true,
+          "rawAccessToken": "SYNTHETIC_TOKEN_SENTINEL",
+          "freshestAccessTokenExpiresAt": "fixture-codex-expiry",
+          "freshestAccessTokenSecondsRemaining": -360,
+          "path": "fixture/codex/auth.json"
+        },
+        "openclaw": {
+          "scopeComplete": true,
+          "registryAgentIds": [
+            "main",
+            "cat_voice"
+          ],
+          "probeAgentIds": [
+            "main",
+            "cat_voice"
+          ],
+          "omittedAgentIds": [],
+          "unaddressableRegistryRows": [
+            {
+              "agentId": "fixture-legacy-row"
+            }
+          ],
+          "registrySource": "db",
+          "agents": {
+            "main": {
+              "available": true,
+              "profiles": [
+                {
+                  "provider": "openai-codex",
+                  "expiresAt": "fixture-openclaw-expired",
+                  "secondsRemaining": -120,
+                  "cooldownUntil": "fixture-cooldown",
+                  "rawToken": "SYNTHETIC_TOKEN_SENTINEL"
+                },
+                {
+                  "provider": "openai",
+                  "expiresAt": "fixture-openai-fresh",
+                  "secondsRemaining": 500000
+                },
+                {
+                  "provider": "anthropic",
+                  "expiresAt": "fixture-ignored",
+                  "secondsRemaining": -1
+                }
+              ]
+            },
+            "cat_voice": {
+              "available": false,
+              "error": "synthetic-probe-unavailable"
+            }
+          }
+        },
+        "hermers": {
+          "scopeComplete": true,
+          "profileRegistry": {
+            "source": "runtime_agents",
+            "dbFile": "fixture-registry.db",
+            "unparseableRecordCount": 0
+          },
+          "registryAgentProfiles": [
+            "catbody",
+            "catheart"
+          ],
+          "unregisteredRequestedProfiles": [],
+          "profiles": {
+            "catbody": {
+              "exists": true,
+              "hasAccessToken": true,
+              "hasRefreshToken": true,
+              "rawRefreshToken": "SYNTHETIC_TOKEN_SENTINEL",
+              "activeProvider": "openai-codex",
+              "freshestAccessTokenExpiresAt": "fixture-hermes-expired",
+              "freshestAccessTokenSecondsRemaining": -45
+            },
+            "catheart": {
+              "exists": false,
+              "hasAccessToken": false,
+              "hasRefreshToken": false,
+              "activeProvider": "openai",
+              "path": "fixture/hermes/catheart.json"
+            }
+          }
+        }
+      },
+      "findings": [
+        {
+          "component": "auth",
+          "key": "codex_cli_oauth_access_expired"
+        },
+        {
+          "component": "auth",
+          "key": "openclaw_oauth_profile_expired"
+        },
+        {
+          "component": "auth",
+          "key": "hermers_oauth_token_copy_drift"
+        },
+        {
+          "component": "auth",
+          "key": "openclaw_oauth_required_provider_missing",
+          "sample": [
+            {
+              "agentId": "main",
+              "requiredProviders": [
+                "openai"
+              ],
+              "providers": []
+            },
+            {
+              "agentId": "main",
+              "requiredProviders": [
+                "openai"
+              ],
+              "providers": []
+            }
+          ]
+        },
+        {
+          "component": "gateway",
+          "key": "fixture-non-auth-finding"
+        }
+      ],
+      "expectedPlan": {
+        "schemaVersion": 1,
+        "generatedAt": "2026-10-06T00:00:00Z",
+        "generatedAtEpochNs": 1791244800000000000,
+        "status": "action-required",
+        "severity": "high",
+        "refreshBrokerEnabled": false,
+        "macCodexExecutor": {
+          "supported": true,
+          "refreshOwner": "mac-codex",
+          "mirrorMode": "access-id-token-mirror",
+          "refreshBrokerEnabled": false,
+          "targets": {
+            "codexCli": true,
+            "hermersProfiles": [
+              "catbody",
+              "catheart"
+            ],
+            "openclawTargets": [
+              {
+                "agentId": "main",
+                "profileKind": "openai"
+              },
+              {
+                "agentId": "main",
+                "profileKind": "openai-codex"
+              }
+            ]
+          },
+          "scopeWarnings": {
+            "openclawUnaddressableRegistryRows": [
+              {
+                "agentId": "fixture-legacy-row"
+              }
+            ],
+            "hermersUnparseableRegistryRecords": 0
+          }
+        },
+        "tokenValuesRedacted": true,
+        "actionCount": 8,
+        "blockedActionCount": 8,
+        "humanGateActionCount": 3,
+        "findingKeys": [
+          "codex_cli_oauth_access_expired",
+          "hermers_oauth_token_copy_drift",
+          "openclaw_oauth_profile_expired",
+          "openclaw_oauth_required_provider_missing"
+        ],
+        "actions": [
+          {
+            "actionId": "codex_cli_mirror_required",
+            "source": "cat-agents-stabilityd.auth-maintenance",
+            "target": "codex-cli",
+            "kind": "mirror-from-mac-codex",
+            "severity": "high",
+            "reason": "Codex CLI OAuth status is access-expired; mirror a fresh access/id token from mac-codex",
+            "canAutoRun": false,
+            "blockedReason": "delegated-to-mac-codex",
+            "humanGateRequired": false,
+            "localAutomation": {
+              "eligible": true,
+              "owner": "mac-codex",
+              "mode": "access-id-token-mirror"
+            },
+            "tokenValuesRedacted": true,
+            "evidence": {
+              "freshestAccessTokenExpiresAt": "fixture-codex-expiry",
+              "freshestAccessTokenSecondsRemaining": -360,
+              "authPath": "fixture/codex/auth.json",
+              "refreshOwner": "mac-codex"
+            }
+          },
+          {
+            "actionId": "openclaw_cat_voice_auth_probe_repair",
+            "source": "cat-agents-stabilityd.auth-maintenance",
+            "target": "openclaw:cat_voice",
+            "kind": "probe-repair",
+            "severity": "warning",
+            "reason": "OpenClaw auth probe failed",
+            "canAutoRun": false,
+            "blockedReason": "manual-or-runtime-owned",
+            "humanGateRequired": false,
+            "localAutomation": {
+              "eligible": false,
+              "owner": "mac-codex",
+              "mode": "access-id-token-mirror"
+            },
+            "tokenValuesRedacted": true,
+            "evidence": {
+              "error": "synthetic-probe-unavailable"
+            }
+          },
+          {
+            "actionId": "openclaw_main_openai-codex_reauth_or_sync",
+            "source": "cat-agents-stabilityd.auth-maintenance",
+            "target": "openclaw:main:openai-codex",
+            "kind": "reauth-or-sync",
+            "severity": "high",
+            "reason": "OpenClaw OAuth profile is expired or nearing expiry",
+            "canAutoRun": false,
+            "blockedReason": "delegated-to-mac-codex",
+            "humanGateRequired": false,
+            "localAutomation": {
+              "eligible": true,
+              "owner": "mac-codex",
+              "mode": "access-id-token-mirror"
+            },
+            "tokenValuesRedacted": true,
+            "evidence": {
+              "expiresAt": "fixture-openclaw-expired",
+              "secondsRemaining": -120,
+              "cooldownUntil": "fixture-cooldown",
+              "profileCount": 1,
+              "staleExpiredProfileCount": 0
+            }
+          },
+          {
+            "actionId": "hermers_catbody_token_sync_or_refresh",
+            "source": "cat-agents-stabilityd.auth-maintenance",
+            "target": "hermers:catbody",
+            "kind": "sync-or-refresh",
+            "severity": "high",
+            "reason": "Hermers profile OAuth status is access-expired; refresh token is present",
+            "canAutoRun": false,
+            "blockedReason": "delegated-to-mac-codex",
+            "humanGateRequired": false,
+            "localAutomation": {
+              "eligible": true,
+              "owner": "mac-codex",
+              "mode": "access-id-token-mirror"
+            },
+            "tokenValuesRedacted": true,
+            "evidence": {
+              "activeProvider": "openai-codex",
+              "freshestAccessTokenExpiresAt": "fixture-hermes-expired",
+              "freshestAccessTokenSecondsRemaining": -45
+            }
+          },
+          {
+            "actionId": "hermers_catheart_reauth_required",
+            "source": "cat-agents-stabilityd.auth-maintenance",
+            "target": "hermers:catheart",
+            "kind": "reauth",
+            "severity": "high",
+            "reason": "Hermers profile OAuth status is missing",
+            "canAutoRun": false,
+            "blockedReason": "manual-or-runtime-owned",
+            "humanGateRequired": true,
+            "localAutomation": {
+              "eligible": false,
+              "owner": "mac-codex",
+              "mode": "access-id-token-mirror"
+            },
+            "tokenValuesRedacted": true,
+            "evidence": {
+              "activeProvider": "openai",
+              "authPath": "fixture/hermes/catheart.json",
+              "status": "missing"
+            }
+          },
+          {
+            "actionId": "openclaw_main_required_provider_reauth",
+            "source": "cat-agents-stabilityd.auth-maintenance",
+            "target": "openclaw:main:required-provider",
+            "kind": "reauth",
+            "severity": "warning",
+            "reason": "OpenClaw required OAuth provider profile is missing",
+            "canAutoRun": false,
+            "blockedReason": "manual-or-runtime-owned",
+            "humanGateRequired": true,
+            "localAutomation": {
+              "eligible": false,
+              "owner": "mac-codex",
+              "mode": "access-id-token-mirror"
+            },
+            "tokenValuesRedacted": true,
+            "evidence": {
+              "requiredProviders": [
+                "openai"
+              ],
+              "providers": [],
+              "findingKey": "openclaw_oauth_required_provider_missing"
+            }
+          },
+          {
+            "actionId": "openclaw_main_required_provider_reauth-2",
+            "source": "cat-agents-stabilityd.auth-maintenance",
+            "target": "openclaw:main:required-provider",
+            "kind": "reauth",
+            "severity": "warning",
+            "reason": "OpenClaw required OAuth provider profile is missing",
+            "canAutoRun": false,
+            "blockedReason": "manual-or-runtime-owned",
+            "humanGateRequired": true,
+            "localAutomation": {
+              "eligible": false,
+              "owner": "mac-codex",
+              "mode": "access-id-token-mirror"
+            },
+            "tokenValuesRedacted": true,
+            "evidence": {
+              "requiredProviders": [
+                "openai"
+              ],
+              "providers": [],
+              "findingKey": "openclaw_oauth_required_provider_missing"
+            }
+          },
+          {
+            "actionId": "hermers_token_copy_drift_cleanup",
+            "source": "cat-agents-stabilityd.auth-maintenance",
+            "target": "hermers:*",
+            "kind": "deduplicate-token-copies",
+            "severity": "warning",
+            "reason": "Hermers auth files contain divergent token copies",
+            "canAutoRun": false,
+            "blockedReason": "manual-or-runtime-owned",
+            "humanGateRequired": false,
+            "localAutomation": {
+              "eligible": false,
+              "owner": "mac-codex",
+              "mode": "access-id-token-mirror"
+            },
+            "tokenValuesRedacted": true,
+            "evidence": {
+              "findingKey": "hermers_oauth_token_copy_drift"
+            }
+          }
+        ],
+        "notes": [
+          "Default mode is observe-only; no device-code login, token copy, or credential mutation is executed by this plan.",
+          "mac-codex is the canonical OAuth refresh owner; dev-server runtimes should receive access/id-token mirrors, not reusable refresh tokens.",
+          "Mirror candidates marked localAutomation.eligible are executed by the mac-codex adapter; dev-server stabilityd never owns or rotates the refresh token."
+        ]
+      }
+    },
+    {
+      "name": "incomplete-runtime-scopes-fail-closed",
+      "auth": {
+        "codexCli": {
+          "exists": true,
+          "hasAccessToken": true,
+          "hasRefreshToken": true,
+          "freshestAccessTokenExpiresAt": "fixture-codex-fresh",
+          "freshestAccessTokenSecondsRemaining": 500000
+        },
+        "openclaw": {
+          "scopeComplete": false,
+          "scopeIncompleteReason": "probe-limit-exceeded",
+          "registryAgentIds": [
+            "main",
+            "cat_claw"
+          ],
+          "probeAgentIds": [
+            "main"
+          ],
+          "omittedAgentIds": [
+            "cat_claw"
+          ],
+          "unaddressableRegistryRows": [],
+          "registrySource": "snapshot",
+          "agents": {
+            "main": {
+              "available": true,
+              "profiles": [
+                {
+                  "provider": "openai-codex",
+                  "expiresAt": "fixture-expired",
+                  "secondsRemaining": -10
+                }
+              ]
+            }
+          }
+        },
+        "hermers": {
+          "scopeComplete": false,
+          "profileRegistry": {
+            "source": "snapshot",
+            "reason": "stale-registry",
+            "dbFile": "",
+            "unparseableRecordCount": 1
+          },
+          "registryAgentProfiles": [
+            "catbody"
+          ],
+          "unregisteredRequestedProfiles": [],
+          "profiles": {
+            "catbody": {
+              "exists": true,
+              "hasAccessToken": true,
+              "hasRefreshToken": true,
+              "activeProvider": "openai",
+              "freshestAccessTokenExpiresAt": "fixture-hermes-expired",
+              "freshestAccessTokenSecondsRemaining": -5
+            }
+          }
+        }
+      },
+      "findings": [],
+      "expectedPlan": {
+        "schemaVersion": 1,
+        "generatedAt": "2026-10-06T00:00:00Z",
+        "generatedAtEpochNs": 1791244800000000000,
+        "status": "action-required",
+        "severity": "high",
+        "refreshBrokerEnabled": false,
+        "macCodexExecutor": {
+          "supported": true,
+          "refreshOwner": "mac-codex",
+          "mirrorMode": "access-id-token-mirror",
+          "refreshBrokerEnabled": false,
+          "targets": {
+            "codexCli": true,
+            "hermersProfiles": [
+              "catbody"
+            ],
+            "openclawTargets": [
+              {
+                "agentId": "main",
+                "profileKind": "openai-codex"
+              }
+            ]
+          },
+          "scopeWarnings": {
+            "openclawUnaddressableRegistryRows": [],
+            "hermersUnparseableRegistryRecords": 1
+          }
+        },
+        "tokenValuesRedacted": true,
+        "actionCount": 4,
+        "blockedActionCount": 4,
+        "humanGateActionCount": 2,
+        "findingKeys": [],
+        "actions": [
+          {
+            "actionId": "openclaw_registry_auth_scope_incomplete",
+            "source": "cat-agents-stabilityd.auth-maintenance",
+            "target": "openclaw:runtime-registry-scope",
+            "kind": "scope-repair",
+            "severity": "warning",
+            "reason": "OpenClaw auth targets are incomplete relative to the active runtime_agents registry",
+            "canAutoRun": false,
+            "blockedReason": "manual-or-runtime-owned",
+            "humanGateRequired": true,
+            "localAutomation": {
+              "eligible": false,
+              "owner": "mac-codex",
+              "mode": "access-id-token-mirror"
+            },
+            "tokenValuesRedacted": true,
+            "evidence": {
+              "registryAgentIds": [
+                "main",
+                "cat_claw"
+              ],
+              "probeAgentIds": [
+                "main"
+              ],
+              "omittedAgentIds": [
+                "cat_claw"
+              ],
+              "unaddressableRegistryRows": [],
+              "scopeIncompleteReason": "probe-limit-exceeded",
+              "registrySource": "snapshot"
+            }
+          },
+          {
+            "actionId": "hermers_runtime_profile_registry_unavailable",
+            "source": "cat-agents-stabilityd.auth-maintenance",
+            "target": "hermers:runtime-registry",
+            "kind": "scope-repair",
+            "severity": "warning",
+            "reason": "Hermers OAuth profile targets could not be derived from active runtime_agents rows",
+            "canAutoRun": false,
+            "blockedReason": "manual-or-runtime-owned",
+            "humanGateRequired": true,
+            "localAutomation": {
+              "eligible": false,
+              "owner": "mac-codex",
+              "mode": "access-id-token-mirror"
+            },
+            "tokenValuesRedacted": true,
+            "evidence": {
+              "registrySource": "snapshot",
+              "registryError": "stale-registry",
+              "dbFile": "",
+              "unparseableRecordCount": 1,
+              "registryAgentProfiles": [
+                "catbody"
+              ],
+              "unregisteredRequestedProfiles": []
+            }
+          },
+          {
+            "actionId": "openclaw_main_openai-codex_reauth_or_sync",
+            "source": "cat-agents-stabilityd.auth-maintenance",
+            "target": "openclaw:main:openai-codex",
+            "kind": "reauth-or-sync",
+            "severity": "high",
+            "reason": "OpenClaw OAuth profile is expired or nearing expiry",
+            "canAutoRun": false,
+            "blockedReason": "delegated-to-mac-codex",
+            "humanGateRequired": false,
+            "localAutomation": {
+              "eligible": true,
+              "owner": "mac-codex",
+              "mode": "access-id-token-mirror"
+            },
+            "tokenValuesRedacted": true,
+            "evidence": {
+              "expiresAt": "fixture-expired",
+              "secondsRemaining": -10,
+              "cooldownUntil": null,
+              "profileCount": 1,
+              "staleExpiredProfileCount": 0
+            }
+          },
+          {
+            "actionId": "hermers_catbody_token_sync_or_refresh",
+            "source": "cat-agents-stabilityd.auth-maintenance",
+            "target": "hermers:catbody",
+            "kind": "sync-or-refresh",
+            "severity": "high",
+            "reason": "Hermers profile OAuth status is access-expired; refresh token is present",
+            "canAutoRun": false,
+            "blockedReason": "delegated-to-mac-codex",
+            "humanGateRequired": false,
+            "localAutomation": {
+              "eligible": true,
+              "owner": "mac-codex",
+              "mode": "access-id-token-mirror"
+            },
+            "tokenValuesRedacted": true,
+            "evidence": {
+              "activeProvider": "openai",
+              "freshestAccessTokenExpiresAt": "fixture-hermes-expired",
+              "freshestAccessTokenSecondsRemaining": -5
+            }
+          }
+        ],
+        "notes": [
+          "Default mode is observe-only; no device-code login, token copy, or credential mutation is executed by this plan.",
+          "mac-codex is the canonical OAuth refresh owner; dev-server runtimes should receive access/id-token mirrors, not reusable refresh tokens.",
+          "Mirror candidates marked localAutomation.eligible are executed by the mac-codex adapter; dev-server stabilityd never owns or rotates the refresh token."
+        ]
+      }
+    }
+  ]
+}

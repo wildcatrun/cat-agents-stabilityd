@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "baselineSymbol": "parse_gateway_deep_status",
+  "baselineSymbolSha256": "08fca9423981efc2f6abf3ca7ac4e46be25655f7b6456758cd1b142488f053a3",
+  "parserPort": 23466,
+  "captureMethod": "compile only the source-hash-pinned parser with annotations removed, re module and restricted builtins; compare the complete output",
+  "cases": [
+    {
+      "name": "complete-running-with-connectivity-security-and-version-findings",
+      "input": "OpenClaw Gateway status\nRuntime: running (pid 12345, state active, sub running)\nService: systemd (enabled)\nGateway: bind=127.0.0.1, port=23466\nConnectivity probe: failed\nSECURITY ERROR: Cannot connect to \"0.0.0.0\" over plaintext ws://\nPort 23466 is already in use\nListening: 127.0.0.1:23466\nPlugins:\n- telegram: 2026.10.1 (installed) → expected 2026.10.2\nEstablished clients: 7",
+      "expected": {
+        "rawSample": "OpenClaw Gateway status\nRuntime: running (pid 12345, state active, sub running)\nService: systemd (enabled)\nGateway: bind=127.0.0.1, port=23466\nConnectivity probe: failed\nSECURITY ERROR: Cannot connect to \"0.0.0.0\" over plaintext ws://\nPort 23466 is already in use\nListening: 127.0.0.1:23466\nPlugins:\n- telegram: 2026.10.1 (installed) → expected 2026.10.2\nEstablished clients: 7",
+        "runtimeState": "running",
+        "runtimePid": 12345,
+        "systemdState": "active",
+        "systemdSubState": "running)\nService: systemd (enabled)\nGateway: bind=127.0.0.1",
+        "service": "systemd (enabled)",
+        "bind": "127.0.0.1",
+        "port": 23466,
+        "connectivityProbeFailed": true,
+        "insecurePlaintextWsBlocked": true,
+        "portInUse": true,
+        "listening": true,
+        "pluginVersionDrift": [
+          {
+            "id": "telegram",
+            "current": "2026.10.1",
+            "expected": "2026.10.2"
+          }
+        ],
+        "establishedClients": 7
+      }
+    },
+    {
+      "name": "partial-stopped-state-and-unmatched-plugin-line",
+      "input": "Runtime: stopped\nService: unknown\nGateway: bind=all, port=34567\n- plugin without expected version",
+      "expected": {
+        "rawSample": "Runtime: stopped\nService: unknown\nGateway: bind=all, port=34567\n- plugin without expected version",
+        "runtimeState": "stopped",
+        "runtimePid": null,
+        "systemdState": null,
+        "systemdSubState": null,
+        "service": "unknown",
+        "bind": "all",
+        "port": 34567,
+        "connectivityProbeFailed": false,
+        "insecurePlaintextWsBlocked": false,
+        "portInUse": false,
+        "listening": false,
+        "pluginVersionDrift": [],
+        "establishedClients": null
+      }
+    }
+  ]
+}

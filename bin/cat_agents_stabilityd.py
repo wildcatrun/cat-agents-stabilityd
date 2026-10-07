@@ -13,25 +13,59 @@ import base64
 import contextlib
 import datetime as dt
 import errno
+import ctypes
 import fcntl
 import glob
+import hashlib
 import json
+import math
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
-import traceback
+import uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+
+_CODE_ROOT = Path(__file__).resolve().parents[1]
+if str(_CODE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_CODE_ROOT))
+from stability_core.actuation_lock import ActuationBusy, ActuationLock
+from stability_core.process_identity import identities_match, read_process_identity, terminate_process_instance
+from stability_core.probe_runner import run_component_probe
+from stability_core.protected_scope import is_protected_identity, resolve_protection_scope
+from stability_core.generation import artifact_metadata, publish_generation, write_json_atomic, write_text_atomic
+from stability_core.redaction import redact_sensitive_text, safe_error_category
+from stability_core.node_inventory import evaluate_inventory
+from stability_core.surface_contracts import evaluate_surface_observations
+from stability_core.config import (
+    RUNTIME_INTEGER_DEFAULTS,
+    parse_actuator_environment_settings, parse_integer_settings, parse_hermers_profile_lifecycle_settings,
+    parse_restart_actuator_settings, parse_hermers_gateway_restart_limit, startup_grace_active,
+)
+from stability_core.action_ledger import ActionLedger
+from stability_core.action_classes import classify_action_types, classify_commands
+from stability_core.preflight_recovery import (
+    build_preflight_summary, build_recovery_summary, load_action_ledger_readonly,
+)
+from stability_core.action_executor import (
+    ActionExecutor, ActionSpec, BoundaryCheck, OperationResult, PostcheckResult,
+)
+from stability_core.authorization import (
+    EligibilityProof, STANDING_RULES, TrustedPolicyAuthorizer, policy_reference,
+)
 
 
 HOME = Path(os.environ.get("OPENCLAW_HOME_DIR", str(Path.home())))
@@ -63,6 +97,8 @@ WORKFLOW_RUNTIME_AGENTS_SNAPSHOT = Path(
         str(WORKFLOW_ROOT / "registry" / "runtime-agents.snapshot.json"),
     )
 )
+WORKFLOW_RUNTIME_SNAPSHOT_MAX_AGE_SECONDS = 900
+WORKFLOW_RUNTIME_SNAPSHOT_MAX_FUTURE_SKEW_SECONDS = 300
 WORKFLOW_GOVERNANCE_LOG_DIR = WORKFLOW_ROOT / "governance-logs"
 SCRIPTS = HOME / "scripts"
 STABILITY_DIR = OPENCLAW / "stability"
@@ -78,6 +114,68 @@ EVENTS_JSONL = STABILITY_DIR / "events.jsonl"
 ACTIONS_JSONL = STABILITY_DIR / "actions.jsonl"
 STATE_DB = STABILITY_DIR / "state.db"
 LOCK_PATH = STABILITY_DIR / "stabilityd.lock"
+ACTUATION_LOCK_PATH = STABILITY_DIR / "actuation.lock"
+COLLECTOR_OUTPUT_MAX_BYTES = 1_000_000
+COLLECTOR_BUDGET_MS = 60_000
+COLLECTOR_ENV_ALLOWLIST = frozenset({
+    "HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+    "OPENCLAW_HOME_DIR", "CAT_AGENTS_WORKFLOW_ROOT", "CAT_AGENTS_WORKFLOW_DB",
+    "CAT_AGENTS_WORKFLOW_RUNTIME_AGENTS_SNAPSHOT", "CAT_AGENTS_STABILITY_DESIRED_STATE",
+    "CAT_AGENTS_STABILITY_CODEX_HOME", "CAT_AGENTS_STABILITY_CODEX_AUTH_PATH",
+    "CAT_AGENTS_STABILITY_CODEX_CONFIG", "CAT_AGENTS_STABILITY_HERMES_CLI",
+    "CAT_AGENTS_STABILITY_AUTH_CRITICAL_SECONDS", "CAT_AGENTS_STABILITY_AUTH_EVIDENCE_FRESH_SECONDS",
+    "CAT_AGENTS_STABILITY_AUTH_OPENAI_PROVIDERS", "CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_IDS",
+    "CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_LIMIT", "CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_ERROR_SECONDS",
+    "CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_NEAR_SECONDS", "CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_SECONDS",
+    "CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_TIMEOUT_SECONDS",
+    "CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_URGENT_SECONDS",
+    "CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_URGENT_WINDOW_SECONDS",
+    "CAT_AGENTS_STABILITY_AUTH_OPENCLAW_REQUIRED_PROVIDERS", "CAT_AGENTS_STABILITY_AUTH_WARN_SECONDS",
+    "CAT_AGENTS_STABILITY_HERMERS_ACP_LONG_SECONDS", "CAT_AGENTS_STABILITY_HERMERS_ACP_ORPHAN_SECONDS",
+    "CAT_AGENTS_STABILITY_HERMERS_FAILURE_BURST", "CAT_AGENTS_STABILITY_HERMERS_FAILURE_WINDOW_SECONDS",
+    "CAT_AGENTS_STABILITY_HERMERS_GATEWAY_RESTART_LIMIT", "CAT_AGENTS_STABILITY_HERMERS_LSP_IDLE_SECONDS",
+    "CAT_AGENTS_STABILITY_HERMERS_LSP_IDLE_STATE_TTL_SECONDS", "CAT_AGENTS_STABILITY_HERMERS_PROFILE_ACTUATE",
+    "CAT_AGENTS_STABILITY_HERMERS_PROFILE_COLD_IDLE_SECONDS",
+    "CAT_AGENTS_STABILITY_HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS",
+    "CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS",
+    "CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_ALLOWLIST",
+    "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ENABLED", "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_MANAGED",
+    "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTUATE",
+    "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS",
+    "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_PROTECTED", "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_START",
+    "CAT_AGENTS_STABILITY_HERMERS_PROFILE_PROTECTED_IDS", "CAT_AGENTS_STABILITY_HERMERS_STALE_SENT_SECONDS",
+    "CAT_AGENTS_STABILITY_REAP_HERMERS_ACP_ORPHANS", "CAT_AGENTS_STABILITY_REAP_HERMERS_IDLE_LSP",
+    "CAT_AGENTS_STABILITY_RESTART_HERMERS_GATEWAY",
+    "OPENCLAW_STABILITY_ACTION_STREAK", "OPENCLAW_STABILITY_BACKUP_HEADROOM_WARN_RATIO",
+    "OPENCLAW_STABILITY_BACKUP_KEEP_COUNT", "OPENCLAW_STABILITY_CHANNEL_CRIT_SECONDS",
+    "OPENCLAW_STABILITY_CHANNEL_WARN_SECONDS", "OPENCLAW_STABILITY_CHILD_GROWTH_WARN",
+    "OPENCLAW_STABILITY_CONTROL_PLANE_BACKPRESSURE_SECONDS",
+    "OPENCLAW_STABILITY_CONTROL_PLANE_DIRECT_SESSIONS", "OPENCLAW_STABILITY_CONTROL_PLANE_HEARTBEAT_JOBS",
+    "OPENCLAW_STABILITY_CONTROL_PLANE_HEAVY_JOBS", "OPENCLAW_STABILITY_CRON_AUDIT_FRESH_SECONDS",
+    "OPENCLAW_STABILITY_CRON_HEARTBEAT_WARN_MS", "OPENCLAW_STABILITY_CRON_HISTORY_DAYS",
+    "OPENCLAW_STABILITY_CRON_LONG_RUN_WARN_MS", "OPENCLAW_STABILITY_CRON_MAX_CONCURRENCY_DEGRADED",
+    "OPENCLAW_STABILITY_CRON_MAX_CONCURRENCY_NORMAL", "OPENCLAW_STABILITY_CRON_RECOVERY_LIMITED_STREAK",
+    "OPENCLAW_STABILITY_CRON_RECOVERY_OPEN_STREAK", "OPENCLAW_STABILITY_CRON_TIMEOUT_NEAR_MISS_MS",
+    "OPENCLAW_STABILITY_HEALTH_PROXY", "OPENCLAW_STABILITY_HEAVY_EVENTS",
+    "OPENCLAW_STABILITY_HEAVY_WINDOW_SECONDS", "OPENCLAW_STABILITY_LEGACY_CRON_AUDIT_REQUIRED",
+    "OPENCLAW_STABILITY_LOG_PRESSURE_WINDOW_SECONDS", "OPENCLAW_STABILITY_MEMORY_CRIT_GB",
+    "OPENCLAW_STABILITY_MEMORY_GROWTH_WARN_GB", "OPENCLAW_STABILITY_MEMORY_WARN_GB",
+    "OPENCLAW_STABILITY_MIN_STALE_RUNNING_SECONDS", "OPENCLAW_STABILITY_ORPHAN_RUN_LOG_MIN_AGE_SECONDS",
+    "OPENCLAW_STABILITY_RESOURCE_EVIDENCE_SECONDS", "OPENCLAW_STABILITY_RESOURCE_HUMAN_GATE_SECONDS",
+    "OPENCLAW_STABILITY_RESOURCE_INCIDENT_STREAK", "OPENCLAW_STABILITY_SESSION_ACTIVE_EVENTS",
+    "OPENCLAW_STABILITY_SESSION_ACTIVE_WINDOW_SECONDS", "OPENCLAW_STABILITY_SESSION_FAIL_THRESHOLD",
+    "OPENCLAW_STABILITY_SESSION_FAIL_WINDOW_SECONDS", "OPENCLAW_STABILITY_SESSION_OVERFLOW_THRESHOLD",
+    "OPENCLAW_STABILITY_SESSION_OVERFLOW_WINDOW_SECONDS", "OPENCLAW_STABILITY_SESSION_RESET_COOLDOWN_SECONDS",
+    "OPENCLAW_STABILITY_STALE_RUNNING_MULTIPLIER", "OPENCLAW_STABILITY_STALE_TELEGRAM_OFFSET_FINDING",
+    "OPENCLAW_STABILITY_SWAP_CRIT_GB", "OPENCLAW_STABILITY_SWAP_WARN_GB",
+    "OPENCLAW_STABILITY_SYSTEM_COMMIT_CRIT_RATIO", "OPENCLAW_STABILITY_SYSTEM_COMMIT_WARN_RATIO",
+    "OPENCLAW_STABILITY_SYSTEM_MEM_AVAILABLE_CRIT_GB", "OPENCLAW_STABILITY_SYSTEM_MEM_AVAILABLE_WARN_GB",
+    "OPENCLAW_STABILITY_SYSTEM_SWAP_CRIT_GB", "OPENCLAW_STABILITY_SYSTEM_SWAP_CRIT_RATIO",
+    "OPENCLAW_STABILITY_SYSTEM_SWAP_WARN_GB", "OPENCLAW_STABILITY_SYSTEM_SWAP_WARN_RATIO",
+    "OPENCLAW_STABILITY_TELEGRAM_ACCOUNTS", "OPENCLAW_STABILITY_TELEGRAM_API_PROBE",
+    "OPENCLAW_STABILITY_STARTUP_GRACE_SECONDS", "OPENCLAW_STABILITY_TMP_MAX_AGE_SECONDS", "OPENCLAW_STABILITY_TREND_SAMPLE_LIMIT",
+    "OPENCLAW_STABILITY_TREND_WINDOW_SECONDS",
+}) | frozenset(RUNTIME_INTEGER_DEFAULTS)
 LOG_PATH = STABILITY_DIR / "stabilityd.log"
 RESOURCE_EVIDENCE_DIR = STABILITY_DIR / "resource-evidence"
 RESOURCE_HUMAN_GATE_DIR = STABILITY_DIR / "human-gate"
@@ -110,9 +208,11 @@ REPAIR_PROCESSED_DIR = REPAIR_DIR / "processed"
 REPAIR_STATUS_PATH = REPAIR_DIR / "status.json"
 GATEWAY_ERR_LOG = LOG_DIR / "gateway.err.log"
 
-PORT = int(os.environ.get("OPENCLAW_GATEWAY_PORT", "23466"))
-INTERVAL_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_INTERVAL_SECONDS", "30"))
-POLICY_TTL_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_POLICY_TTL_SECONDS", "180"))
+RUNTIME_INTEGER_SETTINGS = parse_integer_settings(os.environ, RUNTIME_INTEGER_DEFAULTS)
+PORT = RUNTIME_INTEGER_SETTINGS["OPENCLAW_GATEWAY_PORT"]
+INTERVAL_SECONDS = RUNTIME_INTEGER_SETTINGS["OPENCLAW_STABILITY_INTERVAL_SECONDS"]
+STABILITYD_PROGRESS_STALE_SECONDS = max(90, INTERVAL_SECONDS * 3)
+POLICY_TTL_SECONDS = RUNTIME_INTEGER_SETTINGS["OPENCLAW_STABILITY_POLICY_TTL_SECONDS"]
 LOG_PRESSURE_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_LOG_PRESSURE_WINDOW_SECONDS", "900"))
 TREND_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_TREND_WINDOW_SECONDS", "1800"))
 TREND_SAMPLE_LIMIT = int(os.environ.get("OPENCLAW_STABILITY_TREND_SAMPLE_LIMIT", "240"))
@@ -128,11 +228,12 @@ CRON_MAX_CONCURRENCY_NORMAL = int(os.environ.get("OPENCLAW_STABILITY_CRON_MAX_CO
 CRON_MAX_CONCURRENCY_DEGRADED = int(os.environ.get("OPENCLAW_STABILITY_CRON_MAX_CONCURRENCY_DEGRADED", "1"))
 CRON_RECOVERY_LIMITED_HEALTHY_STREAK = int(os.environ.get("OPENCLAW_STABILITY_CRON_RECOVERY_LIMITED_STREAK", "5"))
 CRON_RECOVERY_OPEN_HEALTHY_STREAK = int(os.environ.get("OPENCLAW_STABILITY_CRON_RECOVERY_OPEN_STREAK", "10"))
-RESTART_COOLDOWN_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_RESTART_COOLDOWN_SECONDS", "1800"))
-RESTART_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_RESTART_WINDOW_SECONDS", str(6 * 3600)))
-MAX_RESTARTS_PER_WINDOW = int(os.environ.get("OPENCLAW_STABILITY_MAX_RESTARTS", "2"))
-ACTION_STREAK_THRESHOLD = int(os.environ.get("OPENCLAW_STABILITY_ACTION_STREAK", "2"))
-STARTUP_GRACE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_STARTUP_GRACE_SECONDS", "240"))
+RESTART_ACTUATOR_SETTINGS = parse_restart_actuator_settings(os.environ)
+RESTART_COOLDOWN_SECONDS = RESTART_ACTUATOR_SETTINGS["RESTART_COOLDOWN_SECONDS"]
+RESTART_WINDOW_SECONDS = RESTART_ACTUATOR_SETTINGS["RESTART_WINDOW_SECONDS"]
+MAX_RESTARTS_PER_WINDOW = RESTART_ACTUATOR_SETTINGS["MAX_RESTARTS_PER_WINDOW"]
+ACTION_STREAK_THRESHOLD = RESTART_ACTUATOR_SETTINGS["ACTION_STREAK_THRESHOLD"]
+STARTUP_GRACE_SECONDS = RESTART_ACTUATOR_SETTINGS["STARTUP_GRACE_SECONDS"]
 MEMORY_WARN_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_MEMORY_WARN_GB", "5.0")) * 1024**3)
 MEMORY_CRIT_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_MEMORY_CRIT_GB", "6.5")) * 1024**3)
 SWAP_WARN_BYTES = int(float(os.environ.get("OPENCLAW_STABILITY_SWAP_WARN_GB", "0.8")) * 1024**3)
@@ -152,53 +253,27 @@ BACKUP_HEADROOM_WARN_RATIO = float(os.environ.get("OPENCLAW_STABILITY_BACKUP_HEA
 BACKUP_KEEP_COUNT = int(os.environ.get("OPENCLAW_STABILITY_BACKUP_KEEP_COUNT", "3"))
 
 HERMERS_PROFILE_FALLBACKS: List[str] = []
-HERMERS_ACP_ORPHAN_REAP_ENABLED = os.environ.get(
-    "CAT_AGENTS_STABILITY_REAP_HERMERS_ACP_ORPHANS",
-    os.environ.get("OPENCLAW_STABILITY_REAP_HERMERS_ACP_ORPHANS", "1"),
-) != "0"
-HERMERS_GATEWAY_RESTART_ENABLED = os.environ.get(
-    "CAT_AGENTS_STABILITY_RESTART_HERMERS_GATEWAY",
-    os.environ.get("OPENCLAW_STABILITY_RESTART_HERMERS_GATEWAY", "0"),
-) == "1"
-HERMERS_GATEWAY_RESTART_LIMIT = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_GATEWAY_RESTART_LIMIT", str(MAX_RESTARTS_PER_WINDOW)))
+ACTUATOR_ENVIRONMENT_SETTINGS = parse_actuator_environment_settings(os.environ)
+HERMERS_ACP_ORPHAN_REAP_ENABLED = ACTUATOR_ENVIRONMENT_SETTINGS["HERMERS_ACP_ORPHAN_REAP_ENABLED"]
+HERMERS_GATEWAY_RESTART_ENABLED = ACTUATOR_ENVIRONMENT_SETTINGS["HERMERS_GATEWAY_RESTART_ENABLED"]
+HERMERS_GATEWAY_RESTART_LIMIT = parse_hermers_gateway_restart_limit(os.environ, MAX_RESTARTS_PER_WINDOW)
 HERMERS_ACP_ORPHAN_MIN_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_ACP_ORPHAN_SECONDS", "120"))
 HERMERS_ACP_LONG_RUNNING_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_ACP_LONG_SECONDS", "600"))
-HERMERS_LSP_IDLE_REAP_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_REAP_HERMERS_IDLE_LSP", "1") != "0"
+HERMERS_LSP_IDLE_REAP_ENABLED = ACTUATOR_ENVIRONMENT_SETTINGS["HERMERS_LSP_IDLE_REAP_ENABLED"]
 HERMERS_LSP_IDLE_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_LSP_IDLE_SECONDS", str(4 * 3600)))
 HERMERS_LSP_IDLE_STATE_TTL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_LSP_IDLE_STATE_TTL_SECONDS", str(24 * 3600)))
 HERMERS_FAILURE_WINDOW_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_FAILURE_WINDOW_SECONDS", "1800"))
 HERMERS_FAILURE_BURST_THRESHOLD = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_FAILURE_BURST", "5"))
 HERMERS_STALE_SENT_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_STALE_SENT_SECONDS", "600"))
-HERMERS_PROFILE_MODE_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ENABLED", "1") != "0"
-HERMERS_PROFILE_MODE_ACTUATE_ENABLED = os.environ.get(
-    "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTUATE",
-    os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_ACTUATE", "0"),
-) != "0"
-HERMERS_PROFILE_MODE_START_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_START", "1") != "0"
-HERMERS_PROFILE_LIFECYCLE_ALLOWLIST = {
-    item.strip()
-    for item in os.environ.get(
-        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_ALLOWLIST",
-        os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_MANAGED", ""),
-    ).split(",")
-    if item.strip()
-}
-HERMERS_PROFILE_COLD_IDLE_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_COLD_IDLE_SECONDS", str(30 * 60)))
-HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS", str(8 * 3600)))
-HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS = int(
-    os.environ.get(
-        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS",
-        os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS", "600"),
-    )
-)
-HERMERS_PROFILE_PROTECTED_IDS = {
-    item.strip()
-    for item in os.environ.get(
-        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_PROTECTED_IDS",
-        os.environ.get("CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_PROTECTED", "main,cat_heart,catheart,cat_claw"),
-    ).split(",")
-    if item.strip()
-}
+HERMERS_PROFILE_LIFECYCLE_SETTINGS = parse_hermers_profile_lifecycle_settings(os.environ)
+HERMERS_PROFILE_MODE_ENABLED = HERMERS_PROFILE_LIFECYCLE_SETTINGS["modeEnabled"]
+HERMERS_PROFILE_MODE_ACTUATE_ENABLED = HERMERS_PROFILE_LIFECYCLE_SETTINGS["actuateEnabled"]
+HERMERS_PROFILE_MODE_START_ENABLED = HERMERS_PROFILE_LIFECYCLE_SETTINGS["startEnabled"]
+HERMERS_PROFILE_LIFECYCLE_ALLOWLIST = HERMERS_PROFILE_LIFECYCLE_SETTINGS["lifecycleAllowlist"]
+HERMERS_PROFILE_COLD_IDLE_SECONDS = HERMERS_PROFILE_LIFECYCLE_SETTINGS["coldIdleSeconds"]
+HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS = HERMERS_PROFILE_LIFECYCLE_SETTINGS["hibernateIdleSeconds"]
+HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS = HERMERS_PROFILE_LIFECYCLE_SETTINGS["lifecycleCooldownSeconds"]
+HERMERS_PROFILE_PROTECTED_IDS = HERMERS_PROFILE_LIFECYCLE_SETTINGS["protectedIds"]
 AUTH_WARN_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_WARN_SECONDS", str(72 * 3600)))
 AUTH_CRITICAL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_CRITICAL_SECONDS", str(24 * 3600)))
 AUTH_OPENCLAW_PROBE_TTL_SECONDS = int(os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_PROBE_SECONDS", str(15 * 60)))
@@ -218,6 +293,7 @@ AUTH_OPENAI_PROVIDER_IDS = {
     for item in os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENAI_PROVIDERS", "openai-codex,openai").split(",")
     if item.strip()
 }
+AUTH_PROFILE_PROVIDER_ID_ALLOWLIST = frozenset({"openai", "openai-codex"})
 AUTH_OPENCLAW_REQUIRED_PROVIDER_IDS = {
     item.strip()
     for item in os.environ.get("CAT_AGENTS_STABILITY_AUTH_OPENCLAW_REQUIRED_PROVIDERS", "openai-codex,openai").split(",")
@@ -238,13 +314,13 @@ TMP_FILE_MAX_AGE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_TMP_MAX_AGE_SE
 ORPHAN_RUN_LOG_MIN_AGE_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_ORPHAN_RUN_LOG_MIN_AGE_SECONDS", "3600"))
 MIN_STALE_RUNNING_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_MIN_STALE_RUNNING_SECONDS", "1800"))
 STALE_RUNNING_TIMEOUT_MULTIPLIER = int(os.environ.get("OPENCLAW_STABILITY_STALE_RUNNING_MULTIPLIER", "4"))
-LEASE_REAP_ENABLED = os.environ.get("OPENCLAW_STABILITY_REAP_LEASES", "1") != "0"
-SESSION_RESET_ENABLED = os.environ.get("OPENCLAW_STABILITY_RESET_SESSIONS", "1") != "0"
-CRON_MUTATION_ENABLED = os.environ.get("OPENCLAW_STABILITY_MUTATE_CRON", "1") != "0"
-GATEWAY_RESTART_ENABLED = os.environ.get("OPENCLAW_STABILITY_RESTART_GATEWAY", "1") != "0"
+LEASE_REAP_ENABLED = ACTUATOR_ENVIRONMENT_SETTINGS["LEASE_REAP_ENABLED"]
+SESSION_RESET_ENABLED = ACTUATOR_ENVIRONMENT_SETTINGS["SESSION_RESET_ENABLED"]
+CRON_MUTATION_ENABLED = ACTUATOR_ENVIRONMENT_SETTINGS["CRON_MUTATION_ENABLED"]
+GATEWAY_RESTART_ENABLED = ACTUATOR_ENVIRONMENT_SETTINGS["GATEWAY_RESTART_ENABLED"]
 GATEWAY_RESTART_ACTUATOR_SUPPORTED = True
-SOFT_GATEWAY_RESTART_ENABLED = os.environ.get("OPENCLAW_STABILITY_SOFT_RESTART_GATEWAY", "0") == "1"
-SOFT_RESCUE_RESTART_ENABLED = os.environ.get("OPENCLAW_STABILITY_SOFT_RESCUE_RESTART", "1") != "0"
+SOFT_GATEWAY_RESTART_ENABLED = ACTUATOR_ENVIRONMENT_SETTINGS["SOFT_GATEWAY_RESTART_ENABLED"]
+SOFT_RESCUE_RESTART_ENABLED = ACTUATOR_ENVIRONMENT_SETTINGS["SOFT_RESCUE_RESTART_ENABLED"]
 SOFT_RESCUE_STREAK_THRESHOLD = int(os.environ.get("OPENCLAW_STABILITY_SOFT_RESCUE_STREAK", "20"))
 
 SESSION_RESET_COOLDOWN_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_SESSION_RESET_COOLDOWN_SECONDS", str(6 * 3600)))
@@ -375,7 +451,7 @@ def ensure_dirs() -> None:
 
 def log_line(message: str) -> None:
     ensure_dirs()
-    line = f"{ts()} {message}\n"
+    line = f"{ts()} {redact_sensitive_text(message, 4000)}\n"
     with LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(line)
 
@@ -390,13 +466,22 @@ def load_json(path: Path, default: Any = None) -> Any:
         return default
 
 
-def write_json_atomic(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{int(time.time() * 1000)}.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=False)
-        fh.write("\n")
-    tmp.replace(path)
+def generation_compatible_payload(path: Path, latest: Dict[str, Any], embedded: Any = None) -> Dict[str, Any]:
+    """Prefer the committed latest snapshot; reject mismatched fixed-path aliases."""
+    if isinstance(embedded, dict):
+        return embedded
+    payload = load_json(path, {}) or {}
+    if not isinstance(payload, dict):
+        return {}
+    committed_generation = latest.get("generationId")
+    payload_generation = payload.get("generationId")
+    if committed_generation:
+        if payload_generation != committed_generation:
+            return {}
+    elif payload_generation is not None:
+        # A legacy latest pointer cannot authenticate a newly versioned alias.
+        return {}
+    return payload
 
 
 def append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
@@ -631,12 +716,14 @@ def parse_openclaw_auth_list(text: str, agent_id: str) -> Dict[str, Any]:
             continue
         match = re.match(r"^-\s+([^\s]+)(?:\s+\([^)]*\))?\s+\[([^]]+)\]", line)
         if not match:
-            unparsed_profile_lines.append(line[:240])
+            unparsed_profile_lines.append("unparsed_oauth_profile_line")
             continue
         raw_profile_id = match.group(1)
         meta = match.group(2)
         provider = meta.split("/", 1)[0].split(";", 1)[0].strip()
-        profile_kind = raw_profile_id.split(":", 1)[0]
+        if provider not in AUTH_PROFILE_PROVIDER_ID_ALLOWLIST:
+            provider = "unknown"
+        profile_kind = provider
         expires_match = re.search(r"\bexpires(?:\s+at)?\s*[:=]?\s+([^;\]]+)", meta, re.IGNORECASE)
         cooldown_match = re.search(r"\bcooldown\s+until\s*[:=]?\s+([^;\]]+)", meta, re.IGNORECASE)
         expires_epoch = parse_iso_epoch(expires_match.group(1).strip()) if expires_match else None
@@ -646,8 +733,10 @@ def parse_openclaw_auth_list(text: str, agent_id: str) -> Dict[str, Any]:
                 "agentId": agent_id,
                 "profileKind": profile_kind,
                 "provider": provider or profile_kind,
-                "profileLabel": f"{profile_kind}:[redacted]" if ":" in raw_profile_id else raw_profile_id,
-                "authKind": meta.split(";", 1)[0].strip(),
+                "profileLabel": f"{profile_kind}:[redacted]",
+                "authKind": meta.split(";", 1)[0].strip().lower()
+                if meta.split(";", 1)[0].strip().lower() in {"oauth", "api_key", "token"}
+                else "unknown",
                 "expiresEpoch": expires_epoch,
                 "expiresAt": iso_from_epoch(expires_epoch),
                 "secondsRemaining": int(expires_epoch) - current_epoch if expires_epoch is not None else None,
@@ -702,7 +791,10 @@ def openclaw_auth_probe_cache_ttl(cached: Dict[str, Any], *, now_epoch: Optional
     return max(1, AUTH_OPENCLAW_PROBE_TTL_SECONDS)
 
 
-def cached_openclaw_auth_probe(conn: sqlite3.Connection, agent_id: str, *, force: bool = False) -> Dict[str, Any]:
+def cached_openclaw_auth_probe(
+    conn: sqlite3.Connection, agent_id: str, *, force: bool = False,
+    persist: bool = True, cache_updates: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     cache_key = f"auth:openclaw:{agent_id}"
     cached = db_get(conn, cache_key, {}) or {}
     cached_epoch = int(cached.get("checkedAtEpoch") or 0) if isinstance(cached, dict) else 0
@@ -748,11 +840,14 @@ def cached_openclaw_auth_probe(conn: sqlite3.Connection, agent_id: str, *, force
             "checkedAtEpoch": epoch(),
             "cached": False,
             "available": False,
-            "error": redact_auth_text(f"{type(exc).__name__}: {exc}", 1000),
+            "error": redact_auth_text(type(exc).__name__, 1000),
             "profileCount": 0,
             "profiles": [],
         }
-    db_set(conn, cache_key, result)
+    if persist:
+        db_set(conn, cache_key, result)
+    elif cache_updates is not None:
+        cache_updates[cache_key] = result
     return result
 
 
@@ -779,30 +874,37 @@ def command_probe(cmd: List[str], timeout: int = 5, max_chars: int = 16_000) -> 
         proc = run_cmd(cmd, timeout=timeout)
         duration = int((time.time() - started) * 1000)
         return {
-            "cmd": cmd,
+            "cmd": [Path(cmd[0]).name] if cmd else [],
             "exitCode": proc.returncode,
             "durationMs": duration,
-            "stdout": proc.stdout[-max_chars:],
-            "stderr": proc.stderr[-max_chars:],
+            "stdout": redact_sensitive_text(proc.stdout, max_chars),
+            "stderr": redact_sensitive_text(proc.stderr, max_chars),
         }
     except Exception as exc:
         duration = int((time.time() - started) * 1000)
         return {
-            "cmd": cmd,
+            "cmd": [Path(cmd[0]).name] if cmd else [],
             "exitCode": -1,
             "durationMs": duration,
-            "error": f"{type(exc).__name__}: {exc}",
+            "errorClass": type(exc).__name__,
         }
 
 
 def extract_json_payload(text: str) -> Tuple[Optional[Any], List[str], Optional[str]]:
-    """Parse CLI JSON while preserving OpenClaw diagnostic preambles."""
+    """Parse CLI JSON while preserving only allowlisted diagnostic categories."""
     diagnostics: List[str] = []
     if not text:
         return None, diagnostics, "empty"
+    lowered = text.lower()
+    if "state-migrations" in lowered or "legacy state migration" in lowered:
+        diagnostics.append("state_migration_warning")
+    if "plugin install index" in lowered:
+        diagnostics.append("plugin_install_index_warning")
+    if "warning" in lowered or "error" in lowered:
+        diagnostics.append("non_json_diagnostic_preamble")
     starts = sorted(idx for idx, char in enumerate(text) if char in "{[")
     if not starts:
-        return None, [line for line in text.splitlines() if line.strip()][:20], "json_start_missing"
+        return None, diagnostics or ["non_json_output"], "json_start_missing"
     decoder = json.JSONDecoder()
     first_error: Optional[str] = None
     for start in starts:
@@ -810,30 +912,30 @@ def extract_json_payload(text: str) -> Tuple[Optional[Any], List[str], Optional[
         payload_text = text[start:].strip()
         try:
             payload, _ = decoder.raw_decode(payload_text)
-            if prefix:
-                diagnostics = [line for line in prefix.splitlines() if line.strip()][:40]
             try:
                 return json.loads(payload_text), diagnostics, None
             except Exception as exc:
-                return payload, diagnostics, f"trailing_non_json_ignored: {exc}"
+                return payload, diagnostics, f"trailing_non_json_ignored:{type(exc).__name__}"
         except Exception as exc:
             if first_error is None:
-                first_error = str(exc)
+                first_error = type(exc).__name__
             continue
-    prefix_lines = [line for line in text.splitlines() if line.strip()][:40]
-    return None, prefix_lines, f"json_parse_failed: {first_error or 'unknown'}"
+    return None, diagnostics or ["non_json_output"], f"json_parse_failed:{first_error or 'unknown'}"
 
 
 def openclaw_state_migration_diagnostics(diagnostics: Iterable[str]) -> List[str]:
-    return [line for line in diagnostics if "state-migrations" in line or "Legacy state migration" in line or "plugin install index" in line]
+    return [
+        code for code in diagnostics
+        if code in {"state_migration_warning", "plugin_install_index_warning"}
+    ]
 
 
 def parse_openclaw_version(text: str) -> Dict[str, Any]:
-    match = re.search(r"OpenClaw\s+([^\s]+)(?:\s+\(([^)]+)\))?", text or "")
+    match = re.search(r"\bOpenClaw\s+(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?:\s+\(([0-9a-fA-F]{7,64})\))?", text or "")
     if not match:
-        return {"raw": (text or "").strip()}
+        return {"raw": "unparsed_version_output", "version": None, "commit": None}
     return {
-        "raw": (text or "").strip(),
+        "raw": f"OpenClaw {match.group(1)}",
         "version": match.group(1),
         "commit": match.group(2),
     }
@@ -889,7 +991,7 @@ def collect_cron_storage_status() -> Dict[str, Any]:
     try:
         out = run_cmd(["openclaw", "cron", "status", "--json"], timeout=15)
     except Exception as exc:
-        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"available": False, "error": type(exc).__name__}
     text = "\n".join([out.stdout or "", out.stderr or ""])
     payload, diagnostics, error = extract_json_payload(text)
     result: Dict[str, Any] = {
@@ -911,7 +1013,8 @@ def collect_cron_storage_status() -> Dict[str, Any]:
             }
         )
     elif out.returncode != 0:
-        result["stderr"] = out.stderr[-1000:]
+        result["stderrOmitted"] = True
+        result["stderrByteCount"] = len((out.stderr or "").encode("utf-8"))
     return result
 
 
@@ -919,7 +1022,7 @@ def collect_plugins_status() -> Dict[str, Any]:
     try:
         out = run_cmd(["openclaw", "plugins", "list", "--json"], timeout=20)
     except Exception as exc:
-        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"available": False, "error": type(exc).__name__}
     text = "\n".join([out.stdout or "", out.stderr or ""])
     payload, diagnostics, error = extract_json_payload(text)
     result: Dict[str, Any] = {
@@ -950,7 +1053,8 @@ def collect_plugins_status() -> Dict[str, Any]:
             }
         )
     elif out.returncode != 0:
-        result["stderr"] = out.stderr[-1000:]
+        result["stderrOmitted"] = True
+        result["stderrByteCount"] = len(out.stderr or "")
     return result
 
 
@@ -1120,7 +1224,7 @@ def desired_state_required_files(state: Dict[str, Any]) -> List[str]:
     return [str(item) for item in files if str(item).strip()]
 
 
-def _snapshot_bool(value: Any, fallback: int = 1) -> int:
+def _snapshot_bool(value: Any, fallback: Optional[int] = None) -> Optional[int]:
     if value is None or value == "":
         return fallback
     if isinstance(value, bool):
@@ -1135,10 +1239,6 @@ def _snapshot_bool(value: Any, fallback: int = 1) -> int:
 
 def _registry_snapshot_records(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
     records = snapshot.get("records") if isinstance(snapshot.get("records"), list) else []
-    if not records and isinstance(snapshot.get("runtimeRegistry"), dict):
-        for agents in snapshot["runtimeRegistry"].values():
-            if isinstance(agents, list):
-                records.extend(item for item in agents if isinstance(item, dict))
     normalized = []
     for item in records:
         if not isinstance(item, dict):
@@ -1163,9 +1263,9 @@ def _registry_snapshot_records(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]
                 "im_ingress_owner": item.get("im_ingress_owner") or item.get("imIngressOwner") or "",
                 "im_ingress_adapter": item.get("im_ingress_adapter") or item.get("imIngressAdapter") or "",
                 "workflow_ingress_adapter": item.get("workflow_ingress_adapter") or item.get("workflowIngressAdapter") or "",
-                "can_receive_dispatch": _snapshot_bool(item.get("can_receive_dispatch", item.get("canReceiveDispatch")), 1),
-                "can_start_workflow": _snapshot_bool(item.get("can_start_workflow", item.get("canStartWorkflow")), 1),
-                "gateway_proxy_allowed": _snapshot_bool(item.get("gateway_proxy_allowed", item.get("gatewayProxyAllowed")), 1),
+                "can_receive_dispatch": _snapshot_bool(item.get("can_receive_dispatch", item.get("canReceiveDispatch"))),
+                "can_start_workflow": _snapshot_bool(item.get("can_start_workflow", item.get("canStartWorkflow"))),
+                "gateway_proxy_allowed": _snapshot_bool(item.get("gateway_proxy_allowed", item.get("gatewayProxyAllowed"))),
                 "endpoint_ref": item.get("endpoint_ref") or item.get("endpointRef") or "",
                 "updated_at": item.get("updated_at") or item.get("updatedAt") or snapshot.get("generatedAt") or "",
             }
@@ -1179,6 +1279,8 @@ def workflow_runtime_registry_snapshot_records(reason: str = "") -> Dict[str, An
         "snapshotFile": str(WORKFLOW_RUNTIME_AGENTS_SNAPSHOT),
         "snapshotExists": WORKFLOW_RUNTIME_AGENTS_SNAPSHOT.exists(),
         "records": [],
+        "health": "unavailable",
+        "writeEligible": False,
     }
     if reason:
         payload["fallbackReason"] = reason
@@ -1191,9 +1293,50 @@ def workflow_runtime_registry_snapshot_records(reason: str = "") -> Dict[str, An
         return payload
     payload["snapshotGeneratedAt"] = snapshot.get("generatedAt") or ""
     payload["workflowSchemaVersion"] = snapshot.get("workflowSchemaVersion")
-    payload["records"] = _registry_snapshot_records(snapshot)
-    if not payload["records"]:
-        payload["error"] = "runtime_agents snapshot has no supported records"
+    snapshot_schema = snapshot.get("schemaVersion")
+    payload["snapshotSchemaVersion"] = snapshot_schema
+    candidate_records = _registry_snapshot_records(snapshot)
+    raw_records = snapshot.get("records") if isinstance(snapshot.get("records"), list) else []
+    generated_epoch = parse_iso_epoch(payload["snapshotGeneratedAt"]) if payload["snapshotGeneratedAt"] else None
+    now_s = epoch()
+    payload["snapshotAgeSeconds"] = now_s - generated_epoch if generated_epoch is not None else None
+    snapshot_agent_ids = [str(item.get("agent_id") or "").strip() for item in candidate_records]
+    duplicate_agent_ids = {value for value in snapshot_agent_ids if value and snapshot_agent_ids.count(value) > 1}
+    payload["duplicateAgentIds"] = sorted(duplicate_agent_ids)
+    snapshot_valid = (
+        snapshot_schema == 1
+        and isinstance(snapshot.get("records"), list)
+        and bool(candidate_records)
+        and len(candidate_records) == len(raw_records)
+        and generated_epoch is not None
+        and generated_epoch <= now_s + WORKFLOW_RUNTIME_SNAPSHOT_MAX_FUTURE_SKEW_SECONDS
+        and now_s - generated_epoch <= WORKFLOW_RUNTIME_SNAPSHOT_MAX_AGE_SECONDS
+        and all(
+            item.get("agent_id") and item.get("runtime") and item.get("status")
+            and item.get("platform") and item.get("endpoint_ref")
+            and item.get("can_receive_dispatch") in (0, 1)
+            and item.get("can_start_workflow") in (0, 1)
+            and item.get("gateway_proxy_allowed") in (0, 1)
+            for item in candidate_records
+        )
+        and not duplicate_agent_ids
+    )
+    payload["records"] = candidate_records if snapshot_valid else []
+    payload["health"] = "observation_only" if snapshot_valid else "invalid"
+    payload["writeEligible"] = False
+    payload["error"] = "snapshot is observation-only; cannot establish mutation eligibility"
+    if generated_epoch is None:
+        payload["snapshotHealth"] = "missing_or_invalid_timestamp"
+    elif generated_epoch > epoch() + 300:
+        payload["snapshotHealth"] = "future_timestamp"
+    elif now_s - generated_epoch > WORKFLOW_RUNTIME_SNAPSHOT_MAX_AGE_SECONDS:
+        payload["snapshotHealth"] = "stale"
+    elif snapshot_schema != 1:
+        payload["snapshotHealth"] = "unsupported_schema"
+    elif not snapshot_valid:
+        payload["snapshotHealth"] = "incomplete_records"
+    else:
+        payload["snapshotHealth"] = "fresh_valid_observation_only"
     return payload
 
 
@@ -1205,14 +1348,14 @@ def workflow_runtime_registry_records() -> Dict[str, Any]:
         "snapshotFile": str(WORKFLOW_RUNTIME_AGENTS_SNAPSHOT),
         "snapshotExists": WORKFLOW_RUNTIME_AGENTS_SNAPSHOT.exists(),
         "records": [],
+        "health": "unavailable",
+        "writeEligible": False,
     }
     if not WORKFLOW_DB.exists():
         fallback = workflow_runtime_registry_snapshot_records("workflow_db_missing")
-        if fallback.get("records"):
-            fallback["dbFile"] = str(WORKFLOW_DB)
-            fallback["exists"] = False
-            return fallback
-        return payload
+        fallback["dbFile"] = str(WORKFLOW_DB)
+        fallback["exists"] = False
+        return fallback
     try:
         conn = sqlite3.connect(str(WORKFLOW_DB))
         conn.row_factory = sqlite3.Row
@@ -1222,12 +1365,23 @@ def workflow_runtime_registry_records() -> Dict[str, Any]:
         if not table:
             payload["error"] = "runtime_agents table not found"
             conn.close()
-            return payload
+            fallback = workflow_runtime_registry_snapshot_records("runtime_agents_table_missing")
+            fallback["dbFile"] = str(WORKFLOW_DB)
+            fallback["exists"] = True
+            fallback["dbError"] = payload["error"]
+            return fallback
         columns = {
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(runtime_agents)").fetchall()
             if row["name"]
         }
+        required = {
+            "agent_id", "runtime", "status", "platform", "execution_adapter",
+            "can_receive_dispatch", "can_start_workflow", "gateway_proxy_allowed", "endpoint_ref",
+        }
+        missing_required = sorted(required - columns)
+        payload["requiredColumns"] = sorted(required)
+        payload["missingRequiredColumns"] = missing_required
         wanted = [
             "agent_key",
             "agent_id",
@@ -1250,7 +1404,11 @@ def workflow_runtime_registry_records() -> Dict[str, Any]:
         if not select_cols:
             payload["error"] = "runtime_agents has no supported columns"
             conn.close()
-            return payload
+            fallback = workflow_runtime_registry_snapshot_records("runtime_agents_columns_missing")
+            fallback["dbFile"] = str(WORKFLOW_DB)
+            fallback["exists"] = True
+            fallback["dbError"] = payload["error"]
+            return fallback
         order_cols = [name for name in ("agent_id", "runtime") if name in columns]
         if not order_cols:
             order_cols = [select_cols[0]]
@@ -1262,15 +1420,32 @@ def workflow_runtime_registry_records() -> Dict[str, Any]:
             """.format(columns=", ".join(select_cols), order_cols=", ".join(order_cols))
         ).fetchall()
         payload["records"] = [dict(row) for row in rows]
+        identities = [str(item.get("agent_id") or "").strip() for item in payload["records"]]
+        complete_rows = all(
+            identity
+            and str(item.get("runtime") or "").strip()
+            and str(item.get("status") or "").strip()
+            and str(item.get("platform") or "").strip()
+            and str(item.get("execution_adapter") or "").strip()
+            and str(item.get("endpoint_ref") or "").strip()
+            and all(item.get(key) in (0, 1, False, True) for key in (
+                "can_receive_dispatch", "can_start_workflow", "gateway_proxy_allowed"
+            ))
+            for item in payload["records"]
+        )
+        payload["duplicateAgentIds"] = sorted({value for value in identities if value and identities.count(value) > 1})
+        payload["writeEligible"] = not missing_required and complete_rows and not payload["duplicateAgentIds"]
+        payload["health"] = "healthy" if payload["writeEligible"] else "incomplete"
+        if not payload["writeEligible"]:
+            payload["error"] = "runtime_agents schema or records are incomplete for lifecycle scope"
         conn.close()
     except Exception as exc:
-        payload["error"] = f"{type(exc).__name__}: {exc}"
+        payload["error"] = type(exc).__name__
         fallback = workflow_runtime_registry_snapshot_records("workflow_db_error")
-        if fallback.get("records"):
-            fallback["dbFile"] = str(WORKFLOW_DB)
-            fallback["exists"] = WORKFLOW_DB.exists()
-            fallback["dbError"] = payload["error"]
-            return fallback
+        fallback["dbFile"] = str(WORKFLOW_DB)
+        fallback["exists"] = WORKFLOW_DB.exists()
+        fallback["dbError"] = payload["error"]
+        return fallback
     return payload
 
 
@@ -1317,7 +1492,7 @@ def codex_mcp_config_check(state: Dict[str, Any]) -> Dict[str, Any]:
     try:
         text = CODEX_CONFIG_PATH.read_text(encoding="utf-8", errors="replace")
     except Exception as exc:
-        payload["error"] = f"{type(exc).__name__}: {exc}"
+        payload["error"] = type(exc).__name__
         return payload
     missing = []
     for name in required:
@@ -1524,19 +1699,20 @@ def desired_state_drift() -> Dict[str, Any]:
 
 def build_workflow_stability_evidence(snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     latest = snapshot if isinstance(snapshot, dict) else (load_json(LATEST_PATH, {}) or {})
-    policy = latest.get("policy") if isinstance(latest.get("policy"), dict) else (load_json(POLICY_PATH, {}) or {})
-    lanes = policy.get("lanes") if isinstance(policy.get("lanes"), dict) else (load_json(LANE_POLICY_PATH, {}) or {})
+    policy = generation_compatible_payload(POLICY_PATH, latest, latest.get("policy"))
+    lanes = generation_compatible_payload(LANE_POLICY_PATH, latest, policy.get("lanes"))
     desired = latest.get("desiredState") if isinstance(latest.get("desiredState"), dict) else desired_state_drift()
     findings = latest.get("findings") if isinstance(latest.get("findings"), list) else []
     actions = latest.get("actions") if isinstance(latest.get("actions"), list) else []
     auth = latest.get("auth") if isinstance(latest.get("auth"), dict) else {}
-    auth_maintenance = latest.get("authMaintenance") if isinstance(latest.get("authMaintenance"), dict) else load_json(AUTH_MAINTENANCE_PLAN_PATH, {}) or {}
+    auth_maintenance = generation_compatible_payload(AUTH_MAINTENANCE_PLAN_PATH, latest, latest.get("authMaintenance"))
     resource_human_gate = load_json(RESOURCE_HUMAN_GATE_DIR / "gateway-resource-pressure-latest.json", {}) or {}
     current_keys = {str(item.get("key")) for item in findings if isinstance(item, dict)}
     resource_gate_active = bool(resource_pressure_active(current_keys))
     resource_gate_generated_at = resource_human_gate.get("generatedAt")
     return {
         "schemaVersion": 1,
+        "generationId": latest.get("generationId"),
         "generatedAt": ts(),
         "source": "cat-agents-stabilityd",
         "workflowRoot": str(WORKFLOW_ROOT),
@@ -1623,6 +1799,7 @@ def render_workflow_stability_evidence_md(evidence: Dict[str, Any]) -> str:
     lines = [
         "# Cat Agents Stability Evidence",
         "",
+        f"- generationId: {evidence.get('generationId')}",
         f"- generatedAt: {evidence.get('generatedAt')}",
         f"- checkedAt: {stability.get('checkedAt')}",
         f"- severity: {stability.get('severity')}",
@@ -1695,11 +1872,13 @@ def write_workflow_stability_evidence(snapshot: Optional[Dict[str, Any]] = None)
         evidence["reason"] = "workflow root missing"
         return evidence
     WORKFLOW_GOVERNANCE_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(WORKFLOW_STABILITY_EVIDENCE_JSON, evidence)
-    WORKFLOW_STABILITY_EVIDENCE_MD.write_text(render_workflow_stability_evidence_md(evidence), encoding="utf-8")
     evidence["written"] = True
     evidence["jsonPath"] = str(WORKFLOW_STABILITY_EVIDENCE_JSON)
     evidence["markdownPath"] = str(WORKFLOW_STABILITY_EVIDENCE_MD)
+    markdown_meta = write_text_atomic(WORKFLOW_STABILITY_EVIDENCE_MD, render_workflow_stability_evidence_md(evidence))
+    evidence["markdownSha256"] = markdown_meta["sha256"]
+    # JSON is the evidence commit marker and is replaced only after Markdown is durable.
+    write_json_atomic(WORKFLOW_STABILITY_EVIDENCE_JSON, evidence)
     return evidence
 
 
@@ -1738,10 +1917,11 @@ def systemctl_show_gateway() -> Dict[str, Any]:
     try:
         out = run_cmd(["systemctl", "show", "openclaw-gateway.service", f"--property={props}"], timeout=8)
     except Exception as exc:
-        return {"error": f"{type(exc).__name__}: {exc}"}
+        return {"error": type(exc).__name__}
     data: Dict[str, Any] = {"exitCode": out.returncode}
     if out.returncode != 0:
-        data["stderr"] = out.stderr[-800:]
+        data["stderrOmitted"] = True
+        data["stderrByteCount"] = len(out.stderr or "")
     for line in out.stdout.splitlines():
         if "=" not in line:
             continue
@@ -1810,6 +1990,82 @@ def ps_rows() -> List[Dict[str, str]]:
     return rows
 
 
+def _process_argv(command: str) -> List[str]:
+    """Parse ps command text conservatively; malformed quoting is not executable evidence."""
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return []
+
+
+def _codex_process_class(command: str) -> Dict[str, Optional[str]]:
+    """Classify a direct Codex executable invocation without matching argument text."""
+    argv = _process_argv(command)
+    if not argv:
+        return {"kind": "other", "executable": None, "launcher": None}
+
+    executable_index = 0
+    launcher = "native"
+    executable = os.path.basename(argv[0])
+    if executable in {"node", "nodejs"}:
+        launcher = "node"
+        node_value_options = {
+            "-r", "--require", "--loader", "--experimental-loader", "--import",
+            "-C", "--conditions", "--inspect-port", "--debug-port",
+        }
+        node_boolean_options = {
+            "--enable-source-maps", "--no-warnings", "--trace-warnings",
+            "--inspect", "--inspect-brk", "--inspect-wait", "--experimental-strip-types",
+        }
+        index = 1
+        while index < len(argv) and argv[index].startswith("-"):
+            option = argv[index]
+            if option.split("=", 1)[0] in {"-e", "--eval", "-p", "--print", "-c", "--check", "--test"}:
+                return {"kind": "other", "executable": executable, "launcher": launcher}
+            if option in node_value_options:
+                index += 2
+            elif option in node_boolean_options or option.startswith("--") and "=" in option:
+                index += 1
+            else:
+                return {"kind": "other", "executable": executable, "launcher": launcher}
+        executable_index = index
+        if executable_index >= len(argv) or os.path.basename(argv[executable_index]) not in {
+            "codex.js", "codex.mjs", "codex.cjs",
+        }:
+            return {"kind": "other", "executable": executable, "launcher": launcher}
+    elif executable not in {"codex", "codex-cli"}:
+        return {"kind": "other", "executable": executable, "launcher": None}
+
+    codex_executable = argv[executable_index]
+    args = argv[executable_index + 1 :]
+    value_options = {
+        "-c", "--config", "-m", "--model", "-p", "--profile",
+        "-s", "--sandbox", "-a", "--ask-for-approval", "-C", "--cd",
+        "--enable", "--disable", "--add-dir", "--local-provider",
+    }
+    boolean_options = {
+        "--oss", "--search", "--no-alt-screen", "--full-auto",
+        "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust",
+    }
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            index += 1
+            break
+        if not arg.startswith("-"):
+            break
+        if arg in value_options:
+            index += 2
+        elif arg in boolean_options or "=" in arg:
+            index += 1
+        else:
+            return {"kind": "codex_helper", "executable": codex_executable, "launcher": launcher}
+
+    kind = "codex_app_server" if index < len(args) and args[index] == "app-server" else "codex_helper"
+    return {"kind": kind, "executable": codex_executable, "launcher": launcher}
+
+
 def child_process_summary(root_pid: int) -> Dict[str, Any]:
     rows = ps_rows()
     by_parent: Dict[str, List[Dict[str, str]]] = {}
@@ -1827,13 +2083,42 @@ def child_process_summary(root_pid: int) -> Dict[str, Any]:
             seen.add(pid)
             children.append(row)
             queue.append(pid)
-    codex_app_servers = [r for r in children if "codex app-server" in r["cmd"]]
+    classified = [(row, _codex_process_class(row["cmd"])) for row in children]
+    codex_app_servers = [row for row, item in classified if item["kind"] == "codex_app_server"]
+    codex_helpers = [row for row, item in classified if item["kind"] == "codex_helper"]
     openclaw_children = [r for r in children if "openclaw" in r["cmd"]]
+    owner_candidates = [
+        {
+            "pid": row["pid"],
+            "ppid": row["ppid"],
+            "kind": item["kind"],
+            "executable": os.path.basename(item["executable"] or "") or None,
+            "launcher": item["launcher"],
+        }
+        for row, item in classified
+        if item["kind"] in {"codex_app_server", "codex_helper"}
+    ]
+    public_children = []
+    for row, classification in classified:
+        public_children.append({
+            "pid": row["pid"], "ppid": row["ppid"], "stat": row["stat"],
+            "etime": row["etime"], "rssKb": row["rssKb"],
+            "processKind": classification["kind"],
+            "executable": os.path.basename(classification.get("executable") or "") or None,
+            "launcher": classification.get("launcher"),
+        })
     return {
         "count": len(children),
         "codexAppServers": len(codex_app_servers),
         "openclawChildren": len(openclaw_children),
-        "sample": children[:20],
+        "processClassCounts": {
+            "codexAppServer": len(codex_app_servers),
+            "codexHelper": len(codex_helpers),
+            "other": len(children) - len(codex_app_servers) - len(codex_helpers),
+        },
+        "ownerCandidates": owner_candidates,
+        "classification": "argv executable plus first Codex subcommand; shell and search argument text are excluded",
+        "sample": public_children[:20],
     }
 
 
@@ -1849,7 +2134,7 @@ def gateway_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     start_epoch = parse_iso_epoch(service.get("ExecMainStartTimestamp"))
     if start_epoch:
         service_age = max(0, epoch() - start_epoch)
-    in_grace = service_age is not None and service_age < STARTUP_GRACE_SECONDS
+    in_grace = startup_grace_active(service_age, STARTUP_GRACE_SECONDS)
     memory = cgroup_bytes("openclaw-gateway.service", "memory.current") or proc_status_bytes(pid, "VmRSS")
     swap = cgroup_bytes("openclaw-gateway.service", "memory.swap.current") or proc_status_bytes(pid, "VmSwap")
     children = child_process_summary(pid)
@@ -1921,6 +2206,7 @@ def gateway_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
         "service": service,
         "active": active,
         "pid": pid,
+        "nodeGeneration": current_host_generation(),
         "port": PORT,
         "portOk": port_ok,
         "healthOk": health_ok,
@@ -1934,15 +2220,28 @@ def gateway_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def current_host_generation() -> Optional[str]:
+    """Return a boot-bound local node generation; unavailable platforms fail closed."""
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        node = platform.node().strip()
+    except (OSError, UnicodeError):
+        return None
+    if not node or not re.fullmatch(r"[0-9a-fA-F-]{16,64}", boot_id):
+        return None
+    return f"{node}:{boot_id.lower()}"
+
+
 def systemctl_user_show(unit: str) -> Dict[str, Any]:
     props = "ActiveState,SubState,MainPID,NRestarts,ExecMainStartTimestamp,MemoryCurrent,TasksCurrent"
     try:
         out = run_user_cmd(["systemctl", "--user", "show", unit, f"--property={props}"], timeout=8)
     except Exception as exc:
-        return {"unit": unit, "error": f"{type(exc).__name__}: {exc}"}
+        return {"unit": unit, "error": type(exc).__name__}
     data: Dict[str, Any] = {"unit": unit, "exitCode": out.returncode}
     if out.returncode != 0:
-        data["stderr"] = out.stderr[-800:]
+        data["stderrOmitted"] = True
+        data["stderrByteCount"] = len(out.stderr or "")
     for line in out.stdout.splitlines():
         if "=" not in line:
             continue
@@ -1963,7 +2262,8 @@ def hermers_gateway_processes(rows: List[Dict[str, str]], profile: str) -> List[
             continue
         if needle not in row.get("cmd", ""):
             continue
-        item = dict(row)
+        item = {key: row.get(key) for key in ("pid", "ppid", "stat", "etime", "rssKb")}
+        item["processType"] = "hermes-gateway"
         item["ageSeconds"] = etime_seconds(row.get("etime"))
         with contextlib.suppress(Exception):
             item["rssBytes"] = int(row.get("rssKb") or "0") * 1024
@@ -1985,10 +2285,14 @@ def hermers_acp_workers(rows: List[Dict[str, str]], known_profiles: Optional[Ite
             profile = match.group(1)
         if known and profile and profile not in known:
             continue
-        item = dict(row)
+        item = {key: row.get(key) for key in ("pid", "ppid", "stat", "etime", "rssKb")}
         item["profile"] = profile
         item["ageSeconds"] = etime_seconds(row.get("etime"))
         item["orphan"] = str(row.get("ppid") or "") == "1"
+        try:
+            item["processIdentity"] = read_process_identity(int(row.get("pid") or 0))
+        except (TypeError, ValueError):
+            item["processIdentity"] = {"status": "unknown", "reason": "invalid-pid"}
         with contextlib.suppress(Exception):
             item["rssBytes"] = int(row.get("rssKb") or "0") * 1024
         workers.append(item)
@@ -2038,18 +2342,22 @@ def hermers_lsp_processes(rows: List[Dict[str, str]], known_profiles: Optional[I
             pid = 0
         if pid <= 1:
             continue
-        item = dict(row)
+        item = {key: row.get(key) for key in ("pid", "ppid", "stat", "etime", "rssKb")}
         item["profile"] = profile
         item["processType"] = "pyright-langserver"
         item["ageSeconds"] = etime_seconds(row.get("etime"))
         item["cpuTicks"] = proc_cpu_ticks(pid)
+        item["processIdentity"] = read_process_identity(pid)
         with contextlib.suppress(Exception):
             item["rssBytes"] = int(row.get("rssKb") or "0") * 1024
         processes.append(item)
     return processes
 
 
-def update_hermers_lsp_idle_state(conn: sqlite3.Connection, processes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def update_hermers_lsp_idle_state(
+    conn: sqlite3.Connection, processes: List[Dict[str, Any]], *, persist: bool = True,
+    cache_updates: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     now_s = epoch()
     previous = db_get(conn, "hermers_lsp_idle_state", {}) or {}
     if not isinstance(previous, dict):
@@ -2071,7 +2379,6 @@ def update_hermers_lsp_idle_state(conn: sqlite3.Connection, processes: List[Dict
         state_item = {
             "profile": profile,
             "pid": pid,
-            "cmd": item.get("cmd") or "",
             "cpuTicks": cpu_ticks,
             "idleSinceEpoch": idle_since,
             "lastSeenEpoch": now_s,
@@ -2092,8 +2399,15 @@ def update_hermers_lsp_idle_state(conn: sqlite3.Connection, processes: List[Dict
             continue
         last_seen = int(old.get("lastSeenEpoch") or 0)
         if last_seen and now_s - last_seen < HERMERS_LSP_IDLE_STATE_TTL_SECONDS:
-            updated[key] = old
-    db_set(conn, "hermers_lsp_idle_state", updated)
+            updated[key] = {
+                field: old.get(field)
+                for field in ("profile", "pid", "cpuTicks", "idleSinceEpoch", "lastSeenEpoch")
+                if field in old
+            }
+    if persist:
+        db_set(conn, "hermers_lsp_idle_state", updated)
+    elif cache_updates is not None:
+        cache_updates["hermers_lsp_idle_state"] = updated
     return enriched
 
 
@@ -2104,7 +2418,7 @@ def hermers_profile_agent_ids(profile: str) -> set[str]:
 def runtime_record_can_receive(record: Dict[str, Any]) -> bool:
     value = record.get("can_receive_dispatch")
     if value is None:
-        return True
+        return False
     return str(value).lower() in {"1", "true", "yes", "on"}
 
 
@@ -2183,9 +2497,14 @@ def hermers_profiles_from_runtime_registry(
             item["agentIds"] = sorted(item.get("agentIds") or [])
         return profiles, {
             "available": True,
-            "scopeComplete": unparseable_record_count == 0,
+            "scopeComplete": bool(registry.get("writeEligible")) and registry.get("source") == "db" and unparseable_record_count == 0,
+            "writeEligible": bool(registry.get("writeEligible")) and registry.get("source") == "db",
             "unparseableRecordCount": unparseable_record_count,
-            "reason": "active-hermers-endpoint-unparseable" if unparseable_record_count else None,
+            "reason": (
+                "active-hermers-endpoint-unparseable" if unparseable_record_count
+                else (registry.get("error") or "registry-observation-only") if not registry.get("writeEligible") or registry.get("source") != "db"
+                else None
+            ),
             "source": "runtime_agents",
             "dbFile": registry.get("dbFile"),
             "recordCount": len(records),
@@ -2330,7 +2649,7 @@ def hermers_profile_workflow_activity(profile_records: Dict[str, Dict[str, Any]]
     except Exception as exc:
         for item in activity.values():
             item["probeOk"] = False
-            item["error"] = f"{type(exc).__name__}: {exc}"
+            item["error"] = type(exc).__name__
     finally:
         if conn is not None:
             with contextlib.suppress(Exception):
@@ -2339,8 +2658,7 @@ def hermers_profile_workflow_activity(profile_records: Dict[str, Dict[str, Any]]
 
 
 def hermers_profile_is_protected(profile: str, agent_ids: Iterable[str]) -> bool:
-    candidates = {profile, *[str(agent_id) for agent_id in agent_ids if str(agent_id)]}
-    return bool(candidates & HERMERS_PROFILE_PROTECTED_IDS)
+    return is_protected_identity({profile, *[str(agent_id) for agent_id in agent_ids if str(agent_id)]}, HERMERS_PROFILE_PROTECTED_IDS)
 
 
 def hermers_profile_lifecycle_allowed(profile: str, agent_ids: Iterable[str], protected: bool) -> bool:
@@ -2410,7 +2728,11 @@ def build_hermers_profile_modes(
         workflow = workflow_activity.get(profile) or {}
         agent_ids = sorted(set(registry_item.get("agentIds") or []) | set(workflow.get("agentIds") or []))
         protected = hermers_profile_is_protected(profile, agent_ids)
-        lifecycle_allowed = hermers_profile_lifecycle_allowed(profile, agent_ids, protected)
+        lifecycle_allowed = (
+            hermers_profile_lifecycle_allowed(profile, agent_ids, protected)
+            and registry_meta.get("source") == "db"
+            and bool(registry_meta.get("writeEligible"))
+        )
         planned = db_get(conn, f"hermers_profile_mode:planned:{profile}", {}) or {}
         planned_mode = str(planned.get("targetMode") or planned.get("observedMode") or "") if isinstance(planned, dict) else ""
         workflow_probe_ok = bool(workflow.get("probeOk", True))
@@ -2564,11 +2886,14 @@ def hermers_workflow_summary() -> Dict[str, Any]:
         summary["staleSentSample"] = [dict(row) for row in stale_sent[:10]]
         conn.close()
     except Exception as exc:
-        summary["error"] = f"{type(exc).__name__}: {exc}"
+        summary["error"] = type(exc).__name__
     return summary
 
 
-def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+def hermers_collect(
+    conn: sqlite3.Connection, findings: List[Dict[str, Any]], *, persist_cache: bool = True,
+    cache_updates: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     rows = ps_rows()
     profiles: Dict[str, Any] = {}
     down = []
@@ -2598,10 +2923,28 @@ def hermers_collect(conn: sqlite3.Connection, findings: List[Dict[str, Any]]) ->
         }
 
     acp_workers = hermers_acp_workers(rows, profile_registry.keys())
+    for item in acp_workers:
+        registry_item = profile_registry.get(str(item.get("profile") or "")) or {}
+        item["agentIds"] = sorted(set(registry_item.get("agentIds") or []))
+        item["registryProfile"] = str(item.get("profile") or "")
+        item["registryProfileMatched"] = bool(registry_item.get("registryRecords"))
+        item["registryScopeComplete"] = bool(registry_meta.get("scopeComplete")) and item["registryProfileMatched"]
     if profile_registry:
-        lsp_processes = update_hermers_lsp_idle_state(conn, hermers_lsp_processes(rows, profile_registry.keys()))
+        lsp_processes = update_hermers_lsp_idle_state(
+            conn, hermers_lsp_processes(rows, profile_registry.keys()),
+            persist=persist_cache, cache_updates=cache_updates,
+        )
+        for item in lsp_processes:
+            registry_item = profile_registry.get(str(item.get("profile") or "")) or {}
+            item["agentIds"] = sorted(set(registry_item.get("agentIds") or []))
+            item["registryProfile"] = str(item.get("profile") or "")
+            item["registryProfileMatched"] = bool(registry_item.get("registryRecords"))
+            item["registryScopeComplete"] = bool(registry_meta.get("scopeComplete")) and item["registryProfileMatched"]
     else:
-        db_set(conn, "hermers_lsp_idle_state", {})
+        if persist_cache:
+            db_set(conn, "hermers_lsp_idle_state", {})
+        elif cache_updates is not None:
+            cache_updates["hermers_lsp_idle_state"] = {}
         lsp_processes = []
     workflow_activity = hermers_profile_workflow_activity(profile_registry)
     profile_modes = build_hermers_profile_modes(conn, profiles, acp_workers, workflow_activity, profile_registry, registry_meta)
@@ -2720,14 +3063,15 @@ def active_openclaw_agent_ids_from_registry(registry: Dict[str, Any]) -> List[st
         status = str(record.get("status") or "").strip()
         runtime = str(record.get("runtime") or "").strip()
         platform = str(record.get("platform") or "").strip()
-        can_receive = _snapshot_bool(record.get("can_receive_dispatch"), 1)
+        adapter = str(record.get("execution_adapter") or "").strip()
+        can_receive = _snapshot_bool(record.get("can_receive_dispatch"))
         if status != "active":
             continue
         if "openclaw_route_shell" in runtime_record_adapter_values(record):
             continue
-        if runtime != "openclaw" and platform != "openclaw":
+        if runtime != "openclaw" or platform != "openclaw" or adapter != "openclaw":
             continue
-        if can_receive == 0:
+        if can_receive != 1:
             continue
         agent_id = str(record.get("agent_id") or "").strip()
         if agent_id:
@@ -2747,9 +3091,11 @@ def openclaw_auth_scope_from_registry(registry: Dict[str, Any]) -> Tuple[List[st
         values = runtime_record_adapter_values(record)
         if "openclaw_route_shell" in values:
             continue
-        if str(record.get("runtime") or "").strip() != "openclaw" and str(record.get("platform") or "").strip() != "openclaw":
+        if (str(record.get("runtime") or "").strip() != "openclaw"
+                or str(record.get("platform") or "").strip() != "openclaw"
+                or str(record.get("execution_adapter") or "").strip() != "openclaw"):
             continue
-        if _snapshot_bool(record.get("can_receive_dispatch"), 1) == 0:
+        if _snapshot_bool(record.get("can_receive_dispatch")) != 1:
             continue
         agent_id = str(record.get("agent_id") or "").strip()
         endpoint_ref = str(record.get("endpoint_ref") or "").strip()
@@ -2877,6 +3223,8 @@ def auth_collect(
     hermers_profiles: Optional[Iterable[str]] = None,
     *,
     force_openclaw_probe: bool = False,
+    persist_probe_cache: bool = True,
+    cache_updates: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     codex_cli = summarize_auth_json(CODEX_AUTH_PATH)
     add_auth_summary_findings(
@@ -3009,7 +3357,10 @@ def auth_collect(
     missing_codex_profiles: List[Dict[str, Any]] = []
     unparsed_profiles: List[Dict[str, Any]] = []
     for agent_id in openclaw_agent_ids:
-        probe = cached_openclaw_auth_probe(conn, agent_id, force=force_openclaw_probe)
+        probe = cached_openclaw_auth_probe(
+            conn, agent_id, force=force_openclaw_probe,
+            persist=persist_probe_cache, cache_updates=cache_updates,
+        )
         openclaw_auth[agent_id] = probe
         if not bool(probe.get("available")):
             add_finding(
@@ -3146,6 +3497,8 @@ def auth_collect(
             "probeAgentIds": openclaw_agent_ids,
             "omittedAgentIds": omitted_openclaw_agent_ids,
             "scopeComplete": bool(requested_openclaw_agent_ids)
+            and registry.get("source") == "db"
+            and bool(registry.get("writeEligible"))
             and "main" in requested_openclaw_agent_ids
             and not omitted_openclaw_agent_ids
             and not unregistered_requested_ids
@@ -3157,6 +3510,7 @@ def auth_collect(
             ),
             "scopeIncompleteReason": (
                 "main-not-registered" if "main" not in requested_openclaw_agent_ids
+                else "runtime-registry-not-write-eligible" if registry.get("source") != "db" or not registry.get("writeEligible")
                 else "probe-limit-exceeded" if omitted_openclaw_agent_ids
                 else "unregistered-requested-target" if unregistered_requested_ids
                 else "openclaw-probe-unavailable-or-partial" if unparsed_profiles
@@ -3479,14 +3833,7 @@ def build_auth_maintenance_plan(auth: Dict[str, Any], findings: Iterable[Dict[st
 
 
 def redact_auth_text(text: Any, max_chars: int = 2000) -> str:
-    raw = str(text or "")[-max_chars:]
-    raw = re.sub(r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]*", "[REDACTED_JWT]", raw)
-    raw = re.sub(r'(?i)("(?:access|refresh|id)(?:[_-]?token|Token)?"\s*:\s*")[^"]+(")', r"\1[REDACTED]\2", raw)
-    raw = re.sub(r'(?i)("(?:api[_-]?key|secret|token)"\s*:\s*")[^"]+(")', r"\1[REDACTED]\2", raw)
-    raw = re.sub(r"(?i)\b(access|refresh|id)(?:[_-]?token)?\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]", raw)
-    raw = re.sub(r"(?i)(api[_-]?key|secret|token)\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]", raw)
-    return raw
-
+    return redact_sensitive_text(text, max_chars)
 
 def compact_mirror_summary(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict):
@@ -3961,12 +4308,14 @@ def collect_cron_cli_status() -> Dict[str, Any]:
     try:
         out = run_cmd(["openclaw", "cron", "list", "--json"], timeout=15)
     except Exception as exc:
-        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"available": False, "error": type(exc).__name__}
     if out.returncode != 0:
-        return {"available": False, "exitCode": out.returncode, "stderr": out.stderr[-1000:]}
+        return {"available": False, "exitCode": out.returncode, "stderrOmitted": True,
+                "stderrByteCount": len(out.stderr or "")}
     payload, diagnostics, error = extract_json_payload("\n".join([out.stdout or "", out.stderr or ""]))
     if payload is None:
-        return {"available": False, "error": error or "json_parse_failed", "stdoutSample": out.stdout[:1000], "diagnostics": diagnostics}
+        return {"available": False, "error": error or "json_parse_failed",
+                "stdoutOmitted": True, "stdoutByteCount": len(out.stdout or ""), "diagnostics": diagnostics}
     jobs = payload.get("jobs") if isinstance(payload, dict) else payload
     if not isinstance(jobs, list):
         return {"available": False, "error": "missing_jobs_array", "diagnostics": diagnostics}
@@ -3993,7 +4342,7 @@ def collect_cron_cli_status() -> Dict[str, Any]:
             item["lastRunAtMs"] = state.get("lastRunAtMs")
             item["lastStatus"] = state.get("lastStatus") or state.get("lastRunStatus")
             item["consecutiveErrors"] = state.get("consecutiveErrors")
-            item["lastError"] = state.get("lastError")
+            item["lastError"] = safe_error_category(state.get("lastError")) if state.get("lastError") else None
             item["runningAtMs"] = state.get("runningAtMs")
             item["lastDurationMs"] = state.get("lastDurationMs")
         if item.get("runningAtMs") is None:
@@ -4027,7 +4376,7 @@ def jobs_from_cron_cli_status(cli_status: Dict[str, Any]) -> Dict[str, Any]:
             "lastRunAtMs": item.get("lastRunAtMs"),
             "lastStatus": item.get("lastStatus"),
             "consecutiveErrors": item.get("consecutiveErrors"),
-            "lastError": item.get("lastError"),
+            "lastError": safe_error_category(item.get("lastError")) if item.get("lastError") else None,
             "runningAtMs": item.get("runningAtMs"),
             "lastDurationMs": item.get("lastDurationMs"),
         }
@@ -4153,7 +4502,7 @@ def build_cron_runtime_summary(data: Dict[str, Any], cli_status: Optional[Dict[s
                     "lastStatus": state.get("lastStatus"),
                     "consecutiveErrors": consecutive_errors,
                     "lastDurationMs": last_duration_ms,
-                    "lastError": state.get("lastError"),
+                    "lastError": safe_error_category(state.get("lastError")) if state.get("lastError") else None,
                     "staleCliStatusClearedByRun": stale_cli_error_success,
                 }
             )
@@ -4514,11 +4863,15 @@ def telegram_api(token: str, method: str, query: str = "") -> Dict[str, Any]:
             return json.loads(res.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
         try:
-            return json.loads(exc.read().decode("utf-8", errors="replace"))
+            payload = json.loads(exc.read().decode("utf-8", errors="replace"))
+            if isinstance(payload, dict) and "description" in payload:
+                payload["description"] = redact_sensitive_text(payload["description"], 500)
+            return payload
         except Exception:
-            return {"ok": False, "description": str(exc)}
+            return {"ok": False, "description": f"HTTPError:{exc.code}"}
     except Exception as exc:
-        return {"ok": False, "description": f"{type(exc).__name__}: {exc}"}
+        # urllib exceptions often embed the request URL, which contains the bot token.
+        return {"ok": False, "description": type(exc).__name__}
 
 
 def channel_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -4731,7 +5084,7 @@ def find_session_entry(session_key: str, agent_ids: Optional[Iterable[str]] = No
 def session_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     registry = workflow_runtime_registry_records()
     registry_records = registry.get("records") if isinstance(registry.get("records"), list) else []
-    scope_available = bool(registry_records) and not registry.get("error")
+    scope_available = registry.get("source") == "db" and bool(registry.get("writeEligible"))
     active_openclaw_agent_ids = active_openclaw_agent_ids_from_registry(registry) if scope_available else []
     stores = iter_session_store_paths(active_openclaw_agent_ids if scope_available else [])
     total_entries = 0
@@ -4894,6 +5247,79 @@ def system_swap_pressure_level(swap_used: int, swap_total: int) -> str:
     return ""
 
 
+def memory_pressure_context(proc_root: Path = Path("/proc")) -> Dict[str, Any]:
+    """Read bounded Linux context; absent probes remain unknown, never healthy."""
+    context: Dict[str, Any] = {
+        "overcommitMode": None, "psi": None, "vmstatCounters": None,
+        "counterScope": "cumulative since boot; not evidence of a recent OOM or swap burst",
+        "probeErrors": {},
+    }
+    sources = {
+        "overcommit": proc_root / "sys" / "vm" / "overcommit_memory",
+        "psi": proc_root / "pressure" / "memory",
+        "vmstat": proc_root / "vmstat",
+    }
+    for name, path in sources.items():
+        try:
+            with path.open(encoding="utf-8") as handle:
+                text = handle.read(32_769)
+            if len(text) > 32_768:
+                raise ValueError("probe output exceeds budget")
+            if name == "overcommit":
+                mode = int(text.strip())
+                if mode not in {0, 1, 2}:
+                    raise ValueError("unknown overcommit mode")
+                context["overcommitMode"] = mode
+            elif name == "vmstat":
+                counters = {}
+                for line in text.splitlines():
+                    fields = line.split()
+                    if len(fields) == 2 and fields[0] in {"pswpin", "pswpout", "pgmajfault", "oom_kill"}:
+                        value = int(fields[1])
+                        if value < 0:
+                            raise ValueError("negative counter")
+                        counters[fields[0]] = value
+                if not counters:
+                    raise ValueError("no supported counters")
+                expected = {"pswpin", "pswpout", "pgmajfault", "oom_kill"}
+                context["vmstatCounters"] = {key: counters.get(key) for key in sorted(expected)}
+                if set(counters) != expected:
+                    context["probeErrors"]["vmstat"] = "MissingCounters"
+            else:
+                pressure = {}
+                for line in text.splitlines():
+                    fields = line.split()
+                    if not fields or fields[0] not in {"some", "full"}:
+                        continue
+                    values = {}
+                    for field in fields[1:]:
+                        key, value = field.split("=", 1)
+                        if key not in {"avg10", "avg60", "avg300", "total"}:
+                            continue
+                        number = int(value) if key == "total" else float(value)
+                        if not math.isfinite(number) or number < 0:
+                            raise ValueError("invalid pressure value")
+                        values[key] = number
+                    if set(values) != {"avg10", "avg60", "avg300", "total"}:
+                        raise ValueError("incomplete pressure line")
+                    pressure[fields[0]] = values
+                if "some" not in pressure:
+                    raise ValueError("no supported pressure lines")
+                context["psi"] = pressure
+                if "full" not in pressure:
+                    context["psi"]["full"] = None
+                    context["probeErrors"]["psi"] = "MissingFullPressure"
+        except (OSError, ValueError, UnicodeError, OverflowError) as exc:
+            context["probeErrors"][name] = type(exc).__name__
+    context["commitInterpretation"] = (
+        "strict commit accounting; reservation ratio still does not prove runtime failure"
+        if context["overcommitMode"] == 2
+        else "reservation ratio is not proof of OOM; corroborate PSI, memory, rates and readiness"
+    )
+    context["status"] = "partial" if context["probeErrors"] else "ok"
+    return context
+
+
 def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     statvfs = os.statvfs(str(OPENCLAW))
     free = statvfs.f_bavail * statvfs.f_frsize
@@ -4934,6 +5360,7 @@ def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     commit_limit = int(meminfo.get("CommitLimit") or 0)
     committed_as = int(meminfo.get("Committed_AS") or 0)
     commit_ratio = (committed_as / commit_limit) if commit_limit else 0
+    pressure_context = memory_pressure_context()
     if mem_available and mem_available <= SYSTEM_MEMORY_AVAILABLE_CRIT_BYTES:
         add_finding(
             findings,
@@ -4994,6 +5421,8 @@ def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
             committedBytes=committed_as,
             commitLimitBytes=commit_limit,
             commitRatio=commit_ratio,
+            overcommitMode=pressure_context["overcommitMode"],
+            interpretation=pressure_context["commitInterpretation"],
         )
     elif commit_limit and commit_ratio >= SYSTEM_COMMIT_WARN_RATIO:
         add_finding(
@@ -5005,6 +5434,8 @@ def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
             committedBytes=committed_as,
             commitLimitBytes=commit_limit,
             commitRatio=commit_ratio,
+            overcommitMode=pressure_context["overcommitMode"],
+            interpretation=pressure_context["commitInterpretation"],
         )
     return {
         "diskFreeBytes": free,
@@ -5021,6 +5452,7 @@ def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
             "committedBytes": committed_as,
             "commitLimitBytes": commit_limit,
             "commitRatio": commit_ratio,
+            "pressureContext": pressure_context,
         },
     }
 
@@ -5801,6 +6233,7 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         "severity": severity,
         "canMutateCronState": bool(can_mutate_cron),
         "cronMutationBlockedReason": "openclaw-sqlite-cron-storage" if cron_uses_sqlite_storage else "",
+        "canReapExpiredLeases": bool(LEASE_REAP_ENABLED and (can_mutate_cron or cron_uses_sqlite_storage)),
         "canResetSession": bool(can_reset_session),
         "gatewayRestartEnabled": bool(GATEWAY_RESTART_ENABLED),
         "gatewayRestartActuatorSupported": bool(GATEWAY_RESTART_ACTUATOR_SUPPORTED),
@@ -5810,12 +6243,15 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         "canRestartHermersGateway": bool(can_restart_hermers_gateway),
         "canReapHermersOrphanWorkers": bool(HERMERS_ACP_ORPHAN_REAP_ENABLED),
         "canReapHermersIdleLsp": bool(HERMERS_LSP_IDLE_REAP_ENABLED),
+        "hermersProfileModeEnabled": bool(HERMERS_PROFILE_MODE_ENABLED),
         "hermersLspIdleSeconds": HERMERS_LSP_IDLE_SECONDS,
         "hermersGatewayRestartLimit": HERMERS_GATEWAY_RESTART_LIMIT,
         "hermersGatewayRestartRemaining": hermers_restart_remaining,
         "hermersGatewayRestartProfiles": hermers_restart_decisions,
         "hermersGatewayRestartCandidateProfiles": hermers_gateway_restart_profiles,
         "hermersGatewayRestartReason": "hermers-gateway-service-down" if hermers_restart_candidate else "no-actionable-streak",
+        "hermersProfileModeActuateEnabled": bool(HERMERS_PROFILE_MODE_ENABLED and HERMERS_PROFILE_MODE_ACTUATE_ENABLED),
+        "hermersProfileModeStartEnabled": bool(HERMERS_PROFILE_MODE_START_ENABLED),
         "restartCandidate": bool(restart_candidate),
         "restartBlockedReasons": restart_blocked_reasons,
         "restartBlockedReason": ",".join(restart_blocked_reasons),
@@ -5960,6 +6396,39 @@ def build_repair_gate_from_policy(policy: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+REPAIR_REQUEST_SCHEMA_VERSION = 1
+REPAIR_REQUEST_REQUIRED_FIELDS = {"schemaVersion", "jobId", "reason", "source", "status"}
+LEGACY_REPAIR_REQUEST_REQUIRED_FIELDS = {
+    "jobId", "reason", "source", "status", "firstDetectedAtMs",
+    "lastDetectedAtMs", "count", "queueState", "gate",
+}
+
+
+def load_valid_repair_request(path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[int]]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return None, type(exc).__name__, None
+    if not isinstance(payload, dict):
+        return None, "InvalidDocumentType", None
+    source_schema = payload.get("schemaVersion")
+    if source_schema is None and LEGACY_REPAIR_REQUEST_REQUIRED_FIELDS <= set(payload):
+        # Recognize only the old producer's full shape, never arbitrary partial JSON.
+        if not all(type(payload.get(key)) is int and payload[key] >= 0 for key in ("firstDetectedAtMs", "lastDetectedAtMs", "count")) or not isinstance(payload.get("gate"), dict):
+            return None, "InvalidLegacyDocument", None
+        source_schema = 0
+        payload["schemaVersion"] = REPAIR_REQUEST_SCHEMA_VERSION
+    missing = sorted(REPAIR_REQUEST_REQUIRED_FIELDS - set(payload))
+    if missing:
+        return None, "MissingRequiredFields", None
+    if type(payload.get("schemaVersion")) is not int or payload.get("schemaVersion") != REPAIR_REQUEST_SCHEMA_VERSION:
+        return None, "UnsupportedSchemaVersion", None
+    if not all(isinstance(payload.get(key), str) and payload[key].strip() for key in ("jobId", "reason", "source", "status")):
+        return None, "InvalidRequiredField", None
+    return payload, None, source_schema
+
+
 def enqueue_repair_request(
     job_id: str,
     reason: str,
@@ -5974,6 +6443,7 @@ def enqueue_repair_request(
     existing = load_json(path, {}) if path.exists() else {}
     active_gate = gate or {}
     payload = {
+        "schemaVersion": REPAIR_REQUEST_SCHEMA_VERSION,
         "jobId": job_id,
         "runId": run_id,
         "reason": reason,
@@ -5995,21 +6465,36 @@ def update_repair_queue_status(policy: Dict[str, Any]) -> Dict[str, Any]:
     pending = 0
     blocked = 0
     ready = 0
+    invalid = 0
     updated = 0
+    migrated = 0
+    invalid_entries = []
     for request_path in sorted(REPAIR_PENDING_DIR.glob("*.json")):
-        pending += 1
-        payload = load_json(request_path, {}) or {}
-        if not isinstance(payload, dict):
+        payload, validation_error, source_schema = load_valid_repair_request(request_path)
+        if validation_error:
+            invalid += 1
+            invalid_entries.append(
+                {
+                    "path": str(request_path),
+                    "queueState": "invalid",
+                    "status": "failed",
+                    "errorClass": validation_error,
+                }
+            )
             continue
+        assert payload is not None
         payload["queueState"] = gate["status"]
         payload["gate"] = gate
         write_json_atomic(request_path, payload)
         updated += 1
+        migrated += int(source_schema == 0)
         if gate["status"] == "ready":
             ready += 1
         else:
             blocked += 1
+    pending = ready + blocked + invalid
     summary = {
+        "schemaVersion": REPAIR_REQUEST_SCHEMA_VERSION,
         "updatedAt": ts(),
         "updatedAtEpoch": epoch(),
         "queueMode": gate["status"],
@@ -6017,15 +6502,38 @@ def update_repair_queue_status(policy: Dict[str, Any]) -> Dict[str, Any]:
         "pendingCount": pending,
         "readyCount": ready,
         "blockedCount": blocked,
+        "invalidCount": invalid,
+        "invalidEntries": invalid_entries,
         "processedCount": len(list(REPAIR_PROCESSED_DIR.glob("*.json"))),
         "updatedPendingEntries": updated,
+        "migratedLegacyEntries": migrated,
         "policyUpdatedAt": policy.get("updatedAt"),
     }
     write_json_atomic(REPAIR_STATUS_PATH, summary)
     return summary
 
 
-def cron_actuate(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
+def governed_clear_stale_running(
+    candidates: List[Dict[str, Any]], policy: Dict[str, Any], gate: Dict[str, Any], snapshot_generation: str,
+) -> Dict[str, Any]:
+    # OpenClaw owns the legacy jobs.json store and writes it independently.
+    # There is no shared lock/CAS API for this mutation, so a stabilityd-side
+    # read/hash/rename sequence can still overwrite a concurrent Gateway update.
+    # Keep the finding visible and defer recovery to OpenClaw's native store path.
+    job_ids = sorted({str(item.get("jobId") or "") for item in candidates if isinstance(item, dict)})
+    job_digests = sorted(hashlib.sha256(job_id.encode()).hexdigest() for job_id in job_ids)
+    target_ref = "stale-jobs:" + hashlib.sha256("".join(job_digests).encode()).hexdigest()[:16]
+    return {
+        "targetRef": target_ref,
+        "result": "blocked",
+        "blockedReason": "legacy-openclaw-jobs-store-has-uncoordinated-writer",
+        "candidateCount": len(job_ids),
+    }
+
+
+def cron_actuate(
+    snapshot: Dict[str, Any], policy: Dict[str, Any], *, snapshot_generation: str = "",
+) -> List[Dict[str, Any]]:
     actions: List[Dict[str, Any]] = []
     cron = snapshot.get("cron") or {}
     storage_status = cron.get("storageStatus") if isinstance(cron.get("storageStatus"), dict) else {}
@@ -6066,143 +6574,613 @@ def cron_actuate(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[
         )
         gate = {**gate, "status": "ready", "reason": "sqlite-storage-lease-hygiene"}
     if stale and not sqlite_cron_storage:
-        data = load_jobs()
-        snap_path = snapshot_jobs()
-        changed = clear_stale_running_state(data, stale)
-        if changed:
-            write_json_atomic(JOBS_PATH, data)
-            repair_paths = []
-            for item in stale:
-                repair_paths.append(
-                    enqueue_repair_request(
-                        str(item["jobId"]),
-                        "stale_running_state",
-                        "cat-agents-stabilityd",
-                        details={"ageMs": item.get("ageMs"), "thresholdMs": item.get("thresholdMs")},
-                        gate=gate,
-                    )
-                )
-            actions.append(
-                {
-                    "action": "clear_stale_running_state",
-                    "result": "ok",
-                    "changed": changed,
-                    "snapshotPath": snap_path,
-                    "repairRequests": repair_paths,
-                }
-            )
-    if LEASE_REAP_ENABLED:
-        reaped = []
-        for item in cron.get("expiredLeases") or []:
-            lease_path = Path(str(item.get("path") or ""))
-            run_id = item.get("runId")
-            job_id = item.get("jobId")
-            if not lease_path.exists() or not job_id:
-                continue
-            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-            lease_backup_path = None
-            run_backup_path = None
-            backup_dir = CRON_DIR / "snapshots" / "lease-reap"
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            with contextlib.suppress(Exception):
-                lease_backup = backup_dir / f"{lease_path.name}.before-reap-{stamp}.bak"
-                shutil.copy2(lease_path, lease_backup)
-                lease_backup_path = str(lease_backup)
-            run_path = RUNS_BY_RUN_DIR / f"{run_id}.json" if run_id else None
-            if run_path and run_path.exists():
-                run_record = load_json(run_path, {}) or {}
-                if run_record.get("status") == "running":
-                    with contextlib.suppress(Exception):
-                        run_backup = backup_dir / f"{run_path.name}.before-reap-{stamp}.bak"
-                        shutil.copy2(run_path, run_backup)
-                        run_backup_path = str(run_backup)
-                    finished = now_ms()
-                    started = int(run_record.get("startedAtMs", finished) or finished)
-                    run_record["status"] = "orphaned"
-                    run_record["finishedAtMs"] = finished
-                    run_record["durationMs"] = max(0, finished - started)
-                    run_record["failure"] = {"class": "lease_expired", "message": "Lease expired without completion update."}
-                    run_record["result"] = None
-                    write_json_atomic(run_path, run_record)
-                    append_jsonl(
-                        RUNS_BY_JOB_DIR / f"{job_id}.jsonl",
-                        {
-                            "ts": finished,
-                            "jobId": job_id,
-                            "runId": run_id,
-                            "action": "orphan-reaped",
-                            "status": "orphaned",
-                            "durationMs": run_record["durationMs"],
-                        },
-                    )
-            with contextlib.suppress(Exception):
-                lease_path.unlink(missing_ok=True)
-            repair = enqueue_repair_request(str(job_id), "lease_expired", "cat-agents-stabilityd", run_id=str(run_id) if run_id else None, gate=gate)
-            reaped.append(
-                {
-                    "jobId": job_id,
-                    "runId": run_id,
-                    "leasePath": str(lease_path),
-                    "leaseBackupPath": lease_backup_path,
-                    "runBackupPath": run_backup_path,
-                    "repairRequestPath": repair,
-                }
-            )
-        if reaped:
-            actions.append({"action": "reap_expired_leases", "result": "ok", "reaped": reaped})
+        stale_action = governed_clear_stale_running(
+            stale, policy, gate, str(snapshot_generation or snapshot.get("generationId") or ""),
+        )
+        stale_action["action"] = "clear_stale_running_state"
+        actions.append(stale_action)
+    if LEASE_REAP_ENABLED and policy.get("canReapExpiredLeases") is True:
+        results = [governed_reap_expired_lease(
+            item, gate, policy, str(snapshot_generation or snapshot.get("generationId") or ""),
+        ) for item in cron.get("expiredLeases") or []]
+        reaped = [item for item in results if item["result"] == "ok"]
+        failures = [item for item in results if item["result"] in {"blocked", "failed", "uncertain"}]
+        if reaped or failures:
+            outcome = "uncertain" if any(item["result"] == "uncertain" for item in failures) else \
+                "failed" if any(item["result"] == "failed" for item in failures) else \
+                "blocked" if failures else "ok"
+            action = {"action": "reap_expired_leases", "result": outcome}
+            if reaped:
+                action["reaped"] = reaped
+            if failures:
+                action["failures"] = failures
+            actions.append(action)
     return actions
 
 
-def reset_session(session_key: str, reason: str, conn: sqlite3.Connection) -> Dict[str, Any]:
-    last_key = f"session_reset:{session_key}"
+class LeaseAuditConflict(ValueError):
+    pass
+
+
+def ensure_lease_reap_audit(job_id: str, run_id: str, run_record: Dict[str, Any]) -> str:
+    if not all(type(run_record.get(key)) is int and run_record[key] >= 0 for key in ("finishedAtMs", "durationMs")):
+        raise ValueError("lease audit requires valid completion timestamp and duration")
+    event_id = "lease-reap-" + hashlib.sha256(
+        json.dumps([job_id, run_id, run_record.get("startedAtMs"), run_record.get("finishedAtMs")], separators=(",", ":")).encode()
+    ).hexdigest()
+    canonical = {
+        "eventId": event_id, "ts": run_record.get("finishedAtMs"), "jobId": job_id,
+        "runId": run_id, "action": "orphan-reaped", "status": "orphaned",
+        "durationMs": run_record.get("durationMs"),
+    }
+    path = RUNS_BY_JOB_DIR / f"{job_id}.jsonl"
+    found = False
+    for line in tail_text(path, max_bytes=1_000_000).splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(event, dict) and event.get("eventId") == event_id:
+            if not all(type(event.get(key)) is type(value) and event.get(key) == value for key, value in canonical.items()):
+                raise LeaseAuditConflict("audit event identity conflicts with canonical run evidence")
+            found = True
+    if not found:
+        append_jsonl(path, canonical)
+    return event_id
+
+
+def reap_expired_lease_candidate(
+    item: Dict[str, Any], gate: Dict[str, Any], *, expected_lease_digest: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Report every partial step; never let one target hide another target's outcome."""
+    lease_path = Path(str(item.get("path") or ""))
+    run_id, job_id = item.get("runId"), item.get("jobId")
+    result: Dict[str, Any] = {"jobId": job_id, "runId": run_id, "leasePath": str(lease_path)}
+    partial = {
+        "runStateBefore": None, "runStateWriteAttempted": False, "runStateUpdated": False,
+        "runAuditAppended": False, "leaseDeleteAttempted": False, "leaseRemoved": False,
+        "repairRequestAttempted": False, "repairRequestQueued": False,
+    }
+    result.update({"leaseBackupPath": None, "runBackupPath": None})
+    stage = "candidate-check"
+    def expected_lease_is_current() -> bool:
+        if expected_lease_digest is None:
+            return True
+        try:
+            if lease_path.is_symlink() or not lease_path.is_file():
+                return False
+            current_lease = load_json(lease_path, None)
+            if (not isinstance(current_lease, dict)
+                    or str(current_lease.get("jobId") or "") != str(job_id)
+                    or str(current_lease.get("runId") or "") != str(run_id or "")
+                    or type(current_lease.get("expiresAtMs")) is not int
+                    or current_lease["expiresAtMs"] > now_ms()):
+                return False
+            digest = hashlib.sha256(json.dumps(
+                current_lease, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False,
+            ).encode()).hexdigest()
+            return digest == expected_lease_digest
+        except Exception:
+            return False
+
+    try:
+        if not job_id or not lease_path.exists():
+            return {**result, "result": "skipped"}
+        if not expected_lease_is_current():
+            return {**result, "result": "blocked", "failedStage": "lease-generation-check",
+                    "errorClass": "LeaseGenerationChanged", "partialWrites": partial}
+        live_lease = load_json(lease_path, None)
+        if not isinstance(live_lease, dict) or live_lease.get("dispatchState") not in {"not-started", "not-dispatched"}:
+            return {**result, "result": "uncertain", "failedStage": "dispatch-outcome-unknown",
+                    "errorClass": "GatewayDispatchOutcomeUnknown", "partialWrites": partial}
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        backup_dir = CRON_DIR / "snapshots" / "lease-reap"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stage = "lease-backup"
+        lease_backup = backup_dir / f"{lease_path.name}.before-reap-{stamp}.bak"
+        shutil.copy2(lease_path, lease_backup)
+        result["leaseBackupPath"] = str(lease_backup)
+        run_path = RUNS_BY_RUN_DIR / f"{run_id}.json" if run_id else None
+        if run_path and run_path.exists():
+            stage = "run-read"
+            with run_path.open(encoding="utf-8") as handle:
+                run_record = json.load(handle)
+            if not isinstance(run_record, dict):
+                raise ValueError("run document must be an object")
+            partial["runStateBefore"] = run_record.get("status")
+            if run_record.get("status") == "running":
+                if run_record.get("dispatchState") not in {"not-started", "not-dispatched"}:
+                    return {**result, "result": "uncertain", "failedStage": "dispatch-outcome-unknown",
+                            "errorClass": "GatewayDispatchOutcomeUnknown", "partialWrites": partial}
+                if not expected_lease_is_current():
+                    return {**result, "result": "blocked", "failedStage": "pre-run-write-lease-check",
+                            "errorClass": "LeaseGenerationChanged", "partialWrites": partial}
+                stage = "run-backup"
+                run_backup = backup_dir / f"{run_path.name}.before-reap-{stamp}.bak"
+                shutil.copy2(run_path, run_backup)
+                result["runBackupPath"] = str(run_backup)
+                finished = now_ms()
+                started = int(run_record.get("startedAtMs", finished) or finished)
+                run_record.update({
+                    "status": "orphaned", "finishedAtMs": finished,
+                    "durationMs": max(0, finished - started),
+                    "failure": {"class": "lease_expired", "message": "Lease expired without completion update."},
+                    "result": None,
+                })
+                stage = "run-write"
+                if not expected_lease_is_current():
+                    return {**result, "result": "blocked", "failedStage": "immediate-pre-run-write-lease-check",
+                            "errorClass": "LeaseGenerationChanged", "partialWrites": partial}
+                partial["runStateWriteAttempted"] = True
+                write_json_atomic(run_path, run_record)
+                partial["runStateUpdated"] = True
+            if run_record.get("status") == "orphaned" and (run_record.get("failure") or {}).get("class") == "lease_expired":
+                stage = "run-audit-append"
+                result["runAuditEventId"] = ensure_lease_reap_audit(str(job_id), str(run_id), run_record)
+                partial["runAuditAppended"] = True
+        stage = "lease-delete"
+        if not expected_lease_is_current():
+            return {**result, "result": "blocked", "failedStage": "pre-lease-delete-generation-check",
+                    "errorClass": "LeaseGenerationChanged", "partialWrites": partial}
+        partial["leaseDeleteAttempted"] = True
+        lease_path.unlink(missing_ok=True)
+        if lease_path.exists():
+            raise OSError("lease path remains after unlink")
+        partial["leaseRemoved"] = True
+        stage = "repair-enqueue"
+        partial["repairRequestAttempted"] = True
+        repair = enqueue_repair_request(str(job_id), "lease_expired", "cat-agents-stabilityd", run_id=str(run_id) if run_id else None, gate=gate)
+        partial["repairRequestQueued"] = True
+        return {**result, "result": "ok", "repairRequestPath": repair, "partialWrites": partial}
+    except Exception as exc:
+        disappearance_unknown = False
+        if partial["leaseDeleteAttempted"] and not partial["leaseRemoved"]:
+            try:
+                partial["leaseRemoved"] = not lease_path.exists()
+            except OSError:
+                partial["leaseRemoved"] = None
+                disappearance_unknown = True
+        uncertain = bool(
+            partial["runStateWriteAttempted"] or partial["leaseRemoved"]
+            or partial["repairRequestAttempted"] or disappearance_unknown
+            or partial["runStateBefore"] == "orphaned" and stage == "run-audit-append"
+        )
+        return {**result, "result": "uncertain" if uncertain else "failed", "failedStage": stage,
+                "errorClass": type(exc).__name__, "partialWrites": partial}
+
+
+@contextlib.contextmanager
+def lease_mutation_lock():
+    """Shared with the cron runner so renewal and stale-lease reap serialize."""
+    if LEASE_DIR.is_symlink() or not LEASE_DIR.is_dir():
+        raise OSError("lease root unavailable")
+    lock_path = LEASE_DIR / ".stabilityd-lease-mutation.lock"
+    with lock_path.open("a+b") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
+def governed_reap_expired_lease(
+    item: Dict[str, Any], gate: Dict[str, Any], policy: Dict[str, Any], snapshot_generation: str,
+) -> Dict[str, Any]:
+    job_id, run_id = item.get("jobId"), item.get("runId")
+    job_text = str(job_id or "")
+    run_text = str(run_id or "")
+    job_digest = hashlib.sha256(job_text.encode()).hexdigest()
+    run_digest = hashlib.sha256(run_text.encode()).hexdigest()
+    target_ref = f"job:{job_digest[:12]}/run:{run_digest[:12]}"
+    generation = str(current_host_generation() or "")
+    if (not snapshot_generation or not generation or gate.get("status") != "ready"
+            or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", job_text)
+            or run_text and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", run_text)):
+        return {"targetRef": target_ref, "result": "blocked", "blockedReason": "invalid-target-gate-or-generation"}
+    lease_path = Path(str(item.get("path") or ""))
+    try:
+        if (lease_path.is_symlink() or lease_path.resolve().parent != LEASE_DIR.resolve()
+                or lease_path.suffix != ".json" or not lease_path.is_file()):
+            return {"targetRef": target_ref, "result": "blocked", "blockedReason": "lease-path-out-of-scope"}
+    except OSError:
+        return {"targetRef": target_ref, "result": "blocked", "blockedReason": "lease-path-unavailable"}
+
+    def current_lease() -> Tuple[Optional[Dict[str, Any]], str]:
+        try:
+            if lease_path.is_symlink() or lease_path.resolve().parent != LEASE_DIR.resolve() or not lease_path.is_file():
+                return None, "lease-path-changed"
+            data = load_json(lease_path, None)
+            if (not isinstance(data, dict) or str(data.get("jobId") or "") != job_text
+                    or str(data.get("runId") or "") != run_text
+                    or type(data.get("expiresAtMs")) is not int
+                    or data["expiresAtMs"] > now_ms()):
+                return None, "lease-not-expired-or-owner-changed"
+            canonical = json.dumps(data, ensure_ascii=False, sort_keys=True,
+                                   separators=(",", ":"), allow_nan=False)
+            digest = hashlib.sha256(canonical.encode()).hexdigest()
+            owner = data.get("leaseOwner")
+            if not isinstance(owner, str) or not owner.strip():
+                return None, "lease-owner-unverifiable"
+            workload_state = data.get("workloadState")
+            workload_owner = data.get("workloadOwner")
+            dispatch_state = data.get("dispatchState")
+            if dispatch_state not in {"not-started", "not-dispatched", "attempted"}:
+                return None, "lease-dispatch-state-unverifiable"
+            if workload_state == "not-started":
+                if workload_owner is not None:
+                    return None, "lease-workload-state-invalid"
+            elif workload_state == "running":
+                if (not isinstance(workload_owner, dict)
+                        or workload_owner.get("host") != socket.gethostname()
+                        or type(workload_owner.get("pid")) is not int
+                        or workload_owner["pid"] <= 1):
+                    return None, "lease-workload-owner-unverifiable"
+            else:
+                return None, "lease-workload-state-unverifiable"
+            return {"digest": digest, "expiresAtMs": data["expiresAtMs"], "leaseOwner": owner,
+                    "workloadState": workload_state, "workloadOwner": workload_owner,
+                    "dispatchState": dispatch_state}, "ok"
+        except Exception:
+            return None, "lease-state-unavailable"
+
+    def lease_owner_is_gone(owner: str) -> bool:
+        try:
+            owner_host, raw_pid = owner.rsplit(":", 1)
+            pid = int(raw_pid)
+            if owner_host != socket.gethostname() or pid <= 1:
+                return False
+            os.kill(pid, 0)
+            return False
+        except ProcessLookupError:
+            return True
+        except (OSError, ValueError, AttributeError):
+            return False
+
+    def all_lease_processes_are_gone(lease: Dict[str, Any]) -> bool:
+        if not lease_owner_is_gone(str(lease.get("leaseOwner") or "")):
+            return False
+        if lease.get("workloadState") == "not-started":
+            return True
+        workload_owner = lease.get("workloadOwner")
+        if not isinstance(workload_owner, dict):
+            return False
+        try:
+            os.kill(workload_owner["pid"], 0)
+            return False
+        except ProcessLookupError:
+            return True
+        except (OSError, TypeError, ValueError):
+            return False
+
+    lease_state, lease_status = current_lease()
+    if lease_status != "ok" or lease_state is None:
+        return {"targetRef": target_ref, "result": "blocked", "blockedReason": lease_status}
+    if not all_lease_processes_are_gone(lease_state):
+        return {"targetRef": target_ref, "result": "blocked",
+                "blockedReason": "lease-owner-or-workload-live-or-unverifiable"}
+    lease_digest = lease_state["digest"]
+    path_digest = hashlib.sha256(str(lease_path.resolve()).encode()).hexdigest()
+    policy_digest, policy_ref = policy_reference(policy)
+    rule = STANDING_RULES["cron.expired_lease.repair"]
+    scope_payload = {"jobDigest": job_digest, "runDigest": run_digest,
+                     "leaseDigest": lease_digest, "pathDigest": path_digest,
+                     "generation": generation}
+    scope_ref = "evidence://cron-lease-scope/sha256/" + hashlib.sha256(
+        json.dumps(scope_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    spec = ActionSpec(
+        idempotency_key=f"cron.expired_lease.repair:{job_digest}:{run_digest}:{lease_digest}:{generation}",
+        action_type="cron.expired_lease.repair", target=f"cron-lease:{job_digest}:{run_digest}",
+        generation=generation, source="stabilityd-daemon",
+        input_data={"jobIdDigest": job_digest, "runIdDigest": run_digest,
+                    "leaseDigest": lease_digest, "pathDigest": path_digest,
+                    "expiresAtMs": lease_state["expiresAtMs"]},
+        authorization_ref=rule.authority_ref, policy_ref=policy_ref,
+        evidence_refs=(f"evidence://snapshot/{snapshot_generation}", scope_ref,
+                       policy_ref, f"policy-digest:sha256:{policy_digest}"),
+        metadata={"actor": "cat-agents-stabilityd", "request_source": "stabilityd-daemon"},
+    )
+
+    def boundary() -> Tuple[bool, str]:
+        if current_host_generation() != generation:
+            return False, "host-generation-changed"
+        latest, status = current_lease()
+        if status != "ok" or latest is None or latest.get("digest") != lease_digest:
+            return False, status if status != "ok" else "lease-content-changed"
+        if not all_lease_processes_are_gone(latest):
+            return False, "lease-owner-or-workload-live-or-unverifiable"
+        return True, scope_ref
+
+    def eligibility(_spec: ActionSpec, loaded: Dict[str, Any], _now_ms: int) -> tuple[str, ...]:
+        if loaded.get("canReapExpiredLeases") is not True or gate.get("status") != "ready":
+            return ()
+        allowed, ref = boundary()
+        return (f"evidence://snapshot/{snapshot_generation}", ref) if allowed else ()
+
+    def precheck(_spec: ActionSpec, _record: Any) -> BoundaryCheck:
+        allowed, ref = boundary()
+        if not allowed:
+            return BoundaryCheck("rejected", "evidence://cron-lease-scope/changed")
+        return BoundaryCheck("approved", ref)
+
+    outcome: Dict[str, Any] = {}
+    def operation(_spec: ActionSpec, _record: Any) -> OperationResult:
+        try:
+            with lease_mutation_lock():
+                allowed, _ref = boundary()
+                if not allowed:
+                    result = {"result": "blocked", "failedStage": "locked-lease-fence",
+                              "partialWrites": {}}
+                else:
+                    result = reap_expired_lease_candidate(
+                        {**item, "path": str(lease_path)}, gate, expected_lease_digest=lease_digest,
+                    )
+        except Exception as exc:
+            result = {"result": "failed", "failedStage": "lease-mutation-lock",
+                      "errorClass": type(exc).__name__, "partialWrites": {}}
+        outcome.update(result=result.get("result"), failedStage=result.get("failedStage"),
+                       errorClass=result.get("errorClass"), partialWrites=result.get("partialWrites"))
+        if isinstance(result.get("runAuditEventId"), str):
+            outcome["runAuditEventId"] = result["runAuditEventId"]
+        outcome_digest = hashlib.sha256(json.dumps(
+            {key: outcome.get(key) for key in ("result", "failedStage", "errorClass", "partialWrites")},
+            sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode()).hexdigest()
+        partial = result.get("partialWrites") if isinstance(result.get("partialWrites"), dict) else {}
+        side_effect_started = any(partial.get(key) is True for key in (
+            "runStateUpdated", "runAuditAppended", "leaseRemoved", "repairRequestQueued",
+        ))
+        status = "unknown" if result.get("result") == "uncertain" or (
+            side_effect_started and result.get("result") != "ok"
+        ) else "complete"
+        return OperationResult(status, f"outcome://cron-lease-reap/sha256/{outcome_digest}")
+
+    def postcheck(_spec: ActionSpec, _record: Any, _operation_result: OperationResult) -> PostcheckResult:
+        try:
+            if lease_path.exists():
+                return PostcheckResult("failed", "evidence://cron-lease-postcheck/lease-remains")
+            repair_path = REPAIR_PENDING_DIR / f"{job_text}__lease_expired.json"
+            repair, error, _schema = load_valid_repair_request(repair_path)
+            if error or repair is None or str(repair.get("jobId")) != job_text or str(repair.get("runId") or "") != run_text:
+                return PostcheckResult("unknown", "evidence://cron-lease-postcheck/repair-receipt-unavailable")
+            run_path = RUNS_BY_RUN_DIR / f"{run_text}.json" if run_text else None
+            if run_path and run_path.exists():
+                run_record = load_json(run_path, {})
+                if not isinstance(run_record, dict):
+                    return PostcheckResult("unknown", "evidence://cron-lease-postcheck/run-state-invalid")
+                if run_record.get("status") == "running":
+                    return PostcheckResult("failed", "evidence://cron-lease-postcheck/run-still-running")
+                if (run_record.get("status") == "orphaned"
+                        and (run_record.get("failure") or {}).get("class") == "lease_expired"):
+                    event_id = "lease-reap-" + hashlib.sha256(json.dumps(
+                        [job_text, run_text, run_record.get("startedAtMs"), run_record.get("finishedAtMs")],
+                        separators=(",", ":"),
+                    ).encode()).hexdigest()
+                    audit_found = False
+                    for line in tail_text(RUNS_BY_JOB_DIR / f"{job_text}.jsonl", 1_000_000).splitlines():
+                        try:
+                            event = json.loads(line)
+                        except (ValueError, TypeError):
+                            continue
+                        if isinstance(event, dict) and event.get("eventId") == event_id:
+                            audit_found = True
+                            break
+                    if not audit_found:
+                        return PostcheckResult("unknown", "evidence://cron-lease-postcheck/audit-missing")
+            digest = hashlib.sha256(json.dumps(
+                {"jobDigest": job_digest, "runDigest": run_digest, "leaseRemoved": True,
+                 "repairReceipt": True}, sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest()
+            return PostcheckResult("verified", f"evidence://cron-lease-postcheck/sha256/{digest}")
+        except Exception:
+            return PostcheckResult("unknown", "evidence://cron-lease-postcheck/unknown")
+
+    try:
+        execution = execute_governed_effect(spec, policy, eligibility_evidence=eligibility,
+                                            precheck=precheck, operation=operation, postcheck=postcheck)
+    except Exception as exc:
+        return {"targetRef": target_ref, "result": "uncertain", "errorClass": type(exc).__name__}
+    states = {"succeeded": "ok", "failed": "failed", "blocked": "blocked", "uncertain": "uncertain"}
+    return {"targetRef": target_ref, "result": states.get(execution.record.state, "existing"),
+            "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
+            "leaseDigest": lease_digest,
+            "failedStage": outcome.get("failedStage"), "errorClass": outcome.get("errorClass"),
+            "partialWrites": outcome.get("partialWrites"),
+            "runAuditEventId": outcome.get("runAuditEventId")}
+
+
+def reset_session(
+    session_key: str, reason: str, conn: sqlite3.Connection, *,
+    expected_session_id: Optional[str] = None, expected_store_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    session_key_digest = hashlib.sha256(str(session_key).encode("utf-8")).hexdigest()
+    last_key = f"session_reset:sha256:{session_key_digest}"
     last_reset = int(db_get(conn, last_key, 0) or 0)
     if last_reset and epoch() - last_reset < SESSION_RESET_COOLDOWN_SECONDS:
-        return {"sessionKey": session_key, "result": "cooldown_skip", "reason": reason}
-    for store_path in iter_session_store_paths():
-        store = load_json(store_path, {})
-        if not isinstance(store, dict) or session_key not in store:
-            continue
-        entry = store.get(session_key)
-        if not isinstance(entry, dict):
-            return {"sessionKey": session_key, "result": "invalid_entry", "storePath": str(store_path)}
-        session_id = entry.get("sessionId")
-        if not session_id:
-            return {"sessionKey": session_key, "result": "missing_session_id", "storePath": str(store_path)}
-        activity = analyze_session_activity(entry)
-        if activity.get("heavy"):
-            return {"sessionKey": session_key, "result": "heavy_task_skip", "activity": activity, "storePath": str(store_path), "sessionId": session_id}
-        if activity.get("active"):
-            return {"sessionKey": session_key, "result": "active_skip", "activity": activity, "storePath": str(store_path), "sessionId": session_id}
-        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        backup_dir = store_path.parent / "manual-backups"
-        backup_dir.mkdir(exist_ok=True)
-        shutil.copy2(store_path, backup_dir / f"sessions.json.before-stabilityd-{session_id}-{stamp}.bak")
-        for path in store_path.parent.glob(f"{session_id}*"):
-            if path.is_file():
-                shutil.copy2(path, backup_dir / f"{path.name}.before-stabilityd-{stamp}.bak")
-        store.pop(session_key, None)
-        write_json_atomic(store_path, store)
-        archived = []
-        for path in list(store_path.parent.glob(f"{session_id}*")):
-            if not path.is_file():
-                continue
-            new_path = path.with_name(path.name + f".stabilityd-reset-{stamp}")
-            path.rename(new_path)
-            archived.append(str(new_path))
-        db_set(conn, last_key, epoch())
-        return {
-            "sessionKey": session_key,
-            "result": "reset",
-            "reason": reason,
-            "storePath": str(store_path),
-            "sessionId": session_id,
-            "archivedFiles": archived,
-        }
+        return {"result": "cooldown_skip"}
+    agent_id = session_key_agent_id(session_key)
+    if not agent_id or not expected_session_id:
+        return {"result": "target-generation-required"}
+    current, status = openclaw_gateway_call(
+        "sessions.reset", {"key": session_key, "agentId": agent_id,
+                          "expectedSessionId": expected_session_id},
+    )
+    if status != "ok" or not isinstance(current, dict):
+        return {"result": "gateway-reset-failed", "errorClass": status}
     db_set(conn, last_key, epoch())
-    return {"sessionKey": session_key, "result": "not_found", "reason": reason}
+    return {"result": "reset", "sessionId": current.get("sessionId")}
 
 
-def session_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
+def openclaw_gateway_call(method: str, params: Dict[str, Any], timeout_seconds: int = 20) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Call a Gateway RPC through the installed CLI without persisting response text."""
+    if method not in {"sessions.describe", "sessions.reset"}:
+        return None, "unsupported-gateway-rpc"
+    try:
+        proc = run_cmd([
+            "openclaw", "gateway", "call", method,
+            "--params", json.dumps(params, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            "--json",
+        ], timeout=timeout_seconds)
+    except Exception as exc:
+        return None, type(exc).__name__
+    if proc.returncode != 0:
+        return None, "gateway-rpc-nonzero-exit"
+    payload, _diagnostics, parse_error = extract_json_payload(proc.stdout or "")
+    if parse_error or not isinstance(payload, dict):
+        return None, "gateway-rpc-invalid-response"
+    if payload.get("ok") is False or payload.get("error"):
+        return None, "gateway-rpc-rejected"
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    if isinstance(result.get("session"), dict):
+        result = result["session"]
+    return result, "ok"
+
+
+def current_session_context(session_key: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]:
+    agent_id = session_key_agent_id(session_key)
+    if not agent_id:
+        return None, {}, "session-agent-scope-unparseable"
+    if is_protected_identity({agent_id}):
+        return None, {}, "protected-session"
+    registry = workflow_runtime_registry_records()
+    if registry.get("source") != "db" or registry.get("writeEligible") is not True:
+        return None, {}, "authoritative-runtime-registry-unavailable"
+    active_agents = active_openclaw_agent_ids_from_registry(registry)
+    if agent_id not in active_agents:
+        return None, {}, "session-agent-not-active-openclaw-member"
+    row, rpc_status = openclaw_gateway_call("sessions.describe", {"key": session_key, "agentId": agent_id})
+    if rpc_status != "ok" or not isinstance(row, dict):
+        return None, {}, "gateway-session-read-unavailable"
+    if str(row.get("key") or row.get("sessionKey") or session_key) != session_key:
+        return None, {}, "gateway-session-key-mismatch"
+    session_id = row.get("sessionId")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None, {}, "gateway-session-id-unavailable"
+    if type(row.get("hasActiveRun")) is not bool:
+        return None, {}, "gateway-active-run-state-unavailable"
+    activity = analyze_session_activity(row)
+    if row.get("hasActiveRun") or activity.get("heavy") or activity.get("active"):
+        return {"agentId": agent_id, "sessionId": session_id, "hasActiveRun": row["hasActiveRun"]}, activity, "session-active-or-heavy"
+    safe_info = {"agentId": agent_id, "sessionId": session_id, "hasActiveRun": False}
+    return safe_info, activity, "session-reset-eligible"
+
+
+def governed_reset_session(
+    conn: sqlite3.Connection, session_key: str, reason: str, policy: Dict[str, Any], snapshot_generation: str,
+    expected_session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    session_key_digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()
+    session_ref = f"sha256:{session_key_digest[:16]}"
+    action_id = f"session-reset-{session_key_digest[:16]}-{int(time.time())}"
+    generation = str(current_host_generation() or "")
+    if not generation or not snapshot_generation:
+        return {"sessionRef": session_ref, "result": "blocked", "blockedReason": "generation-unavailable"}
+    if not isinstance(expected_session_id, str) or not expected_session_id:
+        return {"sessionRef": session_ref, "result": "blocked", "blockedReason": "candidate-session-id-unavailable"}
+    session_info, activity, target_status = current_session_context(session_key)
+    if (target_status != "session-reset-eligible" or session_info is None
+            or session_info.get("sessionId") != expected_session_id):
+        blocked_reason = target_status if target_status != "session-reset-eligible" else "candidate-session-id-changed"
+        return {"sessionRef": session_ref, "result": "blocked", "blockedReason": blocked_reason}
+    session_id = expected_session_id
+    session_id_digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    scope_payload = {"sessionKeyDigest": session_key_digest, "sessionIdDigest": session_id_digest,
+                     "agentId": session_info.get("agentId"), "generation": generation}
+    scope_ref = "evidence://openclaw-session-scope/sha256/" + hashlib.sha256(
+        json.dumps(scope_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    reason_code = "context_overflow" if reason == "context_overflow" else "repeated_failures"
+    policy_digest, policy_ref = policy_reference(policy)
+    rule = STANDING_RULES["openclaw.session.reset"]
+    last_key = f"session_reset:sha256:{session_key_digest}"
+    spec = ActionSpec(
+        idempotency_key=(f"openclaw.session.reset:{session_key_digest}:{session_id_digest}:{generation}:"
+                         f"{int(epoch() // max(1, SESSION_RESET_COOLDOWN_SECONDS))}"),
+        action_type="openclaw.session.reset", target=f"openclaw-session:sha256:{session_key_digest}",
+        generation=generation, source="stabilityd-daemon",
+        input_data={"sessionKeyDigest": session_key_digest, "sessionIdDigest": session_id_digest,
+                    "agentId": session_info.get("agentId"), "reasonCode": reason_code},
+        authorization_ref=rule.authority_ref, policy_ref=policy_ref,
+        evidence_refs=(f"evidence://snapshot/{snapshot_generation}", scope_ref,
+                       policy_ref, f"policy-digest:sha256:{policy_digest}"),
+        metadata={"actor": "cat-agents-stabilityd", "request_source": "stabilityd-daemon"},
+    )
+
+    def live_boundary() -> Tuple[bool, str]:
+        if current_host_generation() != generation:
+            return False, "host-generation-changed"
+        current_info, current_activity, status = current_session_context(session_key)
+        if (status != "session-reset-eligible" or current_info is None
+                or current_info.get("sessionId") != session_id
+                or current_info.get("agentId") != session_info.get("agentId")):
+            return False, status if status != "session-reset-eligible" else "session-target-changed"
+        return True, scope_ref
+
+    def eligibility(_spec: ActionSpec, loaded: Dict[str, Any], _now_ms: int) -> tuple[str, ...]:
+        if loaded.get("canResetSession") is not True:
+            return ()
+        eligible, ref = live_boundary()
+        return (f"evidence://snapshot/{snapshot_generation}", ref) if eligible else ()
+
+    def precheck(_spec: ActionSpec, _record: Any) -> BoundaryCheck:
+        eligible, ref = live_boundary()
+        if not eligible:
+            return BoundaryCheck("rejected", "evidence://openclaw-session-scope/changed")
+        last = int(db_get(conn, last_key, 0) or 0)
+        if last and epoch() - last < SESSION_RESET_COOLDOWN_SECONDS:
+            return BoundaryCheck("rejected", "evidence://openclaw-session-scope/cooldown")
+        return BoundaryCheck("approved", ref)
+
+    operation_meta: Dict[str, Any] = {}
+    def operation(_spec: ActionSpec, _record: Any) -> OperationResult:
+        result = reset_session(session_key, reason_code, conn, expected_session_id=session_id)
+        operation_meta.update(result=result.get("result"), resetSessionId=result.get("sessionId"))
+        outcome_digest = hashlib.sha256(json.dumps(
+            {"result": operation_meta["result"],
+             "resetSessionIdDigest": hashlib.sha256(str(operation_meta["resetSessionId"] or "").encode()).hexdigest()},
+            sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        status = "complete" if result.get("result") == "reset" else "partial"
+        return OperationResult(status, f"outcome://openclaw-session-reset/sha256/{outcome_digest}")
+
+    def postcheck(_spec: ActionSpec, _record: Any, _operation_result: OperationResult) -> PostcheckResult:
+        try:
+            current, _activity, status_code = current_session_context(session_key)
+            if current is None:
+                return PostcheckResult("unknown", "evidence://openclaw-session-postcheck/session-unavailable")
+            # OpenClaw allows sessions.reset in place; compare the Gateway
+            # receipt with the current target rather than requiring ID rotation.
+            returned_session_id = operation_meta.get("resetSessionId")
+            if not isinstance(returned_session_id, str) or not returned_session_id:
+                return PostcheckResult("unknown", "evidence://openclaw-session-postcheck/reset-receipt-unavailable")
+            receipt_matches = current.get("sessionId") == returned_session_id
+            evidence = {"sessionKeyDigest": session_key_digest,
+                        "resetReceiptMatchesCurrentSession": receipt_matches,
+                        "gatewayStatus": status_code}
+            digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            status = "verified" if receipt_matches else "unknown"
+            return PostcheckResult(status, f"evidence://openclaw-session-postcheck/sha256/{digest}")
+        except Exception:
+            return PostcheckResult("unknown", "evidence://openclaw-session-postcheck/unknown")
+
+    try:
+        execution = execute_governed_effect(spec, policy, eligibility_evidence=eligibility,
+                                            precheck=precheck, operation=operation, postcheck=postcheck)
+    except Exception as exc:
+        return {"actionId": action_id, "sessionRef": session_ref, "result": "uncertain",
+                "error": type(exc).__name__}
+    state_map = {"succeeded": "ok", "failed": "failed", "blocked": "blocked", "uncertain": "uncertain"}
+    return {"actionId": execution.record.action_id, "sessionRef": session_ref,
+            "result": state_map.get(execution.record.state, "existing"),
+            "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
+            "sessionIdDigest": session_id_digest, "reason": reason_code,
+            "resetSessionIdDigest": hashlib.sha256(str(operation_meta.get("resetSessionId") or "").encode()).hexdigest()}
+
+
+def session_actuate(
+    conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str, Any], *, snapshot_generation: str = "",
+) -> List[Dict[str, Any]]:
     actions: List[Dict[str, Any]] = []
     if not policy.get("canResetSession"):
         if (snapshot.get("session") or {}).get("resetCandidates"):
@@ -6221,58 +7199,274 @@ def session_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: 
         session_key = str(item.get("sessionKey") or "")
         if not session_key:
             continue
-        last_key = f"session_reset:{session_key}"
-        last_seen = int(db_get(conn, last_key, 0) or 0)
-        if last_seen and epoch() - last_seen < SESSION_RESET_COOLDOWN_SECONDS:
-            continue
         reason = "context_overflow" if int(item.get("overflowCount") or 0) >= SESSION_OVERFLOW_THRESHOLD else "repeated_failures"
-        results.append(reset_session(session_key, reason, conn))
+        results.append(governed_reset_session(
+            conn, session_key, reason, policy,
+            str(snapshot_generation or snapshot.get("generationId") or ""),
+            expected_session_id=str(item.get("sessionId") or ""),
+        ))
     if results:
-        actions.append({"action": "reset_unhealthy_sessions", "result": "ok", "results": results})
+        action_result = "uncertain" if any(item.get("result") == "uncertain" for item in results) else \
+            "failed" if any(item.get("result") == "failed" for item in results) else \
+            "blocked" if all(item.get("result") == "blocked" for item in results) else "ok"
+        actions.append({"action": "reset_unhealthy_sessions", "result": action_result, "results": results})
     return actions
 
 
-def gateway_restart(conn: sqlite3.Connection, reason: str) -> Dict[str, Any]:
-    action_id = f"gateway-restart-{int(time.time())}"
-    started = time.time()
-    cmd = ["sudo", "-n", "systemctl", "restart", "openclaw-gateway.service"]
-    try:
-        proc = run_cmd(cmd, timeout=60)
-        duration = int((time.time() - started) * 1000)
-        result = "ok" if proc.returncode == 0 else "failed"
-        payload = {
-            "actionId": action_id,
-            "ts": ts(),
-            "tsEpoch": epoch(),
-            "source": "cat-agents-stabilityd",
-            "component": "gateway",
-            "action": "restart_gateway",
-            "result": result,
-            "reason": reason,
-            "exitCode": proc.returncode,
-            "durationMs": duration,
-            "stderr": proc.stderr[-1200:],
+def execute_governed_effect(
+    spec: ActionSpec,
+    policy: Dict[str, Any],
+    *,
+    eligibility_evidence: Any,
+    precheck: Any,
+    operation: Any,
+    postcheck: Any,
+) -> Any:
+    """Bridge one existing effect leaf through durable intent and live fences."""
+    digest, policy_ref = policy_reference(policy)
+    rule = STANDING_RULES.get(spec.action_type)
+    if rule is None:
+        raise ValueError("unsupported governed action type")
+    base_refs = tuple(spec.evidence_refs)
+    if (
+        spec.policy_ref != policy_ref
+        or spec.authorization_ref != rule.authority_ref
+        or len(base_refs) < 3
+        or base_refs[-2:] != (policy_ref, f"policy-digest:sha256:{digest}")
+    ):
+        raise ValueError("action references do not bind the loaded policy")
+
+    def evaluate(spec_: ActionSpec, policy_: Dict[str, Any], policy_digest: str, now_ms: int) -> EligibilityProof:
+        refs = eligibility_evidence(spec_, policy_, now_ms)
+        evidence_refs = tuple(refs) if isinstance(refs, (tuple, list)) else ()
+        return EligibilityProof(
+            action_type=spec_.action_type,
+            target=spec_.target,
+            generation=spec_.generation,
+            input_digest=hashlib.sha256(
+                json.dumps(spec_.input_data, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"), allow_nan=False).encode("utf-8")
+            ).hexdigest(),
+            policy_digest=policy_digest,
+            evidence_refs=evidence_refs,
+            checked_at_ms=now_ms,
+            expires_at_ms=now_ms + 30_000,
+            eligible=bool(evidence_refs),
+        )
+
+    authorizer = TrustedPolicyAuthorizer(
+        policy_reader=lambda: dict(policy), eligibility_evaluator=evaluate,
+        source=spec.source, clock_ms=lambda: epoch() * 1000,
+    )
+    with ActionLedger(STATE_DB) as ledger:
+        executor = ActionExecutor(
+            ledger, authorizer=authorizer, precheck=precheck, operation=operation,
+            postcheck=postcheck, clock_ms=lambda: epoch() * 1000,
+        )
+        return executor.execute(spec)
+
+
+def gateway_restart(
+    conn: sqlite3.Connection,
+    reason: str,
+    protection_decision: Any = None,
+    *,
+    policy: Optional[Dict[str, Any]] = None,
+    snapshot_generation: str = "",
+    allow_protected_impact: bool = False,
+) -> Dict[str, Any]:
+    reason_code = re.sub(r"[^A-Za-z0-9_-]+", "-", str(reason))[:80] or "policy"
+    decision_status = str(getattr(protection_decision, "status", "unknown"))
+    decision_generation = getattr(protection_decision, "target_generation", None)
+    protection = {
+        "status": decision_status,
+        "reason": getattr(protection_decision, "reason", "protection-scope-unavailable"),
+        "affectedAgents": list(getattr(protection_decision, "affected_agents", ()) or ()),
+        "protectedSubjects": list(getattr(protection_decision, "protected_subjects", ()) or ()),
+        "targetGeneration": decision_generation,
+    }
+    if (
+        decision_status not in {"clear", "protected"} or not decision_generation
+        or not isinstance(policy, dict) or not snapshot_generation
+    ):
+        return {
+            "ts": ts(), "tsEpoch": epoch(),
+            "source": "cat-agents-stabilityd", "component": "gateway", "action": "restart_gateway",
+            "result": "blocked", "reason": reason_code,
+            "blockedReason": "protection-scope-or-generation-unavailable",
+            "protectionScope": protection,
         }
-        if proc.returncode == 0:
-            record_restart_time(conn)
-        return payload
+    if decision_status == "protected" and allow_protected_impact is not True:
+        return {
+            "ts": ts(), "tsEpoch": epoch(),
+            "source": "cat-agents-stabilityd", "component": "gateway", "action": "restart_gateway",
+            "result": "blocked", "reason": reason_code, "blockedReason": "protected-impact-not-authorized",
+            "protectionScope": protection,
+        }
+
+    def resolve_current_scope() -> Any:
+        registry = workflow_runtime_registry_records()
+        return resolve_protection_scope(
+            registry.get("records") if isinstance(registry.get("records"), list) else [],
+            registry_source=str(registry.get("source") or "unknown"),
+            registry_write_eligible=registry.get("writeEligible") is True,
+            scope_complete=registry.get("writeEligible") is True and registry.get("source") == "db",
+            target_kind="shared-gateway", target_id="dev-server", runtime="openclaw",
+            target_generation=current_host_generation() or "",
+        )
+
+    def scope_reference(scope: Any) -> str:
+        safe = {
+            "status": getattr(scope, "status", "unknown"),
+            "reason": getattr(scope, "reason", "unknown"),
+            "affectedAgents": sorted(getattr(scope, "affected_agents", ()) or ()),
+            "protectedSubjects": sorted(getattr(scope, "protected_subjects", ()) or ()),
+            "targetGeneration": getattr(scope, "target_generation", None),
+        }
+        encoded = json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return "evidence://gateway-impact/sha256/" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    try:
+        current_scope = resolve_current_scope()
+    except Exception:
+        current_scope = None
+    if (
+        current_scope is None
+        or current_scope.status not in {"clear", "protected"}
+        or current_scope.target_generation != decision_generation
+        or current_scope.status == "protected" and allow_protected_impact is not True
+    ):
+        return {
+            "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd",
+            "component": "gateway", "action": "restart_gateway", "result": "blocked",
+            "reason": reason_code, "blockedReason": "protection-scope-changed-before-intent",
+            "protectionScope": protection,
+        }
+    policy_digest, policy_ref = policy_reference(policy)
+    base_ref = f"evidence://snapshot/{snapshot_generation}"
+    scope_ref = scope_reference(current_scope)
+    rule = STANDING_RULES["openclaw.gateway.restart"]
+    spec = ActionSpec(
+        idempotency_key=(
+            f"openclaw.gateway.restart:{decision_generation}:{reason_code}:"
+            f"{int(epoch() // max(1, RESTART_COOLDOWN_SECONDS))}"
+        ),
+        action_type="openclaw.gateway.restart", target="openclaw-gateway:dev-server",
+        generation=str(decision_generation), source="stabilityd-daemon",
+        input_data={"reasonCode": reason_code, "allowProtectedImpact": allow_protected_impact},
+        authorization_ref=rule.authority_ref, policy_ref=policy_ref,
+        evidence_refs=(base_ref, scope_ref, policy_ref, f"policy-digest:sha256:{policy_digest}"),
+        metadata={"actor": "cat-agents-stabilityd", "request_source": "stabilityd-daemon"},
+    )
+    latest_scope = {"value": current_scope}
+
+    def evidence(spec_: ActionSpec, loaded_policy: Dict[str, Any], now_ms: int) -> tuple[str, ...]:
+        if (
+            loaded_policy.get("canRestartGateway") is not True
+            or loaded_policy.get("restartCandidate") is not True
+            or str(loaded_policy.get("restartReason") or "policy") != str(reason)
+        ):
+            return ()
+        try:
+            scope = resolve_current_scope()
+        except Exception:
+            return ()
+        latest_scope["value"] = scope
+        if (
+            scope.status not in {"clear", "protected"}
+            or scope.target_generation != spec_.generation
+            or scope.status == "protected" and allow_protected_impact is not True
+        ):
+            return ()
+        return base_ref, scope_reference(scope)
+
+    def precheck(_spec: ActionSpec, _record: Any) -> BoundaryCheck:
+        try:
+            scope = resolve_current_scope()
+        except Exception:
+            scope = None
+        latest_scope["value"] = scope
+        if (
+            scope is None or scope.status not in {"clear", "protected"}
+            or scope.target_generation != decision_generation
+            or scope.status == "protected" and allow_protected_impact is not True
+        ):
+            return BoundaryCheck("rejected", "evidence://gateway-impact/unknown")
+        return BoundaryCheck("approved", scope_reference(scope))
+
+    operation_meta: dict[str, Any] = {}
+
+    def operation(_spec: ActionSpec, record: Any) -> OperationResult:
+        started = time.monotonic()
+        proc = run_cmd(["sudo", "-n", "systemctl", "restart", "openclaw-gateway.service"], timeout=60)
+        operation_meta.update(exitCode=proc.returncode, durationMs=int((time.monotonic() - started) * 1000),
+                              stderrByteCount=len(proc.stderr or ""))
+        if proc.returncode != 0:
+            return OperationResult("partial", f"outcome://gateway-restart/exit-{proc.returncode}")
+        # Record cooldown before declaring operation complete; a write failure
+        # makes the ledger uncertain and prevents an automatic restart replay.
+        record_restart_time(conn)
+        return OperationResult("complete", f"outcome://gateway-restart/{record.action_id}")
+
+    def postcheck(_spec: ActionSpec, _record: Any, _result: OperationResult) -> PostcheckResult:
+        try:
+            service = systemctl_show_gateway()
+            port_ok = tcp_ok(PORT)
+            health = gateway_http_health(PORT, timeout=8) if port_ok else {"ok": False}
+        except Exception:
+            return PostcheckResult("unknown", "evidence://gateway-postcheck/unknown")
+        active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
+        if active and port_ok and health.get("ok") is True:
+            status = "verified"
+        elif service.get("ActiveState") == "inactive" or not port_ok:
+            status = "failed"
+        else:
+            status = "unknown"
+        digest = hashlib.sha256(json.dumps(
+            {"active": active, "portOk": port_ok, "healthOk": health.get("ok") is True},
+            sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        return PostcheckResult(status, f"evidence://gateway-postcheck/sha256/{digest}")
+
+    try:
+        execution = execute_governed_effect(
+            spec, policy, eligibility_evidence=evidence, precheck=precheck,
+            operation=operation, postcheck=postcheck,
+        )
     except Exception as exc:
         return {
-            "actionId": action_id,
-            "ts": ts(),
-            "tsEpoch": epoch(),
-            "source": "cat-agents-stabilityd",
-            "component": "gateway",
-            "action": "restart_gateway",
-            "result": "failed",
-            "reason": reason,
-            "exitCode": -1,
-            "error": f"{type(exc).__name__}: {exc}",
+            "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd",
+            "component": "gateway", "action": "restart_gateway", "result": "uncertain",
+            "reason": reason_code, "errorClass": type(exc).__name__,
+            "protectionScope": protection,
         }
+    state_to_result = {"succeeded": "ok", "failed": "failed", "blocked": "blocked", "uncertain": "uncertain"}
+    state = execution.record.state
+    scope = latest_scope.get("value") or current_scope
+    return {
+        "actionId": execution.record.action_id,
+        "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd",
+        "component": "gateway", "action": "restart_gateway",
+        "result": state_to_result.get(state, "existing" if execution.disposition == "existing" else "blocked"),
+        "reason": reason_code, "ledgerState": state, "ledgerDisposition": execution.disposition,
+        "exitCode": operation_meta.get("exitCode"), "durationMs": operation_meta.get("durationMs"),
+        "stderrOmitted": True, "stderrByteCount": operation_meta.get("stderrByteCount", 0),
+        "blockedReason": "durable-authority-or-precheck-denied" if state == "blocked" else None,
+        "protectionScope": {
+            "status": getattr(scope, "status", "unknown"),
+            "reason": getattr(scope, "reason", "unknown"),
+            "affectedAgents": list(getattr(scope, "affected_agents", ()) or ()),
+            "protectedSubjects": list(getattr(scope, "protected_subjects", ()) or ()),
+            "targetGeneration": getattr(scope, "target_generation", None),
+        },
+    }
 
 
-def hermers_gateway_restart(conn: sqlite3.Connection, profile: str, unit: str, reason: str) -> Dict[str, Any]:
-    action_id = f"hermers-gateway-restart-{profile}-{int(time.time())}"
+def hermers_gateway_restart(
+    conn: sqlite3.Connection, profile: str, unit: str, reason: str, *,
+    policy: Optional[Dict[str, Any]] = None, snapshot_generation: str = "",
+) -> Dict[str, Any]:
+    action_id = f"hermers-gateway-restart-{hashlib.sha256(profile.encode()).hexdigest()[:12]}-{int(time.time())}"
     if not re.match(r"^[A-Za-z0-9_.@-]+$", profile):
         return {
             "actionId": action_id,
@@ -6303,6 +7497,34 @@ def hermers_gateway_restart(conn: sqlite3.Connection, profile: str, unit: str, r
             "blockedReason": "unit-profile-mismatch",
             "expectedUnit": expected_unit,
         }
+    if not isinstance(policy, dict) or not snapshot_generation:
+        return {"actionId": action_id, "ts": ts(), "tsEpoch": epoch(),
+                "source": "cat-agents-stabilityd", "component": "hermers",
+                "action": "restart_hermers_gateway", "result": "blocked",
+                "profile": profile, "unit": unit, "blockedReason": "policy-or-snapshot-generation-unavailable"}
+    def resolve_profile_scope() -> Any:
+        registry = workflow_runtime_registry_records()
+        return resolve_protection_scope(
+            registry.get("records") if isinstance(registry.get("records"), list) else [],
+            registry_source=str(registry.get("source") or "unknown"),
+            registry_write_eligible=registry.get("writeEligible") is True,
+            scope_complete=registry.get("writeEligible") is True and registry.get("source") == "db",
+            target_kind="profile", target_id=profile, runtime="hermes",
+            target_generation=current_host_generation() or "",
+            additive_protected=HERMERS_PROFILE_PROTECTED_IDS,
+        )
+
+    try:
+        scope = resolve_profile_scope()
+    except Exception:
+        scope = None
+    if scope is None or scope.status != "clear" or not scope.target_generation:
+        return {"actionId": action_id, "ts": ts(), "tsEpoch": epoch(),
+                "source": "cat-agents-stabilityd", "component": "hermers",
+                "action": "restart_hermers_gateway", "result": "blocked",
+                "profile": profile, "unit": unit,
+                "blockedReason": "protected-or-unknown-profile-scope",
+                "protectionScopeStatus": getattr(scope, "status", "unknown")}
     last_key = f"hermers_gateway_restart:{profile}"
     last_restart = int(db_get(conn, last_key, 0) or 0)
     now_s = epoch()
@@ -6337,48 +7559,117 @@ def hermers_gateway_restart(conn: sqlite3.Connection, profile: str, unit: str, r
             "reason": reason,
             "cooldownUntilEpoch": last_restart + RESTART_COOLDOWN_SECONDS,
         }
-    started = time.time()
-    try:
+    policy_digest, policy_ref = policy_reference(policy)
+    reason_code = re.sub(r"[^A-Za-z0-9_-]+", "-", str(reason))[:80] or "policy"
+    scope_ref = "evidence://hermes-profile-scope/sha256/" + hashlib.sha256(
+        json.dumps({"profile": profile, "generation": scope.target_generation,
+                    "affected": sorted(scope.affected_agents), "status": scope.status},
+                   sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    rule = STANDING_RULES["hermes.gateway.restart"]
+    def unit_is_explicitly_down() -> bool:
+        try:
+            state = systemctl_user_show(unit).get("ActiveState")
+            return state in {"inactive", "failed"}
+        except Exception:
+            return False
+
+    spec = ActionSpec(
+        idempotency_key=(f"hermes.gateway.restart:{profile}:{scope.target_generation}:{reason_code}:"
+                         f"{int(epoch() // max(1, RESTART_COOLDOWN_SECONDS))}"),
+        action_type="hermes.gateway.restart", target=f"hermes-gateway:{profile}",
+        generation=str(scope.target_generation), source="stabilityd-daemon",
+        input_data={"profile": profile, "unit": unit, "reasonCode": reason_code},
+        authorization_ref=rule.authority_ref, policy_ref=policy_ref,
+        evidence_refs=(f"evidence://snapshot/{snapshot_generation}", scope_ref,
+                       policy_ref, f"policy-digest:sha256:{policy_digest}"),
+        metadata={"actor": "cat-agents-stabilityd", "request_source": "stabilityd-daemon"},
+    )
+    def eligibility(spec_: ActionSpec, loaded: Dict[str, Any], now_ms: int) -> tuple[str, ...]:
+        planned = loaded.get("hermersGatewayRestartProfiles")
+        if (loaded.get("canRestartHermersGateway") is not True
+                or str(loaded.get("hermersGatewayRestartReason") or "") != str(reason)
+                or not isinstance(planned, list)):
+            return ()
+        matched = any(isinstance(item, dict) and str(item.get("profile") or "") == profile
+                      and str(item.get("unit") or "") == unit for item in planned)
+        try:
+            latest = resolve_profile_scope()
+        except Exception:
+            return ()
+        if (not matched or latest.status != "clear" or latest.target_generation != spec_.generation
+                or tuple(sorted(latest.affected_agents)) != tuple(sorted(scope.affected_agents))
+                or not unit_is_explicitly_down()):
+            return ()
+        return (f"evidence://snapshot/{snapshot_generation}", scope_ref)
+
+    def precheck(_spec: ActionSpec, _record: Any) -> BoundaryCheck:
+        try:
+            latest = resolve_profile_scope()
+        except Exception:
+            latest = None
+        if (latest is None or latest.status != "clear" or latest.target_generation != scope.target_generation
+                or tuple(sorted(latest.affected_agents)) != tuple(sorted(scope.affected_agents))
+                or not unit_is_explicitly_down()):
+            return BoundaryCheck("rejected", "evidence://hermes-profile-scope/unknown")
+        if len(recent_hermers_gateway_restart_history(conn)) >= MAX_RESTARTS_PER_WINDOW:
+            return BoundaryCheck("rejected", "evidence://hermes-gateway/restart-storm")
+        last = int(db_get(conn, last_key, 0) or 0)
+        if last and epoch() - last < RESTART_COOLDOWN_SECONDS:
+            return BoundaryCheck("rejected", "evidence://hermes-gateway/cooldown")
+        return BoundaryCheck("approved", scope_ref)
+
+    operation_meta: Dict[str, Any] = {}
+    def operation(_spec: ActionSpec, record: Any) -> OperationResult:
+        started = time.monotonic()
         proc = run_hermes_profile_gateway_cmd(profile, "restart", timeout=60)
-        duration = int((time.time() - started) * 1000)
-        result = "ok" if proc.returncode == 0 else "failed"
-        payload = {
-            "actionId": action_id,
-            "ts": ts(),
-            "tsEpoch": epoch(),
-            "source": "cat-agents-stabilityd",
-            "component": "hermers",
-            "action": "restart_hermers_gateway",
-            "result": result,
-            "profile": profile,
-            "unit": unit,
-            "reason": reason,
-            "operation": "hermes-gateway-restart",
-            "adapter": "hermes-cli",
-            "command": [HERMES_CLI, "-p", profile, "gateway", "restart"],
-            "exitCode": proc.returncode,
-            "durationMs": duration,
-            "stderr": proc.stderr[-1200:],
-        }
-        if proc.returncode == 0:
-            db_set(conn, last_key, epoch())
-            record_hermers_gateway_restart_time(conn, profile)
-        return payload
+        operation_meta.update(exitCode=proc.returncode, durationMs=int((time.monotonic() - started) * 1000),
+                              stderrByteCount=len(proc.stderr or ""))
+        if proc.returncode != 0:
+            return OperationResult("partial", f"outcome://hermes-gateway-restart/exit-{proc.returncode}")
+        db_set(conn, last_key, epoch())
+        record_hermers_gateway_restart_time(conn, profile)
+        return OperationResult("complete", f"outcome://hermes-gateway-restart/{record.action_id}")
+
+    def postcheck(_spec: ActionSpec, _record: Any, _result: OperationResult) -> PostcheckResult:
+        try:
+            proc = run_hermes_profile_gateway_cmd(profile, "status", timeout=20)
+            status_text = (proc.stdout or "").lower()
+            explicit_failure = re.search(
+                r"\b(not\s+(?:active|running|ready)|inactive|stopped|failed|down|unhealthy)\b",
+                status_text,
+            )
+            explicit_ready = re.search(r"\b(active|running|ready)\b", status_text)
+            if proc.returncode != 0 or explicit_failure:
+                state = "failed"
+            elif proc.returncode == 0 and explicit_ready:
+                state = "verified"
+            else:
+                state = "unknown"
+            digest = hashlib.sha256(f"{proc.returncode}:{state}".encode()).hexdigest()
+            return PostcheckResult(state, f"evidence://hermes-gateway-postcheck/sha256/{digest}")
+        except Exception:
+            return PostcheckResult("unknown", "evidence://hermes-gateway-postcheck/unknown")
+
+    try:
+        execution = execute_governed_effect(
+            spec, policy, eligibility_evidence=eligibility, precheck=precheck,
+            operation=operation, postcheck=postcheck,
+        )
     except Exception as exc:
-        return {
-            "actionId": action_id,
-            "ts": ts(),
-            "tsEpoch": epoch(),
-            "source": "cat-agents-stabilityd",
-            "component": "hermers",
+        return {"actionId": action_id, "ts": ts(), "tsEpoch": epoch(),
+                "source": "cat-agents-stabilityd", "component": "hermers",
+                "action": "restart_hermers_gateway", "result": "uncertain",
+                "profile": profile, "unit": unit, "error": type(exc).__name__}
+    state_map = {"succeeded": "ok", "failed": "failed", "blocked": "blocked", "uncertain": "uncertain"}
+    return {"actionId": execution.record.action_id, "ts": ts(), "tsEpoch": epoch(),
+            "source": "cat-agents-stabilityd", "component": "hermers",
             "action": "restart_hermers_gateway",
-            "result": "failed",
-            "profile": profile,
-            "unit": unit,
-            "reason": reason,
-            "exitCode": -1,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+            "result": state_map.get(execution.record.state, "existing" if execution.disposition == "existing" else "blocked"),
+            "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
+            "profile": profile, "unit": unit, "reason": reason,
+            "exitCode": operation_meta.get("exitCode"), "durationMs": operation_meta.get("durationMs"),
+            "stderrOmitted": True, "stderrByteCount": operation_meta.get("stderrByteCount", 0)}
 
 
 def resource_trigger_keys(snapshot: Dict[str, Any]) -> List[str]:
@@ -6420,8 +7711,8 @@ def capture_resource_evidence(snapshot: Dict[str, Any], policy: Dict[str, Any], 
             timeout=5,
             max_chars=8_000,
         ),
-        "topMem": command_probe(["bash", "-lc", "ps aux --sort=-%mem | head -40"], timeout=5, max_chars=12_000),
-        "topCpu": command_probe(["bash", "-lc", "ps aux --sort=-%cpu | head -40"], timeout=5, max_chars=12_000),
+        "topMem": command_probe(["ps", "-eo", "pid,ppid,stat,etime,rss,comm", "--sort=-%mem"], timeout=5, max_chars=12_000),
+        "topCpu": command_probe(["ps", "-eo", "pid,ppid,stat,etime,%cpu,comm", "--sort=-%cpu"], timeout=5, max_chars=12_000),
         "recentKernelMemory": command_probe(
             ["bash", "-lc", "journalctl -k --since '-30 min' --no-pager | grep -Ei 'memory pressure|oom|Out of memory|Killed process|watchdog' | tail -120"],
             timeout=5,
@@ -6611,9 +7902,168 @@ def resource_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy:
     return actions
 
 
-def hermers_profile_mode_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+def execute_hermers_profile_lifecycle(
+    conn: sqlite3.Connection, profile: str, item: Dict[str, Any], target_mode: str,
+    policy: Dict[str, Any], snapshot_generation: str,
+) -> Dict[str, Any]:
+    unit = str(item.get("unit") or f"hermes-gateway-{profile}.service")
+    action_id = f"hermes-profile-mode-{hashlib.sha256(profile.encode()).hexdigest()[:12]}-{target_mode}-{int(time.time())}"
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", profile) or unit != f"hermes-gateway-{profile}.service":
+        return {"actionId": action_id, "action": "set_hermers_profile_mode", "result": "blocked",
+                "profile": profile, "unit": unit, "targetMode": target_mode,
+                "blockedReason": "invalid-profile-or-unit"}
+    if (target_mode not in {"hot", "hibernate"} or profile not in HERMERS_PROFILE_LIFECYCLE_ALLOWLIST
+            or item.get("managed") is not True or item.get("activeWork") is not False):
+        return {"actionId": action_id, "action": "set_hermers_profile_mode", "result": "blocked",
+                "profile": profile, "unit": unit, "targetMode": target_mode,
+                "blockedReason": "lifecycle-candidate-not-eligible"}
+    if target_mode == "hibernate" and (item.get("active") is not True or item.get("safeToHibernate") is not True):
+        return {"actionId": action_id, "action": "set_hermers_profile_mode", "result": "blocked",
+                "profile": profile, "unit": unit, "targetMode": target_mode,
+                "blockedReason": str(item.get("safeToHibernateReason") or "runtime-safe-to-hibernate-missing")}
+    if target_mode == "hot" and (item.get("active") is not False or HERMERS_PROFILE_MODE_START_ENABLED is not True):
+        return {"actionId": action_id, "action": "set_hermers_profile_mode", "result": "blocked",
+                "profile": profile, "unit": unit, "targetMode": target_mode,
+                "blockedReason": "profile-start-not-eligible"}
+    generation = str(current_host_generation() or "")
+    if not generation or not snapshot_generation:
+        return {"actionId": action_id, "action": "set_hermers_profile_mode", "result": "blocked",
+                "profile": profile, "unit": unit, "targetMode": target_mode,
+                "blockedReason": "generation-unavailable"}
+    owner_ok, owner_reason, scope_ref = hermers_profile_live_owner(
+        profile, list(item.get("agentIds") or []), generation,
+    )
+    if not owner_ok:
+        return {"actionId": action_id, "action": "set_hermers_profile_mode", "result": "blocked",
+                "profile": profile, "unit": unit, "targetMode": target_mode,
+                "blockedReason": owner_reason}
+    now_s = epoch()
+    action_key = f"hermers_profile_mode:{profile}:{target_mode}"
+    last_action = int(db_get(conn, action_key, 0) or 0)
+    if last_action and now_s - last_action < HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS:
+        return {"actionId": action_id, "action": "set_hermers_profile_mode", "result": "cooldown_skip",
+                "profile": profile, "unit": unit, "targetMode": target_mode,
+                "cooldownUntilEpoch": last_action + HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS}
+    policy_digest, policy_ref = policy_reference(policy)
+    rule = STANDING_RULES["hermes.profile.lifecycle"]
+    action = "stop" if target_mode == "hibernate" else "start"
+    reason_code = re.sub(r"[^A-Za-z0-9_-]+", "-", str(item.get("reason") or "policy"))[:80] or "policy"
+    spec = ActionSpec(
+        idempotency_key=(f"hermes.profile.lifecycle:{profile}:{target_mode}:{generation}:"
+                         f"{int(now_s // max(1, HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS))}"),
+        action_type="hermes.profile.lifecycle", target=f"hermes-profile:{profile}",
+        generation=generation, source="stabilityd-daemon",
+        input_data={"profile": profile, "unit": unit, "targetMode": target_mode,
+                    "operation": action, "reasonCode": reason_code},
+        authorization_ref=rule.authority_ref, policy_ref=policy_ref,
+        evidence_refs=(f"evidence://snapshot/{snapshot_generation}", scope_ref,
+                       policy_ref, f"policy-digest:sha256:{policy_digest}"),
+        metadata={"actor": "cat-agents-stabilityd", "request_source": "stabilityd-daemon"},
+    )
+
+    def current_boundary() -> Tuple[bool, str, str]:
+        valid, why, ref = hermers_profile_live_owner(profile, list(item.get("agentIds") or []), generation)
+        if not valid:
+            return False, why, ""
+        try:
+            registry = workflow_runtime_registry_records()
+            profiles, meta = hermers_profiles_from_runtime_registry([], registry)
+            activity = hermers_profile_workflow_activity(profiles).get(profile) or {}
+            if (meta.get("scopeComplete") is not True or activity.get("probeOk") is not True
+                    or int(activity.get("activeRuntimeCount") or 0) > 0
+                    or int(activity.get("activeDispatchCount") or 0) > 0):
+                return False, "active-or-unknown-workflow-activity", ""
+            service = systemctl_user_show(unit)
+            active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
+            if target_mode == "hibernate":
+                if not active:
+                    return False, "profile-no-longer-active", ""
+                if item.get("safeToHibernate") is not True:
+                    return False, "safe-to-hibernate-evidence-unavailable", ""
+            elif active:
+                return False, "profile-already-active", ""
+            return True, "profile-lifecycle-boundary-verified", ref
+        except Exception:
+            return False, "profile-lifecycle-boundary-unknown", ""
+
+    def eligibility(_spec: ActionSpec, loaded: Dict[str, Any], _now_ms: int) -> tuple[str, ...]:
+        if loaded.get("hermersProfileModeActuateEnabled") is not True:
+            return ()
+        if target_mode == "hot" and loaded.get("hermersProfileModeStartEnabled") is not True:
+            return ()
+        eligible, _, ref = current_boundary()
+        return (f"evidence://snapshot/{snapshot_generation}", ref) if eligible else ()
+
+    def precheck(_spec: ActionSpec, _record: Any) -> BoundaryCheck:
+        eligible, _, ref = current_boundary()
+        if not eligible:
+            return BoundaryCheck("rejected", "evidence://hermes-profile-lifecycle/boundary-changed")
+        last = int(db_get(conn, action_key, 0) or 0)
+        if last and epoch() - last < HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS:
+            return BoundaryCheck("rejected", "evidence://hermes-profile-lifecycle/cooldown")
+        return BoundaryCheck("approved", ref)
+
+    operation_meta: Dict[str, Any] = {}
+    def operation(_spec: ActionSpec, record: Any) -> OperationResult:
+        started = time.monotonic()
+        proc = run_hermes_profile_gateway_cmd(profile, action, timeout=30)
+        operation_meta.update(exitCode=proc.returncode, durationMs=int((time.monotonic() - started) * 1000),
+                              stderrByteCount=len(proc.stderr or ""))
+        if proc.returncode != 0:
+            return OperationResult("partial", f"outcome://hermes-profile-{action}/exit-{proc.returncode}")
+        db_set(conn, action_key, epoch())
+        if target_mode == "hibernate":
+            db_set(conn, f"hermers_profile_mode:planned:{profile}",
+                   {"profile": profile, "targetMode": target_mode, "unit": unit,
+                    "reason": reason_code, "setAt": ts(),
+                    "setAtEpoch": epoch(), "source": "cat-agents-stabilityd"})
+        return OperationResult("complete", f"outcome://hermes-profile-{action}/{record.action_id}")
+
+    def postcheck(_spec: ActionSpec, _record: Any, _result: OperationResult) -> PostcheckResult:
+        try:
+            service = systemctl_user_show(unit)
+            active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
+            active_state = service.get("ActiveState")
+            if not isinstance(active_state, str) or not active_state:
+                state = "unknown"
+            elif target_mode == "hot" and active:
+                state = "verified"
+            elif target_mode == "hibernate" and not active and active_state == "inactive":
+                state = "verified"
+            elif active_state == "unknown":
+                state = "unknown"
+            else:
+                state = "failed"
+            ref = "evidence://hermes-profile-postcheck/sha256/" + hashlib.sha256(
+                json.dumps({"active": active, "activeState": service.get("ActiveState"),
+                            "subState": service.get("SubState")}, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            return PostcheckResult(state, ref)
+        except Exception:
+            return PostcheckResult("unknown", "evidence://hermes-profile-postcheck/unknown")
+
+    try:
+        execution = execute_governed_effect(spec, policy, eligibility_evidence=eligibility,
+                                            precheck=precheck, operation=operation, postcheck=postcheck)
+    except Exception as exc:
+        return {"actionId": action_id, "action": "set_hermers_profile_mode", "result": "uncertain",
+                "profile": profile, "unit": unit, "targetMode": target_mode, "error": type(exc).__name__}
+    state_map = {"succeeded": "ok", "failed": "failed", "blocked": "blocked", "uncertain": "uncertain"}
+    return {"actionId": execution.record.action_id, "action": "set_hermers_profile_mode",
+            "result": state_map.get(execution.record.state, "existing"),
+            "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
+            "profile": profile, "unit": unit, "targetMode": target_mode,
+            "operation": f"hermes-gateway-{action}", "adapter": "hermes-cli",
+            "exitCode": operation_meta.get("exitCode"), "durationMs": operation_meta.get("durationMs"),
+            "stderrOmitted": True, "stderrByteCount": operation_meta.get("stderrByteCount", 0)}
+
+
+def hermers_profile_mode_actuate(
+    conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Optional[Dict[str, Any]] = None,
+    *, snapshot_generation: str = "",
+) -> List[Dict[str, Any]]:
     actions: List[Dict[str, Any]] = []
-    if not HERMERS_PROFILE_MODE_ENABLED or not HERMERS_PROFILE_MODE_ACTUATE_ENABLED:
+    if not HERMERS_PROFILE_MODE_ENABLED or not HERMERS_PROFILE_MODE_ACTUATE_ENABLED or not isinstance(policy, dict):
         return actions
     hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
     modes = hermers.get("profileModes") if isinstance(hermers.get("profileModes"), dict) else {}
@@ -6622,139 +8072,191 @@ def hermers_profile_mode_actuate(conn: sqlite3.Connection, snapshot: Dict[str, A
     for profile, item in profiles.items():
         if not isinstance(item, dict):
             continue
-        if item.get("protected") or not item.get("managed"):
-            continue
-        if item.get("activeWork"):
-            continue
         target_mode = str(item.get("targetMode") or item.get("observedMode") or "warm")
         active = bool(item.get("active"))
         unit = str(item.get("unit") or f"hermes-gateway-{profile}.service")
-        expected_unit = f"hermes-gateway-{profile}.service"
-        if unit != expected_unit:
-            actions.append(
-                {
-                    "action": "set_hermers_profile_mode",
-                    "result": "blocked",
-                    "profile": profile,
-                    "unit": unit,
-                    "targetMode": target_mode,
-                    "blockedReason": "unit-profile-mismatch",
-                    "expectedUnit": expected_unit,
-                }
-            )
-            continue
-        action_key = f"hermers_profile_mode:{profile}:{target_mode}"
-        last_action = int(db_get(conn, action_key, 0) or 0)
-        if last_action and now_s - last_action < HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS:
-            continue
-        if target_mode == "hibernate" and active:
-            if not item.get("safeToHibernate"):
-                actions.append(
-                    {
-                        "action": "set_hermers_profile_mode",
-                        "result": "blocked",
-                        "profile": profile,
-                        "unit": unit,
-                        "targetMode": target_mode,
-                        "reason": item.get("reason"),
-                        "blockedReason": item.get("safeToHibernateReason") or "runtime-safe-to-hibernate-missing",
-                    }
-                )
-                continue
-            started = time.time()
-            try:
-                proc = run_hermes_profile_gateway_cmd(profile, "stop", timeout=30)
-                duration_ms = int((time.time() - started) * 1000)
-                result = "ok" if proc.returncode == 0 else "failed"
-                actions.append(
-                    {
-                        "action": "set_hermers_profile_mode",
-                        "result": result,
-                        "profile": profile,
-                        "unit": unit,
-                        "targetMode": target_mode,
-                        "reason": item.get("reason"),
-                        "idleSeconds": item.get("idleSeconds"),
-                        "operation": "hermes-gateway-stop",
-                        "adapter": "hermes-cli",
-                        "command": [HERMES_CLI, "-p", profile, "gateway", "stop"],
-                        "exitCode": proc.returncode,
-                        "durationMs": duration_ms,
-                        "stderr": proc.stderr[-1200:],
-                    }
-                )
-                db_set(conn, action_key, now_s)
-                if proc.returncode == 0:
-                    db_set(
-                        conn,
-                        f"hermers_profile_mode:planned:{profile}",
-                        {
-                            "profile": profile,
-                            "targetMode": target_mode,
-                            "unit": unit,
-                            "reason": item.get("reason"),
-                            "setAt": ts(),
-                            "setAtEpoch": now_s,
-                            "source": "cat-agents-stabilityd",
-                        },
-                    )
-            except Exception as exc:
-                db_set(conn, action_key, now_s)
-                actions.append(
-                    {
-                        "action": "set_hermers_profile_mode",
-                        "result": "failed",
-                        "profile": profile,
-                        "unit": unit,
-                        "targetMode": target_mode,
-                        "reason": item.get("reason"),
-                        "operation": "hermes-gateway-stop",
-                        "adapter": "hermes-cli",
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-        elif target_mode == "hot" and not active and HERMERS_PROFILE_MODE_START_ENABLED:
-            started = time.time()
-            try:
-                proc = run_hermes_profile_gateway_cmd(profile, "start", timeout=30)
-                duration_ms = int((time.time() - started) * 1000)
-                result = "ok" if proc.returncode == 0 else "failed"
-                actions.append(
-                    {
-                        "action": "set_hermers_profile_mode",
-                        "result": result,
-                        "profile": profile,
-                        "unit": unit,
-                        "targetMode": target_mode,
-                        "reason": item.get("reason"),
-                        "operation": "hermes-gateway-start",
-                        "adapter": "hermes-cli",
-                        "command": [HERMES_CLI, "-p", profile, "gateway", "start"],
-                        "exitCode": proc.returncode,
-                        "durationMs": duration_ms,
-                        "stderr": proc.stderr[-1200:],
-                    }
-                )
-                db_set(conn, action_key, now_s)
-            except Exception as exc:
-                db_set(conn, action_key, now_s)
-                actions.append(
-                    {
-                        "action": "set_hermers_profile_mode",
-                        "result": "failed",
-                        "profile": profile,
-                        "unit": unit,
-                        "targetMode": target_mode,
-                        "reason": item.get("reason"),
-                        "operation": "hermes-gateway-start",
-                        "adapter": "hermes-cli",
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
+        if (target_mode == "hibernate" and active) or (target_mode == "hot" and not active):
+            actions.append(execute_hermers_profile_lifecycle(
+                conn, str(profile), item, target_mode, policy,
+                str(snapshot_generation or snapshot.get("generationId") or ""),
+            ))
+        elif item.get("managed") is not True and target_mode in {"hot", "hibernate"}:
+            actions.append({"action": "set_hermers_profile_mode", "result": "blocked",
+                            "profile": profile, "unit": unit, "targetMode": target_mode,
+                            "blockedReason": "profile-not-in-lifecycle-allowlist"})
+        elif item.get("activeWork"):
+            actions.append({"action": "set_hermers_profile_mode", "result": "blocked",
+                            "profile": profile, "unit": unit, "targetMode": target_mode,
+                            "blockedReason": "active-work"})
     return actions
 
 
-def verify_hermers_orphan_worker(pid: int, profile: str, rows: List[Dict[str, str]]) -> Tuple[bool, str]:
+def _hermers_signal_profile_protected(profile: str, item: Optional[Dict[str, Any]] = None) -> bool:
+    registry_ids = {str(value) for value in ((item or {}).get("agentIds") or []) if str(value)}
+    # Config/environment can add protection, never remove canonical protected members.
+    return is_protected_identity({profile, *registry_ids}, HERMERS_PROFILE_PROTECTED_IDS)
+
+
+def _hermers_signal_profile_scope(profile: str, item: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+    if _hermers_signal_profile_protected(profile, item):
+        return False, "protected-profile"
+    if not isinstance(item, dict) or item.get("registryScopeComplete") is not True:
+        return False, "registry-scope-unavailable"
+    if item.get("registryProfileMatched") is not True or str(item.get("registryProfile") or "") != profile:
+        return False, "registry-profile-owner-unavailable"
+    if not isinstance(item.get("agentIds"), list) or not item["agentIds"]:
+        return False, "registry-agent-owner-unavailable"
+    return True, "registry-profile-owner-verified"
+
+
+def _verify_captured_process_identity(pid: int, item: Dict[str, Any]) -> Tuple[bool, str]:
+    expected = item.get("processIdentity") if isinstance(item.get("processIdentity"), dict) else {}
+    matched, reason = identities_match(expected, read_process_identity(pid))
+    return (True, "identity-match") if matched else (False, reason)
+
+
+def hermers_profile_live_owner(profile: str, expected_agents: List[str], expected_generation: str) -> Tuple[bool, str, str]:
+    """Rebind a Hermes process effect to the current authoritative profile owner."""
+    if is_protected_identity({profile, *expected_agents}, HERMERS_PROFILE_PROTECTED_IDS):
+        return False, "protected-profile", ""
+    try:
+        registry = workflow_runtime_registry_records()
+        profiles, meta = hermers_profiles_from_runtime_registry([], registry)
+        item = profiles.get(profile) or {}
+        if (registry.get("source") != "db" or registry.get("writeEligible") is not True
+                or meta.get("scopeComplete") is not True or not item.get("registryRecords")
+                or current_host_generation() != expected_generation):
+            return False, "registry-or-generation-unavailable", ""
+        current_agents = sorted(set(item.get("agentIds") or []))
+        if not current_agents or current_agents != sorted(set(expected_agents)):
+            return False, "profile-owner-changed", ""
+        if is_protected_identity({profile, *current_agents}, HERMERS_PROFILE_PROTECTED_IDS):
+            return False, "protected-profile", ""
+        ref_data = {"profile": profile, "agents": current_agents, "generation": expected_generation}
+        ref = "evidence://hermes-process-scope/sha256/" + hashlib.sha256(
+            json.dumps(ref_data, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return True, "profile-owner-verified", ref
+    except Exception:
+        return False, "registry-or-generation-unavailable", ""
+
+
+def execute_hermers_process_signal(
+    item: Dict[str, Any], action_type: str, policy_flag: str, verifier: Any,
+    rows_provider: Any,
+    policy: Dict[str, Any], snapshot_generation: str,
+) -> Dict[str, Any]:
+    profile = str(item.get("profile") or "")
+    identity = item.get("processIdentity") if isinstance(item.get("processIdentity"), dict) else {}
+    try:
+        pid = int(identity.get("pid") or item.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    generation = str(current_host_generation() or "")
+    identity_digest = hashlib.sha256(json.dumps(
+        {key: identity.get(key) for key in ("pid", "starttime", "uid", "euid", "bootId", "cmdlineDigest", "cgroupDigest")},
+        sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    base_result = {"pid": pid, "profile": profile}
+    if pid <= 1 or not generation or not snapshot_generation or identity.get("status") != "known":
+        return {**base_result, "result": "blocked", "reason": "identity-or-generation-unavailable"}
+    owner_ok, owner_reason, scope_ref = hermers_profile_live_owner(
+        profile, list(item.get("agentIds") or []), generation,
+    )
+    if not owner_ok:
+        return {**base_result, "result": "blocked", "reason": owner_reason}
+    policy_digest, policy_ref = policy_reference(policy)
+    rule = STANDING_RULES[action_type]
+    idempotency_key = f"{action_type}:{profile}:{pid}:{identity.get('bootId')}:{identity.get('starttime')}"
+    spec = ActionSpec(
+        idempotency_key=idempotency_key, action_type=action_type,
+        target=f"hermes-process:{profile}:{pid}", generation=generation,
+        source="stabilityd-daemon",
+        input_data={"profile": profile, "pid": pid, "processIdentityDigest": identity_digest},
+        authorization_ref=rule.authority_ref, policy_ref=policy_ref,
+        evidence_refs=(f"evidence://snapshot/{snapshot_generation}", scope_ref,
+                       f"evidence://process-identity/sha256/{identity_digest}",
+                       policy_ref, f"policy-digest:sha256:{policy_digest}"),
+        metadata={"actor": "cat-agents-stabilityd", "request_source": "stabilityd-daemon"},
+    )
+    latest = {"item": item, "scopeRef": scope_ref}
+
+    def eligibility(spec_: ActionSpec, loaded: Dict[str, Any], _now_ms: int) -> tuple[str, ...]:
+        if loaded.get(policy_flag) is not True:
+            return ()
+        valid, _, ref = hermers_profile_live_owner(profile, list(item.get("agentIds") or []), generation)
+        if not valid:
+            return ()
+        try:
+            rows = rows_provider()
+            verified, _ = verifier(pid, profile, rows, item) if action_type.endswith("orphan_reap") else verifier(pid, profile, item, rows)
+        except Exception:
+            return ()
+        if not verified:
+            return ()
+        latest.update(item=item, scopeRef=ref)
+        return f"evidence://snapshot/{snapshot_generation}", ref, f"evidence://process-identity/sha256/{identity_digest}"
+
+    def precheck(_spec: ActionSpec, _record: Any) -> BoundaryCheck:
+        valid, _, ref = hermers_profile_live_owner(profile, list(item.get("agentIds") or []), generation)
+        if not valid:
+            return BoundaryCheck("rejected", "evidence://hermes-process-scope/unknown")
+        try:
+            rows = rows_provider()
+            verified, _ = verifier(pid, profile, rows, item) if action_type.endswith("orphan_reap") else verifier(pid, profile, item, rows)
+        except Exception:
+            verified = False
+        if not verified:
+            return BoundaryCheck("rejected", "evidence://hermes-process-identity/changed")
+        latest["scopeRef"] = ref
+        return BoundaryCheck("approved", ref)
+
+    result_box: Dict[str, Any] = {}
+    def operation(_spec: ActionSpec, _record: Any) -> OperationResult:
+        outcome = terminate_process_instance(identity)
+        result_box.update(outcome)
+        outcome_digest = hashlib.sha256(json.dumps(
+            {"result": outcome.get("result"), "reason": outcome.get("reason"), "signal": outcome.get("signal")},
+            sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        state = outcome.get("result")
+        operation_status = "complete" if state == "succeeded" else "unknown" if state == "uncertain" else "partial"
+        return OperationResult(operation_status, f"outcome://hermes-process-signal/sha256/{outcome_digest}")
+
+    def postcheck(_spec: ActionSpec, _record: Any, operation_result: OperationResult) -> PostcheckResult:
+        if result_box.get("result") == "uncertain":
+            return PostcheckResult("unknown", "evidence://hermes-process-postcheck/uncertain")
+        if result_box.get("result") != "succeeded":
+            return PostcheckResult("failed", "evidence://hermes-process-postcheck/not-signaled")
+        current = read_process_identity(pid)
+        if current.get("status") != "known":
+            if not Path("/proc").joinpath(str(pid)).exists():
+                return PostcheckResult("verified", "evidence://hermes-process-postcheck/exited")
+            return PostcheckResult("unknown", "evidence://hermes-process-postcheck/identity-unknown")
+        matches, _ = identities_match(identity, current)
+        if matches:
+            return PostcheckResult("failed", "evidence://hermes-process-postcheck/same-instance")
+        if any(current.get(key) != identity.get(key) for key in ("bootId", "pid", "starttime")):
+            return PostcheckResult("verified", "evidence://hermes-process-postcheck/instance-gone")
+        return PostcheckResult("unknown", "evidence://hermes-process-postcheck/identity-drift")
+
+    try:
+        execution = execute_governed_effect(spec, policy, eligibility_evidence=eligibility,
+                                            precheck=precheck, operation=operation, postcheck=postcheck)
+    except Exception as exc:
+        return {**base_result, "result": "uncertain", "error": type(exc).__name__}
+    state_map = {"succeeded": "ok", "failed": "failed", "blocked": "blocked", "uncertain": "uncertain"}
+    return {**base_result, "result": state_map.get(execution.record.state, "existing"),
+            "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
+            "reason": result_box.get("reason") if execution.disposition == "executed" else None}
+
+
+def verify_hermers_orphan_worker(
+    pid: int, profile: str, rows: List[Dict[str, str]], item: Optional[Dict[str, Any]] = None
+) -> Tuple[bool, str]:
+    registry_scope_ok, registry_scope_reason = _hermers_signal_profile_scope(profile, item)
+    if not registry_scope_ok:
+        return False, registry_scope_reason
     current = None
     for row in rows:
         try:
@@ -6777,10 +8279,16 @@ def verify_hermers_orphan_worker(pid: int, profile: str, rows: List[Dict[str, st
         ppid = 0
     if ppid > 1:
         return False, "worker-has-live-parent"
+    identity_ok, identity_reason = _verify_captured_process_identity(pid, item or {})
+    if not identity_ok:
+        return False, identity_reason
     return True, "verified-orphan"
 
 
 def verify_hermers_idle_lsp(pid: int, profile: str, item: Dict[str, Any], rows: List[Dict[str, str]]) -> Tuple[bool, str]:
+    registry_scope_ok, registry_scope_reason = _hermers_signal_profile_scope(profile, item)
+    if not registry_scope_ok:
+        return False, registry_scope_reason
     current = None
     for row in rows:
         try:
@@ -6824,10 +8332,26 @@ def verify_hermers_idle_lsp(pid: int, profile: str, item: Dict[str, Any], rows: 
     current_ticks = proc_cpu_ticks(pid)
     if current_ticks != expected_ticks:
         return False, "cpu-advanced-after-snapshot"
+    identity_ok, identity_reason = _verify_captured_process_identity(pid, item)
+    if not identity_ok:
+        return False, identity_reason
     return True, "verified-idle-lsp"
 
 
-def hermers_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _signal_batch_result(items: List[Dict[str, Any]]) -> str:
+    results = {str(item.get("result") or "uncertain") for item in items}
+    if "uncertain" in results:
+        return "uncertain"
+    if "failed" in results:
+        return "failed"
+    if "blocked" in results:
+        return "blocked"
+    return "ok"
+
+
+def hermers_actuate(
+    conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str, Any], *, snapshot_generation: str = "",
+) -> List[Dict[str, Any]]:
     actions: List[Dict[str, Any]] = []
     hermers = snapshot.get("hermers") if isinstance(snapshot.get("hermers"), dict) else {}
     workers = hermers.get("orphanAcpWorkers") if isinstance(hermers.get("orphanAcpWorkers"), list) else []
@@ -6842,19 +8366,18 @@ def hermers_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: 
             if pid <= 1:
                 continue
             profile = str(item.get("profile") or "")
-            verified, verify_reason = verify_hermers_orphan_worker(pid, profile, current_rows)
+            verified, verify_reason = verify_hermers_orphan_worker(pid, profile, current_rows, item)
             if not verified:
                 killed.append({"pid": pid, "profile": profile, "result": "blocked", "reason": verify_reason})
                 continue
-            try:
-                os.kill(pid, signal.SIGTERM)
-                killed.append({"pid": pid, "profile": profile, "ageSeconds": item.get("ageSeconds"), "signal": "SIGTERM", "verified": verify_reason})
-            except ProcessLookupError:
-                killed.append({"pid": pid, "profile": profile, "result": "already_exited"})
-            except Exception as exc:
-                killed.append({"pid": pid, "profile": profile, "result": "failed", "error": f"{type(exc).__name__}: {exc}"})
+            outcome = execute_hermers_process_signal(
+                item, "hermes.process.orphan_reap", "canReapHermersOrphanWorkers",
+                verify_hermers_orphan_worker, ps_rows, policy, snapshot_generation,
+            )
+            killed.append({"pid": pid, "profile": profile, "ageSeconds": item.get("ageSeconds"),
+                           "verified": verify_reason, **outcome})
         if killed:
-            actions.append({"action": "reap_hermers_acp_orphan_workers", "result": "ok", "workers": killed})
+            actions.append({"action": "reap_hermers_acp_orphan_workers", "result": _signal_batch_result(killed), "workers": killed})
     elif workers:
         actions.append(
             {
@@ -6879,26 +8402,24 @@ def hermers_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: 
             if not verified:
                 reaped.append({"pid": pid, "profile": profile, "result": "blocked", "reason": verify_reason})
                 continue
-            try:
-                os.kill(pid, signal.SIGTERM)
-                reaped.append(
-                    {
-                        "pid": pid,
-                        "profile": profile,
-                        "processType": item.get("processType") or "pyright-langserver",
-                        "ageSeconds": item.get("ageSeconds"),
-                        "idleObservedSeconds": item.get("idleObservedSeconds"),
-                        "rssBytes": item.get("rssBytes"),
-                        "signal": "SIGTERM",
-                        "verified": verify_reason,
-                    }
-                )
-            except ProcessLookupError:
-                reaped.append({"pid": pid, "profile": profile, "result": "already_exited"})
-            except Exception as exc:
-                reaped.append({"pid": pid, "profile": profile, "result": "failed", "error": f"{type(exc).__name__}: {exc}"})
+            outcome = execute_hermers_process_signal(
+                item, "hermes.process.idle_lsp_reap", "canReapHermersIdleLsp",
+                verify_hermers_idle_lsp, ps_rows, policy, snapshot_generation,
+            )
+            reaped.append(
+                {
+                    "pid": pid,
+                    "profile": profile,
+                    "processType": item.get("processType") or "pyright-langserver",
+                    "ageSeconds": item.get("ageSeconds"),
+                    "idleObservedSeconds": item.get("idleObservedSeconds"),
+                    "rssBytes": item.get("rssBytes"),
+                    "verified": verify_reason,
+                    **outcome,
+                }
+            )
         if reaped:
-            actions.append({"action": "reap_hermers_idle_lsp_processes", "result": "ok", "processes": reaped})
+            actions.append({"action": "reap_hermers_idle_lsp_processes", "result": _signal_batch_result(reaped), "processes": reaped})
     elif idle_lsps:
         actions.append(
             {
@@ -6907,7 +8428,9 @@ def hermers_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: 
                 "processes": idle_lsps[:20],
             }
         )
-    actions.extend(hermers_profile_mode_actuate(conn, snapshot))
+    actions.extend(hermers_profile_mode_actuate(
+        conn, snapshot, policy, snapshot_generation=snapshot_generation,
+    ))
     profiles = hermers.get("profiles") if isinstance(hermers.get("profiles"), dict) else {}
     modes = ((hermers.get("profileModes") or {}).get("profiles") or {}) if isinstance(hermers.get("profileModes"), dict) else {}
     down_profiles = [
@@ -6925,6 +8448,7 @@ def hermers_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: 
                     str(item.get("profile") or ""),
                     str(item.get("unit") or ""),
                     str(policy.get("hermersGatewayRestartReason") or "hermers-gateway-service-down"),
+                    policy=policy, snapshot_generation=snapshot_generation,
                 )
             )
         if len(down_profiles) > len(restart_profiles):
@@ -6958,17 +8482,44 @@ def actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str
     for action in resource_actuate(conn, snapshot, policy):
         action.update({"actionId": f"{action['action']}-{int(time.time() * 1000)}", "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd", "component": "resource"})
         actions.append(action)
-    for action in cron_actuate(snapshot, policy):
+    for action in cron_actuate(
+        snapshot, policy, snapshot_generation=str(snapshot.get("generationId") or ""),
+    ):
         action.update({"actionId": f"{action['action']}-{int(time.time() * 1000)}", "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd", "component": "cron"})
         actions.append(action)
-    for action in session_actuate(conn, snapshot, policy):
+    for action in session_actuate(
+        conn, snapshot, policy, snapshot_generation=str(snapshot.get("generationId") or ""),
+    ):
         action.update({"actionId": f"{action['action']}-{int(time.time() * 1000)}", "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd", "component": "session"})
         actions.append(action)
-    for action in hermers_actuate(conn, snapshot, policy):
+    for action in hermers_actuate(
+        conn, snapshot, policy, snapshot_generation=str(snapshot.get("generationId") or ""),
+    ):
         action.update({"actionId": f"{action['action']}-{int(time.time() * 1000)}", "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd", "component": "hermers"})
         actions.append(action)
     if policy.get("canRestartGateway"):
-        actions.append(gateway_restart(conn, str(policy.get("restartReason") or "policy")))
+        registry = workflow_runtime_registry_records()
+        gateway = snapshot.get("gateway") if isinstance(snapshot.get("gateway"), dict) else {}
+        protection_decision = resolve_protection_scope(
+            registry.get("records") if isinstance(registry.get("records"), list) else [],
+            registry_source=str(registry.get("source") or "unknown"),
+            registry_write_eligible=registry.get("writeEligible") is True,
+            scope_complete=registry.get("writeEligible") is True and registry.get("source") == "db",
+            target_kind="shared-gateway",
+            target_id="dev-server",
+            runtime="openclaw",
+            target_generation=str(gateway.get("nodeGeneration") or ""),
+        )
+        actions.append(
+            gateway_restart(
+                conn,
+                str(policy.get("restartReason") or "policy"),
+                protection_decision,
+                policy=policy,
+                snapshot_generation=str(snapshot.get("generationId") or ""),
+                allow_protected_impact=bool(policy.get("canRestartGateway") and policy.get("restartCandidate")),
+            )
+        )
     elif policy.get("restartCandidate"):
         actions.append(
             {
@@ -6981,10 +8532,11 @@ def actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str
     return actions or [{"action": "none", "result": "ok", "reason": policy.get("restartReason") or "no-action"}]
 
 
-def write_legacy_watchdog_health(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> None:
+def write_legacy_watchdog_health(snapshot: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
     gateway = snapshot.get("gateway") or {}
     control_plane = snapshot.get("controlPlane") or {}
     payload = {
+        "generationId": snapshot.get("generationId"),
         "updatedAt": policy.get("updatedAt"),
         "updatedAtEpoch": policy.get("updatedAtEpoch"),
         "mode": policy.get("mode"),
@@ -7012,26 +8564,377 @@ def write_legacy_watchdog_health(snapshot: Dict[str, Any], policy: Dict[str, Any
         "controlPlaneBackpressureActive": bool(control_plane.get("active")),
         "source": "cat-agents-stabilityd",
     }
-    write_json_atomic(LEGACY_WATCHDOG_HEALTH, payload)
+    return write_json_atomic(LEGACY_WATCHDOG_HEALTH, payload)
 
 
-def collect_snapshot(conn: sqlite3.Connection) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
+_COMPONENT_PROBE_NAMES = frozenset({
+    "gateway", "cron", "session", "channel", "hermers", "auth", "resource", "config", "desired_state",
+})
+_COMPONENT_PROBE_DB_NAMES = frozenset({"hermers", "auth"})
+_COMPONENT_PROBE_STATE_DB_ENV = "CAT_AGENTS_STABILITY_COMPONENT_STATE_DB"
+_COMPONENT_PROBE_PARENT_PID_ENV = "CAT_AGENTS_STABILITY_COMPONENT_PARENT_PID"
+
+
+class CollectorProcessCleanupFailure(RuntimeError):
+    """A component process group could not be proven stopped; abort this writer generation."""
+
+
+def install_component_probe_parent_death_guard(expected_parent_pid: int) -> bool:
+    """Bind an internal worker group to its parent; false means parent already exited."""
+    def kill_worker_group(_signum: int = 0, _frame: Any = None) -> None:
+        with contextlib.suppress(OSError):
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+
+    if type(expected_parent_pid) is not int or expected_parent_pid <= 1:
+        return False
+    if sys.platform.startswith("linux"):
+        signal.signal(signal.SIGTERM, kill_worker_group)
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+            return False
+        if os.getppid() != expected_parent_pid:
+            kill_worker_group()
+            return False
+        return True
+    # macOS has no PR_SET_PDEATHSIG; this monitor is best-effort and the
+    # production Linux worker uses the kernel parent-death signal above.
+    parent_gone = threading.Event()
+
+    def watch_parent() -> None:
+        while not parent_gone.wait(0.1):
+            if os.getppid() != expected_parent_pid:
+                kill_worker_group()
+                return
+
+    if os.getppid() != expected_parent_pid:
+        kill_worker_group()
+        return False
+    threading.Thread(target=watch_parent, name="stabilityd-probe-parent-watch", daemon=True).start()
+    return True
+
+
+def collector_worker_environment() -> Dict[str, str]:
+    """Build a minimal, explicit worker environment without credential variables."""
+    worker_env = {
+        key: value for key, value in os.environ.items()
+        if key in COLLECTOR_ENV_ALLOWLIST and isinstance(value, str) and "\0" not in value and len(value) <= 8192
+    }
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        value = os.environ.get(key)
+        if not isinstance(value, str) or not value or "\0" in value or len(value) > 8192:
+            continue
+        try:
+            parsed = urllib.parse.urlsplit(value if "://" in value else "http://" + value)
+            if (parsed.scheme in {"http", "https", "socks5", "socks5h"} and parsed.hostname
+                    and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment):
+                worker_env[key] = value
+        except Exception:
+            continue
+    for key in ("NO_PROXY", "no_proxy"):
+        value = os.environ.get(key)
+        if isinstance(value, str) and "\0" not in value and len(value) <= 4096:
+            worker_env[key] = value
+    # urllib's explicit Telegram probe proxy may be configured separately. Pass
+    # it only when it is a credential-free URL; otherwise use the loopback default.
+    proxy = worker_env.get("OPENCLAW_STABILITY_HEALTH_PROXY")
+    if proxy:
+        try:
+            parsed = urllib.parse.urlsplit(proxy)
+            if (parsed.scheme not in {"http", "https", "socks5", "socks5h"} or not parsed.hostname
+                    or parsed.username or parsed.password or parsed.query or parsed.fragment):
+                worker_env.pop("OPENCLAW_STABILITY_HEALTH_PROXY", None)
+        except Exception:
+            worker_env.pop("OPENCLAW_STABILITY_HEALTH_PROXY", None)
+    try:
+        worker_env[_COMPONENT_PROBE_STATE_DB_ENV] = str(STATE_DB.resolve(strict=True))
+    except OSError:
+        worker_env.pop(_COMPONENT_PROBE_STATE_DB_ENV, None)
+    return worker_env
+
+
+def persist_component_cache_updates(conn: sqlite3.Connection, updates: Mapping[str, Any]) -> None:
+    """Commit only the two existing collector cache domains, atomically in the parent."""
+    if not isinstance(updates, Mapping) or len(updates) > 513 or conn.in_transaction:
+        raise ValueError("invalid cache proposals or parent transaction state")
+    encoded_updates = []
+    total_bytes = 0
+    for key, value in updates.items():
+        if not isinstance(key, str) or not (
+            key == "hermers_lsp_idle_state"
+            or re.fullmatch(r"auth:openclaw:[A-Za-z0-9_-]{1,64}", key)
+        ):
+            raise ValueError("cache proposal key is outside the collector allowlist")
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        total_bytes += len(encoded.encode("utf-8"))
+        if total_bytes > COLLECTOR_OUTPUT_MAX_BYTES:
+            raise ValueError("cache proposals exceed size limit")
+        encoded_updates.append((key, encoded, epoch()))
+    if not encoded_updates:
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany(
+            "INSERT INTO kv(key, value, updated_at) VALUES(?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            encoded_updates,
+        )
+        conn.commit()
+    except Exception:
+        with contextlib.suppress(Exception):
+            conn.rollback()
+        raise
+
+
+def _run_component_collector(
+    name: str, conn: Optional[sqlite3.Connection], findings: List[Dict[str, Any]],
+    hermers_profiles: Optional[Iterable[str]] = None, cache_updates: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if name == "gateway":
+        return gateway_collect(findings)
+    if name == "cron":
+        return cron_collect(findings)
+    if name == "session":
+        return session_collect(findings)
+    if name == "channel":
+        return channel_collect(findings)
+    if name == "hermers":
+        if conn is None:
+            raise RuntimeError("component database unavailable")
+        return hermers_collect(conn, findings, persist_cache=cache_updates is None, cache_updates=cache_updates)
+    if name == "auth":
+        if conn is None:
+            raise RuntimeError("component database unavailable")
+        return auth_collect(conn, findings, hermers_profiles,
+                            persist_probe_cache=cache_updates is None, cache_updates=cache_updates)
+    if name == "resource":
+        return resource_collect(findings)
+    if name == "config":
+        return config_collect(findings)
+    if name == "desired_state":
+        return desired_state_drift()
+    raise ValueError("unknown component")
+
+
+def _open_component_probe_db() -> sqlite3.Connection:
+    raw_db = os.environ.get(_COMPONENT_PROBE_STATE_DB_ENV, "")
+    db_path = Path(raw_db)
+    if not db_path.is_absolute() or not db_path.is_file() or db_path.is_symlink():
+        raise ValueError("component state database unavailable")
+    expected_db = STATE_DB.resolve(strict=True)
+    if db_path.resolve(strict=True) != expected_db:
+        raise ValueError("component state database path mismatch")
+    uri = "file:" + urllib.parse.quote(str(db_path), safe="/") + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=min(5.0, COLLECTOR_BUDGET_MS / 1000))
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
+def _encode_component_probe_result(
+    data: Dict[str, Any], findings: List[Dict[str, Any]], cache_updates: Optional[Dict[str, Any]] = None,
+) -> Optional[bytes]:
+    encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    encoded = bytearray()
+    for part in encoder.iterencode({"data": data, "findings": findings, "cacheUpdates": cache_updates or {}}):
+        # A single giant string must not be copied into another giant encoded
+        # buffer before the protocol bound is enforced.
+        if len(part) > COLLECTOR_OUTPUT_MAX_BYTES:
+            return None
+        chunk = part.encode("utf-8")
+        if len(encoded) + len(chunk) > COLLECTOR_OUTPUT_MAX_BYTES:
+            return None
+        encoded.extend(chunk)
+    return bytes(encoded)
+
+
+def _component_probe_worker(argv: List[str]) -> int:
+    """Fresh-interpreter entry point. Only fixed read-only collectors are selectable."""
+    if len(argv) != 2 or argv[0] not in _COMPONENT_PROBE_NAMES:
+        return 2
+    name, raw_profiles = argv
+    try:
+        try:
+            expected_parent_pid = int(os.environ.get(_COMPONENT_PROBE_PARENT_PID_ENV) or "0")
+        except ValueError:
+            return 2
+        if not install_component_probe_parent_death_guard(expected_parent_pid):
+            return 2
+        hermers_profiles = json.loads(raw_profiles)
+        if (not isinstance(hermers_profiles, list) or len(hermers_profiles) > 512
+                or any(not isinstance(item, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", item) is None
+                       for item in hermers_profiles)):
+            return 2
+        findings: List[Dict[str, Any]] = []
+        conn = None
+        if name in _COMPONENT_PROBE_DB_NAMES:
+            conn = _open_component_probe_db()
+        cache_updates: Dict[str, Any] = {}
+        try:
+            with open(os.devnull, "w", encoding="utf-8") as sink, contextlib.redirect_stdout(sink):
+                data = _run_component_collector(name, conn, findings, hermers_profiles, cache_updates)
+            if not isinstance(data, dict) or any(
+                not isinstance(item, dict)
+                or any(not isinstance(item.get(field), str) for field in ("key", "severity", "component", "message"))
+                for item in findings
+            ):
+                return 2
+            payload = _encode_component_probe_result(data, findings, cache_updates)
+            if payload is None:
+                return 3
+            sys.stdout.buffer.write(payload)
+            sys.stdout.buffer.flush()
+            return 0
+        finally:
+            if conn is not None:
+                conn.close()
+    except Exception:
+        # Do not emit exception text, configuration values, or tracebacks.
+        return 1
+
+
+def collect_snapshot(
+    conn: sqlite3.Connection, *, component_probe_runner: Any = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
     snapshot: Dict[str, Any] = {
         "schemaVersion": 1,
         "checkedAt": ts(),
         "checkedAtEpoch": epoch(),
     }
-    snapshot["gateway"] = gateway_collect(findings)
-    snapshot["cron"] = cron_collect(findings)
-    snapshot["session"] = session_collect(findings)
-    snapshot["channel"] = channel_collect(findings)
-    snapshot["hermers"] = hermers_collect(conn, findings)
+    self_progress = stabilityd_progress_evidence(snapshot["checkedAtEpoch"])
+    snapshot["selfProgress"] = self_progress
+    if self_progress.get("state") == "stale_previous_generation":
+        add_finding(
+            findings, "stabilityd_progress_stale", "warning", "stabilityd",
+            "previous stabilityd generation exceeded the loop progress threshold",
+            previousGenerationId=self_progress.get("previousGenerationId"),
+            previousAgeSeconds=self_progress.get("previousAgeSeconds"),
+            thresholdSeconds=self_progress.get("thresholdSeconds"),
+            supervision="existing-daemon-loop",
+        )
+    probes: Dict[str, Any] = {}
+    pending_cache_updates: Dict[str, Any] = {}
+    collector_failed = False
+
+    runner = component_probe_runner or run_component_probe_hard
+    worker_env = collector_worker_environment() if component_probe_runner is None else {}
+
+    def collect_component(name: str, fallback: Dict[str, Any], hermers_profiles: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+        nonlocal collector_failed
+        if snapshot.get("collectorFatal"):
+            collector_failed = True
+            probes[name] = {
+                "component": name, "status": "error", "source": "cat-agents-stabilityd",
+                "coverage": False, "durationMs": 0, "budgetMs": COLLECTOR_BUDGET_MS,
+                "maxOutputBytes": COLLECTOR_OUTPUT_MAX_BYTES, "errorClass": "PriorWorkerCleanupUnverified",
+                "fatal": True, "noLiveGroupMemberObserved": False,
+            }
+            return dict(fallback)
+        requested_profiles = sorted({
+            item for item in hermers_profiles or []
+            if isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", item)
+        })[:512]
+        command = [
+            sys.executable, str(Path(__file__).resolve()), "__component_probe_v1", name,
+            json.dumps(requested_profiles, ensure_ascii=False, separators=(",", ":")),
+        ]
+        child_env = dict(worker_env)
+        if component_probe_runner is None:
+            child_env[_COMPONENT_PROBE_PARENT_PID_ENV] = str(os.getpid())
+        result = runner(
+            name, command, fallback, source="cat-agents-stabilityd",
+            max_output_bytes=COLLECTOR_OUTPUT_MAX_BYTES, budget_ms=COLLECTOR_BUDGET_MS,
+            env=child_env,
+        )
+        probes[name] = result["probe"]
+        if (result["probe"].get("fatal") is True
+                or result["probe"].get("noLiveGroupMemberObserved") is False):
+            snapshot["collectorFatal"] = True
+            raise CollectorProcessCleanupFailure("collector process cleanup was not verified")
+        if result["probe"]["status"] == "ok":
+            component_findings = result.get("findings") or []
+            cache_updates = result.get("cacheUpdates") or {}
+            if not isinstance(component_findings, list) or any(
+                not isinstance(item, dict)
+                or any(not isinstance(item.get(field), str) for field in ("key", "severity", "component", "message"))
+                for item in component_findings
+            ):
+                result["probe"].update({"status": "error", "coverage": False, "errorClass": "InvalidWorkerFindings"})
+                result["data"] = dict(fallback)
+                component_findings = []
+            if result["probe"]["status"] == "ok" and not isinstance(cache_updates, Mapping):
+                result["probe"].update({"status": "error", "coverage": False, "errorClass": "InvalidWorkerCacheUpdates"})
+                result["data"] = dict(fallback)
+            if result["probe"]["status"] == "ok":
+                if cache_updates:
+                    for key, value in cache_updates.items():
+                        if key in pending_cache_updates:
+                            result["probe"].update({"status": "error", "coverage": False, "errorClass": "DuplicateWorkerCacheUpdate"})
+                            result["data"] = dict(fallback)
+                            pending_cache_updates.clear()
+                            break
+                        pending_cache_updates[key] = value
+                findings.extend(component_findings if result["probe"]["status"] == "ok" else [])
+            if result["probe"]["status"] != "ok":
+                collector_failed = True
+        else:
+            collector_failed = True
+        if result["probe"]["status"] != "ok":
+            add_finding(
+                findings,
+                f"stability_collector_{name}_probe_failed",
+                "warning",
+                name,
+                f"stabilityd {name} collector returned incomplete evidence",
+                errorClass=result["probe"].get("errorClass"),
+                durationMs=result["probe"].get("durationMs"),
+                budgetMs=result["probe"].get("budgetMs"),
+                coverage=False,
+            )
+        return result["data"]
+
+    snapshot["gateway"] = collect_component(
+        "gateway",
+        {"active": None, "pid": 0, "portOk": None, "healthOk": None, "status": "unknown"},
+    )
+    snapshot["cron"] = collect_component(
+        "cron",
+        {"staleRunning": [], "expiredLeases": [], "storageStatus": {"storage": "unknown"}},
+    )
+    snapshot["session"] = collect_component("session", {"resetCandidates": []})
+    snapshot["channel"] = collect_component("channel", {"channels": []})
+    snapshot["hermers"] = collect_component(
+        "hermers",
+        {"profiles": {}, "orphanAcpWorkers": [], "idleLspProcesses": [], "profileModes": {"profiles": {}},
+         "profileRegistry": {"available": False, "scopeComplete": False, "source": "unknown"}},
+    )
     hermers_profiles = (snapshot.get("hermers") or {}).get("profiles") if isinstance(snapshot.get("hermers"), dict) else {}
-    snapshot["auth"] = auth_collect(conn, findings, (hermers_profiles or {}).keys() if isinstance(hermers_profiles, dict) else None)
-    snapshot["resource"] = resource_collect(findings)
-    snapshot["config"] = config_collect(findings)
-    snapshot["desiredState"] = desired_state_drift()
+    snapshot["auth"] = collect_component(
+        "auth",
+        {"hermers": {"scopeComplete": False, "profiles": {}}, "openclaw": {"scopeComplete": False, "agents": {}}},
+        (hermers_profiles or {}).keys() if isinstance(hermers_profiles, dict) else None,
+    )
+    snapshot["resource"] = collect_component("resource", {"status": "unknown"})
+    snapshot["config"] = collect_component("config", {"status": "unknown"})
+    snapshot["desiredState"] = collect_component(
+        "desired_state",
+        {"ok": False, "drifts": [], "observations": [], "status": "unknown"}
+    )
+    snapshot["collectorProbes"] = probes
+    if pending_cache_updates and not collector_failed:
+        try:
+            persist_component_cache_updates(conn, pending_cache_updates)
+        except Exception as exc:
+            snapshot["collectorFatal"] = True
+            add_finding(
+                findings, "stability_collector_cache_commit_failed", "critical", "stabilityd",
+                "stabilityd collector cache proposals could not be committed atomically",
+                errorClass=type(exc).__name__, coverage=False,
+            )
+    elif collector_failed:
+        # Cache proposals from otherwise successful children are never persisted
+        # when any component output in this generation is incomplete.
+        pending_cache_updates.clear()
     for drift in snapshot["desiredState"].get("drifts") or []:
         add_finding(
             findings,
@@ -7054,22 +8957,55 @@ def collect_snapshot(conn: sqlite3.Connection) -> Tuple[Dict[str, Any], List[Dic
     return snapshot, findings, policy
 
 
+def stabilityd_progress_evidence(now_epoch: Optional[int] = None) -> Dict[str, Any]:
+    """Observe prior committed-loop freshness without adding a supervisor/timer."""
+    now_value = int(now_epoch if now_epoch is not None else epoch())
+    latest = load_json(LATEST_PATH, {}) or {}
+    completed = latest.get("completedAtEpoch") if isinstance(latest, dict) else None
+    if not isinstance(completed, (int, float)) or isinstance(completed, bool) or not math.isfinite(completed):
+        state, age = "first_observation", None
+    elif completed > now_value + 5:
+        state, age = "clock_skew", None
+    else:
+        age = max(0, now_value - int(completed))
+        state = "stale_previous_generation" if age > STABILITYD_PROGRESS_STALE_SECONDS else "recent_previous_generation"
+    return {
+        "state": state,
+        "previousGenerationId": latest.get("generationId") if isinstance(latest, dict) else None,
+        "previousAgeSeconds": age,
+        "thresholdSeconds": STABILITYD_PROGRESS_STALE_SECONDS,
+        "supervision": "existing-daemon-loop",
+    }
+
+
 def run_once(conn: sqlite3.Connection, no_action: bool = False) -> Dict[str, Any]:
+    # no_action disables actuators, but this entrypoint still publishes evidence/KV.
+    # Both writer modes share this lock; pure status readers never acquire it.
+    ensure_dirs()
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(ActuationLock(ACTUATION_LOCK_PATH))
+        except ActuationBusy:
+            return {
+                "schemaVersion": 1, "status": "busy", "checkedAt": ts(),
+                "reason": "actuation-writer-active", "statePublished": False,
+                "actions": [{"action": "none", "result": "busy", "reason": "actuation-writer-active"}],
+            }
+        return _run_once_body(conn, no_action=no_action)
+
+
+def _run_once_body(conn: sqlite3.Connection, no_action: bool = False) -> Dict[str, Any]:
     ensure_dirs()
     snapshot, findings, policy = collect_snapshot(conn)
+    generation_id = uuid.uuid4().hex
+    snapshot["generationId"] = generation_id
+    policy["generationId"] = generation_id
     snapshot["controlPlane"] = control_plane_backpressure(snapshot, policy)
-    actions = actuate(conn, snapshot, policy, no_action=no_action)
+    actions = actuate_collected_snapshot(conn, snapshot, policy, no_action=no_action)
     snapshot["actions"] = actions
     snapshot["completedAt"] = ts()
     snapshot["completedAtEpoch"] = epoch()
-    write_json_atomic(POLICY_PATH, policy)
-    write_json_atomic(LATEST_PATH, snapshot)
-    write_json_atomic(LANE_POLICY_PATH, policy.get("lanes") or {})
-    write_json_atomic(HERMERS_PROFILE_MODES_PATH, ((snapshot.get("hermers") or {}).get("profileModes") or {}))
-    write_json_atomic(AUTH_MAINTENANCE_PLAN_PATH, snapshot.get("authMaintenance") or {})
-    write_json_atomic(CONTROL_PLANE_BACKPRESSURE_PATH, snapshot["controlPlane"])
     snapshot["workflowEvidence"] = write_workflow_stability_evidence(snapshot)
-    write_legacy_watchdog_health(snapshot, policy)
     for finding in findings:
         if SEVERITY_RANK.get(str(finding.get("severity")), 0) >= SEVERITY_RANK["high"]:
             event_key = f"event:{finding.get('key')}"
@@ -7099,58 +9035,117 @@ def run_once(conn: sqlite3.Connection, no_action: bool = False) -> Dict[str, Any
             ",".join(str(a.get("action")) for a in actions),
         )
     )
-    return snapshot
+    # Publish compatibility artifacts first. latest.json is the final pointer for
+    # this generation and must never describe a generation whose sidecars failed.
+    lanes_payload = dict(policy.get("lanes") or {})
+    lanes_payload["generationId"] = generation_id
+    modes_payload = dict((snapshot.get("hermers") or {}).get("profileModes") or {})
+    modes_payload["generationId"] = generation_id
+    auth_plan = dict(snapshot.get("authMaintenance") or {})
+    auth_plan["generationId"] = generation_id
+    backpressure = dict(snapshot["controlPlane"])
+    backpressure["generationId"] = generation_id
+    artifacts = [
+        (POLICY_PATH, policy),
+        (LANE_POLICY_PATH, lanes_payload),
+        (HERMERS_PROFILE_MODES_PATH, modes_payload),
+        (AUTH_MAINTENANCE_PLAN_PATH, auth_plan),
+        (CONTROL_PLANE_BACKPRESSURE_PATH, backpressure),
+    ]
+    legacy_meta = write_legacy_watchdog_health(snapshot, policy)
+    # Fixed-path readers must compare generationId; only latest.json is the
+    # atomic commit pointer across the set of compatibility aliases.
+    artifacts_meta_extra = [legacy_meta]
+    if snapshot["workflowEvidence"].get("written") is True:
+        artifacts_meta_extra.extend([
+            artifact_metadata(Path(snapshot["workflowEvidence"]["jsonPath"])),
+            artifact_metadata(Path(snapshot["workflowEvidence"]["markdownPath"])),
+        ])
+    return publish_generation(snapshot, artifacts, LATEST_PATH, artifacts_meta_extra)
+
+
+def actuate_collected_snapshot(
+    conn: sqlite3.Connection, snapshot: Dict[str, Any], policy: Dict[str, Any], *, no_action: bool = False,
+) -> List[Dict[str, Any]]:
+    if snapshot.get("collectorFatal") is True:
+        return [{"action": "none", "result": "blocked", "reason": "collector-cache-commit-failed"}]
+    return actuate(conn, snapshot, policy, no_action=no_action)
 
 
 class StopSignal(Exception):
     pass
 
 
+class DaemonLoopEvidenceWriteFailure(RuntimeError):
+    """The loop cannot persist failure evidence and must stop safely."""
+
+
 def daemon_loop(no_action: bool = False) -> int:
     ensure_dirs()
     lock_fh = LOCK_PATH.open("a+", encoding="utf-8")
     try:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        if exc.errno in (errno.EACCES, errno.EAGAIN):
-            print("cat-agents-stabilityd is already running", file=sys.stderr)
-            return 1
-        raise
-
-    stopping = {"value": False}
-
-    def handle_signal(_signum: int, _frame: Any) -> None:
-        stopping["value"] = True
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-
-    conn = init_db()
-    log_line(f"daemon started interval={INTERVAL_SECONDS}s no_action={no_action}")
-    while not stopping["value"]:
-        started = time.time()
         try:
-            run_once(conn, no_action=no_action)
-        except Exception as exc:
-            err = {
-                "ts": ts(),
-                "tsEpoch": epoch(),
-                "source": "cat-agents-stabilityd",
-                "component": "daemon",
-                "severity": "critical",
-                "key": "stabilityd_loop_error",
-                "message": f"{type(exc).__name__}: {exc}",
-                "traceback": traceback.format_exc()[-4000:],
-            }
-            db_record_event(conn, err)
-            log_line(f"loop_error {type(exc).__name__}: {exc}")
-        elapsed = time.time() - started
-        sleep_for = max(1, INTERVAL_SECONDS - elapsed)
-        end = time.time() + sleep_for
-        while time.time() < end and not stopping["value"]:
-            time.sleep(min(1, end - time.time()))
-    log_line("daemon stopped")
-    return 0
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                print("cat-agents-stabilityd is already running", file=sys.stderr)
+                return 1
+            raise
+
+        stopping = {"value": False}
+
+        def handle_signal(_signum: int, _frame: Any) -> None:
+            stopping["value"] = True
+
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+
+        conn = init_db()
+        log_line(f"daemon started interval={INTERVAL_SECONDS}s no_action={no_action}")
+        while not stopping["value"]:
+            started = time.time()
+            try:
+                run_once(conn, no_action=no_action)
+            except CollectorProcessCleanupFailure:
+                log_line("loop_aborted reason=collector-process-cleanup-unverified")
+                raise
+            except Exception as exc:
+                err = daemon_loop_error_event(exc)
+                evidence_write_failed = False
+                try:
+                    db_record_event(conn, err)
+                except Exception:
+                    # Do not let a storage exception (which may contain SQL,
+                    # paths, or provider data) escape into the service journal.
+                    evidence_write_failed = True
+                if evidence_write_failed:
+                    raise DaemonLoopEvidenceWriteFailure(
+                        "daemon loop error evidence persistence failed"
+                    ) from None
+                log_line(f"loop_error stage=daemon-loop errorClass={type(exc).__name__}")
+            elapsed = time.time() - started
+            sleep_for = max(1, INTERVAL_SECONDS - elapsed)
+            end = time.time() + sleep_for
+            while time.time() < end and not stopping["value"]:
+                time.sleep(min(1, end - time.time()))
+        log_line("daemon stopped")
+        return 0
+    finally:
+        lock_fh.close()
+
+
+def daemon_loop_error_event(exc: BaseException) -> Dict[str, Any]:
+    """Build persistable loop-failure evidence without exception or traceback text."""
+    return {
+        "ts": ts(),
+        "tsEpoch": epoch(),
+        "source": "cat-agents-stabilityd",
+        "component": "daemon",
+        "severity": "critical",
+        "key": "stabilityd_loop_error",
+        "message": "stabilityd run loop failed; diagnostic text omitted",
+        "evidence": {"errorClass": type(exc).__name__, "stage": "daemon-loop"},
+    }
 
 
 def read_json_or_empty(path: Path) -> Any:
@@ -7191,8 +9186,8 @@ def tail_jsonl(path: Path, limit: int = 20) -> List[Any]:
 
 def runbook() -> Dict[str, Any]:
     latest = load_json(LATEST_PATH, {}) or {}
-    policy = load_json(POLICY_PATH, {}) or {}
-    lanes = load_json(LANE_POLICY_PATH, {}) or policy.get("lanes") or {}
+    policy = generation_compatible_payload(POLICY_PATH, latest, latest.get("policy"))
+    lanes = generation_compatible_payload(LANE_POLICY_PATH, latest, policy.get("lanes"))
     findings = latest.get("findings") or []
     commands = [
         "systemctl status cat-agents-stabilityd.service --no-pager",
@@ -7202,6 +9197,9 @@ def runbook() -> Dict[str, Any]:
         "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability auth-readiness",
         "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability auth-maintenance",
         "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability findings",
+        "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability preflight",
+        "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability recovery --limit 20",
+        "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability action-classes",
         "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability drift",
         "/home/flashcat/cat-agents-stabilityd/bin/cat-agents-stability actions --limit 20",
         "tail -n 100 /home/flashcat/.openclaw/stability/events.jsonl",
@@ -7225,6 +9223,9 @@ def runbook() -> Dict[str, Any]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["__component_probe_v1"]:
+        return _component_probe_worker(argv[1:])
     parser = argparse.ArgumentParser(description="Cat agents stability control plane")
     sub = parser.add_subparsers(dest="cmd")
     sub.add_parser("daemon")
@@ -7234,6 +9235,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("snapshot")
     sub.add_parser("policy")
     sub.add_parser("lanes")
+    sub.add_parser("nodes")
+    sub.add_parser("surfaces")
+    sub.add_parser("preflight")
+    recovery_p = sub.add_parser("recovery")
+    recovery_p.add_argument("--limit", type=int, default=100)
+    sub.add_parser("action-classes")
     auth_p = sub.add_parser("auth-readiness")
     auth_p.add_argument("--fresh", action="store_true", help="collect a fresh auth-readiness snapshot instead of returning latest daemon evidence")
     auth_maint_p = sub.add_parser("auth-maintenance")
@@ -7275,20 +9282,34 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     cmd = args.cmd or "status"
     if cmd == "daemon":
-        return daemon_loop(no_action=False)
+        try:
+            return daemon_loop(no_action=False)
+        except DaemonLoopEvidenceWriteFailure:
+            print("cat-agents-stabilityd: loop_error_evidence_write_failed", file=sys.stderr)
+            return 2
     if cmd == "once":
         conn = init_db()
-        return print_json(run_once(conn, no_action=args.no_action))
+        try:
+            return print_json(run_once(conn, no_action=args.no_action))
+        except CollectorProcessCleanupFailure:
+            print_json({"status": "blocked", "reason": "collector-process-cleanup-unverified"})
+            return 2
     if cmd == "status":
         latest = load_json(LATEST_PATH, {}) or {}
-        policy = load_json(POLICY_PATH, {}) or {}
+        policy = generation_compatible_payload(POLICY_PATH, latest, latest.get("policy"))
+        updated_at_epoch = policy.get("updatedAtEpoch")
+        if isinstance(updated_at_epoch, (int, float)) and not isinstance(updated_at_epoch, bool) and math.isfinite(updated_at_epoch):
+            policy_age = max(0, epoch() - int(updated_at_epoch))
+        else:
+            snapshot_epoch = parse_iso_epoch(latest.get("completedAt") or latest.get("checkedAt"))
+            policy_age = max(0, epoch() - int(snapshot_epoch)) if snapshot_epoch is not None else None
         return print_json(
             {
                 "checkedAt": latest.get("checkedAt"),
                 "completedAt": latest.get("completedAt"),
                 "severity": latest.get("severity"),
                 "mode": policy.get("mode"),
-                "policyAgeSeconds": file_age_seconds(POLICY_PATH),
+                "policyAgeSeconds": policy_age,
                 "findingCount": len(latest.get("findings") or []),
                 "lastActions": latest.get("actions"),
             }
@@ -7296,10 +9317,45 @@ def main(argv: Optional[List[str]] = None) -> int:
     if cmd == "snapshot":
         return print_json(read_json_or_empty(LATEST_PATH))
     if cmd == "policy":
-        return print_json(read_json_or_empty(POLICY_PATH))
+        latest = load_json(LATEST_PATH, {}) or {}
+        return print_json(generation_compatible_payload(POLICY_PATH, latest, latest.get("policy")))
     if cmd == "lanes":
-        lanes = load_json(LANE_POLICY_PATH, {}) or (load_json(POLICY_PATH, {}) or {}).get("lanes") or {}
+        latest = load_json(LATEST_PATH, {}) or {}
+        policy = generation_compatible_payload(POLICY_PATH, latest, latest.get("policy"))
+        lanes = generation_compatible_payload(LANE_POLICY_PATH, latest, policy.get("lanes"))
         return print_json(lanes)
+    if cmd == "nodes":
+        latest = load_json(LATEST_PATH, {}) or {}
+        latest = latest if isinstance(latest, dict) else {}
+        observations = latest.get("nodeObservations") if isinstance(latest.get("nodeObservations"), list) else []
+        return print_json(evaluate_inventory(observations, now_epoch=epoch()))
+    if cmd == "surfaces":
+        latest = load_json(LATEST_PATH, {}) or {}
+        latest = latest if isinstance(latest, dict) else {}
+        observations = latest.get("surfaceObservations") if isinstance(latest.get("surfaceObservations"), list) else []
+        return print_json(evaluate_surface_observations(observations, now_epoch=epoch()))
+    if cmd == "preflight":
+        latest = load_json(LATEST_PATH, {}) or {}
+        latest = latest if isinstance(latest, dict) else {}
+        policy = generation_compatible_payload(POLICY_PATH, latest, latest.get("policy"))
+        node_observations = latest.get("nodeObservations") if isinstance(latest.get("nodeObservations"), list) else []
+        surface_observations = latest.get("surfaceObservations") if isinstance(latest.get("surfaceObservations"), list) else []
+        nodes = evaluate_inventory(node_observations, now_epoch=epoch())
+        surfaces = evaluate_surface_observations(surface_observations, now_epoch=epoch())
+        return print_json(build_preflight_summary(
+            latest, policy, nodes, surfaces, now_epoch=epoch(),
+        ))
+    if cmd == "recovery":
+        ledger = load_action_ledger_readonly(STATE_DB, limit=args.limit)
+        return print_json(build_recovery_summary(
+            ledger.get("records") or [], ledger_status=str(ledger.get("status") or "unavailable"),
+            limit=args.limit, ledger_counts=ledger.get("counts"),
+            total_candidate_count=ledger.get("candidateCount"),
+        ))
+    if cmd == "action-classes":
+        return print_json({"schemaVersion": 1,
+                           "commands": classify_commands(),
+                           "actuators": classify_action_types()})
     if cmd == "auth-readiness":
         latest = load_json(LATEST_PATH, {}) or {}
         latest_auth = latest.get("auth") if isinstance(latest.get("auth"), dict) else {}
@@ -7315,7 +9371,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if (args.execute or args.force_openclaw_probe) and not args.fresh:
             args.fresh = True
         if not args.fresh:
-            latest_plan = latest.get("authMaintenance") if isinstance(latest.get("authMaintenance"), dict) else load_json(AUTH_MAINTENANCE_PLAN_PATH, {}) or {}
+            latest_plan = generation_compatible_payload(AUTH_MAINTENANCE_PLAN_PATH, latest, latest.get("authMaintenance"))
             if latest_plan and not args.execute and not args.dry_run:
                 return print_json(with_auth_freshness(latest_plan, "generatedAt", "latest"))
             if latest_plan:
@@ -7376,7 +9432,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
         )
     if cmd == "profile-modes":
-        return print_json(read_json_or_empty(HERMERS_PROFILE_MODES_PATH))
+        latest = load_json(LATEST_PATH, {}) or {}
+        hermers = latest.get("hermers") if isinstance(latest.get("hermers"), dict) else {}
+        return print_json(generation_compatible_payload(HERMERS_PROFILE_MODES_PATH, latest, hermers.get("profileModes")))
     if cmd == "desired-state":
         return print_json(load_desired_state())
     if cmd == "drift":
@@ -7397,11 +9455,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         return print_json(runbook())
     if cmd == "doctor":
         conn = init_db()
-        snap = run_once(conn, no_action=args.no_action)
+        try:
+            snap = run_once(conn, no_action=args.no_action)
+        except CollectorProcessCleanupFailure:
+            print_json({"status": "blocked", "reason": "collector-process-cleanup-unverified"})
+            return 2
         return print_json({"severity": snap.get("severity"), "policy": snap.get("policy"), "findings": snap.get("findings"), "actions": snap.get("actions")})
     if cmd == "repair":
         conn = init_db()
-        snap = run_once(conn, no_action=args.dry_run)
+        try:
+            snap = run_once(conn, no_action=args.dry_run)
+        except CollectorProcessCleanupFailure:
+            print_json({"status": "blocked", "reason": "collector-process-cleanup-unverified"})
+            return 2
         return print_json({"dryRun": args.dry_run, "actions": snap.get("actions"), "policy": snap.get("policy")})
     parser.print_help()
     return 2

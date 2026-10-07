@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "captureMethod": "AST-isolated evaluation of only six pinned restart threshold assignments; calls limited to os.environ.get, int, and str; startup-grace decision expression is hashed but never executed",
+  "baselineTargets": {
+    "RESTART_COOLDOWN_SECONDS": "RESTART_COOLDOWN_SECONDS",
+    "RESTART_WINDOW_SECONDS": "RESTART_WINDOW_SECONDS",
+    "MAX_RESTARTS_PER_WINDOW": "MAX_RESTARTS_PER_WINDOW",
+    "ACTION_STREAK_THRESHOLD": "ACTION_STREAK_THRESHOLD",
+    "STARTUP_GRACE_SECONDS": "STARTUP_GRACE_SECONDS",
+    "HERMERS_GATEWAY_RESTART_LIMIT": "HERMERS_GATEWAY_RESTART_LIMIT"
+  },
+  "baselineExpressionSha256": {
+    "RESTART_COOLDOWN_SECONDS": "ee10390988228e4c3636e1b52639b5b87b25bc44c90021bf57967c9556c2b484",
+    "RESTART_WINDOW_SECONDS": "66f48f687a932e47ed1f08de2895d9849ea6a7ea85facadce43d65b30e7863c3",
+    "MAX_RESTARTS_PER_WINDOW": "80775920bdd9d630af9cbedbe081b67f2470b9064781e540cf6abb9e5447f472",
+    "ACTION_STREAK_THRESHOLD": "de596eb0ab25eed848e5b78b5839e08574f953cd28c5a147141dbd79a15b805e",
+    "STARTUP_GRACE_SECONDS": "2908d4902edf90e2ecec5c8c9f86aded193e5781e0aac6450d6c6ccd2fa3d424",
+    "HERMERS_GATEWAY_RESTART_LIMIT": "dd1665cb28585c34e7d77e641be0d36c38296ddd85c9e6a570cb8c2c3a281a46"
+  },
+  "startupGraceDecisionExpressionSha256": "eebfa1bdc50c45dfeec3cbdf9f59b08fa62363db0356bf4a1451034b9c6d189d",
+  "recentRestartHistoryFunctionSha256": "3990c3eda98aa620a05bb3dc269bf085ad67be0ccc604eb103700beb24f2e65b",
+  "outputNames": [
+    "ACTION_STREAK_THRESHOLD",
+    "HERMERS_GATEWAY_RESTART_LIMIT",
+    "MAX_RESTARTS_PER_WINDOW",
+    "RESTART_COOLDOWN_SECONDS",
+    "RESTART_WINDOW_SECONDS",
+    "STARTUP_GRACE_SECONDS"
+  ],
+  "cases": [
+    {
+      "name": "defaults",
+      "environment": {},
+      "expected": {
+        "RESTART_COOLDOWN_SECONDS": 1800,
+        "RESTART_WINDOW_SECONDS": 21600,
+        "MAX_RESTARTS_PER_WINDOW": 2,
+        "ACTION_STREAK_THRESHOLD": 2,
+        "STARTUP_GRACE_SECONDS": 240,
+        "HERMERS_GATEWAY_RESTART_LIMIT": 2
+      }
+    },
+    {
+      "name": "full-overrides",
+      "environment": {
+        "OPENCLAW_STABILITY_RESTART_COOLDOWN_SECONDS": "90",
+        "OPENCLAW_STABILITY_RESTART_WINDOW_SECONDS": "7777",
+        "OPENCLAW_STABILITY_MAX_RESTARTS": "5",
+        "OPENCLAW_STABILITY_ACTION_STREAK": "4",
+        "OPENCLAW_STABILITY_STARTUP_GRACE_SECONDS": "333",
+        "CAT_AGENTS_STABILITY_HERMERS_GATEWAY_RESTART_LIMIT": "3"
+      },
+      "expected": {
+        "RESTART_COOLDOWN_SECONDS": 90,
+        "RESTART_WINDOW_SECONDS": 7777,
+        "MAX_RESTARTS_PER_WINDOW": 5,
+        "ACTION_STREAK_THRESHOLD": 4,
+        "STARTUP_GRACE_SECONDS": 333,
+        "HERMERS_GATEWAY_RESTART_LIMIT": 3
+      }
+    },
+    {
+      "name": "hermers-limit-inherits-resolved-max",
+      "environment": {
+        "OPENCLAW_STABILITY_MAX_RESTARTS": "7"
+      },
+      "expected": {
+        "RESTART_COOLDOWN_SECONDS": 1800,
+        "RESTART_WINDOW_SECONDS": 21600,
+        "MAX_RESTARTS_PER_WINDOW": 7,
+        "ACTION_STREAK_THRESHOLD": 2,
+        "STARTUP_GRACE_SECONDS": 240,
+        "HERMERS_GATEWAY_RESTART_LIMIT": 7
+      }
+    },
+    {
+      "name": "hermers-limit-explicitly-overrides-inherited-max",
+      "environment": {
+        "OPENCLAW_STABILITY_MAX_RESTARTS": "7",
+        "CAT_AGENTS_STABILITY_HERMERS_GATEWAY_RESTART_LIMIT": "2"
+      },
+      "expected": {
+        "RESTART_COOLDOWN_SECONDS": 1800,
+        "RESTART_WINDOW_SECONDS": 21600,
+        "MAX_RESTARTS_PER_WINDOW": 7,
+        "ACTION_STREAK_THRESHOLD": 2,
+        "STARTUP_GRACE_SECONDS": 240,
+        "HERMERS_GATEWAY_RESTART_LIMIT": 2
+      }
+    }
+  ]
+}

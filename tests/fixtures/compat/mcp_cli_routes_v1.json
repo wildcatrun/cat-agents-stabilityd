@@ -1,0 +1,228 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "source": "Captured by invoking pinned baseline stability_cli_args in memory; no command runner or live tools called.",
+  "cases": [
+    {
+      "action": "status",
+      "arguments": {},
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "status"
+      ]
+    },
+    {
+      "action": "snapshot",
+      "arguments": {},
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "snapshot"
+      ]
+    },
+    {
+      "action": "policy",
+      "arguments": {},
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "policy"
+      ]
+    },
+    {
+      "action": "lanes",
+      "arguments": {},
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "lanes"
+      ]
+    },
+    {
+      "action": "profile-modes",
+      "arguments": {},
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "profile-modes"
+      ]
+    },
+    {
+      "action": "desired-state",
+      "arguments": {},
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "desired-state"
+      ]
+    },
+    {
+      "action": "drift",
+      "arguments": {},
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "drift"
+      ]
+    },
+    {
+      "action": "findings",
+      "arguments": {},
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "findings"
+      ]
+    },
+    {
+      "action": "workflow-evidence",
+      "arguments": {},
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "workflow-evidence"
+      ]
+    },
+    {
+      "action": "actions",
+      "arguments": {
+        "limit": 7
+      },
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "actions",
+        "--limit",
+        "7"
+      ]
+    },
+    {
+      "action": "events",
+      "arguments": {},
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "events"
+      ]
+    },
+    {
+      "action": "runbook",
+      "arguments": {},
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "runbook"
+      ]
+    },
+    {
+      "action": "auth-readiness",
+      "arguments": {
+        "fresh": true
+      },
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "auth-readiness",
+        "--fresh"
+      ]
+    },
+    {
+      "action": "auth-maintenance",
+      "arguments": {
+        "fresh": true,
+        "actionId": "fixture-action",
+        "dryRun": true,
+        "execute": true,
+        "allowMirror": true
+      },
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "auth-maintenance",
+        "--fresh",
+        "--action-id",
+        "fixture-action",
+        "--dry-run",
+        "--execute"
+      ]
+    },
+    {
+      "action": "auth-mirror",
+      "arguments": {
+        "apply": true
+      },
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "auth-mirror"
+      ]
+    },
+    {
+      "action": "doctor",
+      "arguments": {
+        "noAction": false
+      },
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "doctor"
+      ]
+    },
+    {
+      "action": "repair",
+      "arguments": {
+        "dryRun": false
+      },
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "repair"
+      ]
+    },
+    {
+      "action": "once",
+      "arguments": {
+        "noAction": true
+      },
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "once",
+        "--no-action"
+      ]
+    },
+    {
+      "action": "auth-maintenance",
+      "arguments": {
+        "fresh": true,
+        "execute": true,
+        "allowMirror": true
+      },
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "auth-maintenance",
+        "--fresh",
+        "--execute"
+      ]
+    },
+    {
+      "action": "auth-mirror",
+      "arguments": {
+        "apply": true
+      },
+      "allowAuthMirror": "0",
+      "expectedArgv": [
+        "auth-mirror"
+      ]
+    },
+    {
+      "action": "auth-maintenance",
+      "arguments": {
+        "fresh": true,
+        "execute": true,
+        "allowMirror": true
+      },
+      "allowAuthMirror": "1",
+      "expectedArgv": [
+        "auth-maintenance",
+        "--fresh",
+        "--execute",
+        "--allow-mirror"
+      ]
+    },
+    {
+      "action": "auth-mirror",
+      "arguments": {
+        "apply": true
+      },
+      "allowAuthMirror": "1",
+      "expectedArgv": [
+        "auth-mirror",
+        "--apply"
+      ]
+    }
+  ]
+}

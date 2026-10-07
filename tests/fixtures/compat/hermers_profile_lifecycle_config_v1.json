@@ -1,0 +1,182 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "captureMethod": "AST-isolated evaluation of only eight allowlisted top-level config assignments; no module import or daemon entry point",
+  "baselineTargets": {
+    "HERMERS_PROFILE_MODE_ENABLED": "modeEnabled",
+    "HERMERS_PROFILE_MODE_ACTUATE_ENABLED": "actuateEnabled",
+    "HERMERS_PROFILE_MODE_START_ENABLED": "startEnabled",
+    "HERMERS_PROFILE_LIFECYCLE_ALLOWLIST": "lifecycleAllowlist",
+    "HERMERS_PROFILE_COLD_IDLE_SECONDS": "coldIdleSeconds",
+    "HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS": "hibernateIdleSeconds",
+    "HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS": "lifecycleCooldownSeconds",
+    "HERMERS_PROFILE_PROTECTED_IDS": "protectedIds"
+  },
+  "baselineExpressionSha256": {
+    "HERMERS_PROFILE_MODE_ENABLED": "61c063660e213801835cf77aa3c8d62d7d5df6e9d7c2da4299e8ce7edccb8431",
+    "HERMERS_PROFILE_MODE_ACTUATE_ENABLED": "5c46a94f797ba1953af7e841d674f64469e189449e3154e46b5c6bc736723c75",
+    "HERMERS_PROFILE_MODE_START_ENABLED": "62577509ab5894b7359c5919a7e6154909b3b100ae67054605e7cdd17f5dfaeb",
+    "HERMERS_PROFILE_LIFECYCLE_ALLOWLIST": "61c29321a5c2225d0924237e714b3d0179548e379295700b1fd47e7c6290cef4",
+    "HERMERS_PROFILE_COLD_IDLE_SECONDS": "6a83c6396225d610eb3adbd891bf06ebf21df8e156e50913263755049312b8e3",
+    "HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS": "8d8e536056e0285a39b2da64f78849da0d4e147a9b3b94a99bc8fc328b644dbf",
+    "HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS": "4f2047cea376c1a6e3aeddc9d61b916607c8f65a6b5e8472bc038e9c3c6c5176",
+    "HERMERS_PROFILE_PROTECTED_IDS": "d59f4cf532caf589fc05a0c531c6f115e4878744a72be0fede1b2104d6425e2e"
+  },
+  "outputNames": [
+    "actuateEnabled",
+    "coldIdleSeconds",
+    "hibernateIdleSeconds",
+    "lifecycleAllowlist",
+    "lifecycleCooldownSeconds",
+    "modeEnabled",
+    "protectedIds",
+    "startEnabled"
+  ],
+  "cases": [
+    {
+      "name": "defaults",
+      "environment": {},
+      "expected": {
+        "modeEnabled": true,
+        "actuateEnabled": false,
+        "startEnabled": true,
+        "lifecycleAllowlist": [],
+        "coldIdleSeconds": 1800,
+        "hibernateIdleSeconds": 28800,
+        "lifecycleCooldownSeconds": 600,
+        "protectedIds": [
+          "cat_claw",
+          "cat_heart",
+          "catheart",
+          "main"
+        ]
+      },
+      "error": null
+    },
+    {
+      "name": "primary-values",
+      "environment": {
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ENABLED": "0",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTUATE": "0",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_START": "0",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_ALLOWLIST": "catnose,catears",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_COLD_IDLE_SECONDS": "321",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS": "654",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS": "987",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_PROTECTED_IDS": "main,cat_heart"
+      },
+      "expected": {
+        "modeEnabled": false,
+        "actuateEnabled": false,
+        "startEnabled": false,
+        "lifecycleAllowlist": [
+          "catears",
+          "catnose"
+        ],
+        "coldIdleSeconds": 321,
+        "hibernateIdleSeconds": 654,
+        "lifecycleCooldownSeconds": 987,
+        "protectedIds": [
+          "cat_heart",
+          "main"
+        ]
+      },
+      "error": null
+    },
+    {
+      "name": "legacy-aliases",
+      "environment": {
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_ACTUATE": "1",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_MANAGED": " catnose, catears , ",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS": "901",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_PROTECTED": " main, cat_heart , catheart "
+      },
+      "expected": {
+        "modeEnabled": true,
+        "actuateEnabled": true,
+        "startEnabled": true,
+        "lifecycleAllowlist": [
+          "catears",
+          "catnose"
+        ],
+        "coldIdleSeconds": 1800,
+        "hibernateIdleSeconds": 28800,
+        "lifecycleCooldownSeconds": 901,
+        "protectedIds": [
+          "cat_heart",
+          "catheart",
+          "main"
+        ]
+      },
+      "error": null
+    },
+    {
+      "name": "primary-wins-over-alias",
+      "environment": {
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTUATE": "0",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_ACTUATE": "1",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_ALLOWLIST": "primary-one, primary-two",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_MANAGED": "legacy-one,legacy-two",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS": "111",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS": "222",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_PROTECTED_IDS": "primary-id",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_PROTECTED": "legacy-id"
+      },
+      "expected": {
+        "modeEnabled": true,
+        "actuateEnabled": false,
+        "startEnabled": true,
+        "lifecycleAllowlist": [
+          "primary-one",
+          "primary-two"
+        ],
+        "coldIdleSeconds": 1800,
+        "hibernateIdleSeconds": 28800,
+        "lifecycleCooldownSeconds": 111,
+        "protectedIds": [
+          "primary-id"
+        ]
+      },
+      "error": null
+    },
+    {
+      "name": "empty-primary-list-and-boolean-values",
+      "environment": {
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ENABLED": " 0 ",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTUATE": "",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_ACTUATE": "0",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_START": "",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_ALLOWLIST": "  , ",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_MANAGED": "must-not-appear",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_PROTECTED_IDS": "   ",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_PROTECTED": "must-not-appear",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_COLD_IDLE_SECONDS": " 17 ",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_HIBERNATE_IDLE_SECONDS": " 29 ",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS": " 73 "
+      },
+      "expected": {
+        "modeEnabled": true,
+        "actuateEnabled": true,
+        "startEnabled": true,
+        "lifecycleAllowlist": [],
+        "coldIdleSeconds": 17,
+        "hibernateIdleSeconds": 29,
+        "lifecycleCooldownSeconds": 73,
+        "protectedIds": []
+      },
+      "error": null
+    },
+    {
+      "name": "cooldown-empty-primary-beats-alias-and-is-invalid",
+      "environment": {
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_MODE_ACTION_COOLDOWN_SECONDS": "",
+        "CAT_AGENTS_STABILITY_HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS": "999"
+      },
+      "expected": null,
+      "error": {
+        "type": "ValueError",
+        "message": "invalid literal for int() with base 10: ''"
+      }
+    }
+  ]
+}

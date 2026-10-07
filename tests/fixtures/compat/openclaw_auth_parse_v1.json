@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "fixedEpoch": 1791237600,
+  "captureMethod": "compile three source-hash-pinned AST functions only; strip copied annotations; fix epoch; compare shared parsed fields",
+  "baselineSymbolSha256": {
+    "parse_iso_epoch": "f15d7ead62e83881563f7c5d6bb630a339a1127b0bf18a0ad70657372898cf5d",
+    "iso_from_epoch": "3c39673b91d3ddc31f678f11193ed487c304322f5661b5d76086b79c9c1cc462",
+    "parse_openclaw_auth_list": "5745fd9e42b370a934699c262e938ab7bb5888a22c4081ba8da8ec55b960279d"
+  },
+  "sharedProfileFields": [
+    "agentId",
+    "profileKind",
+    "provider",
+    "expiresEpoch",
+    "expiresAt",
+    "secondsRemaining",
+    "cooldownUntilEpoch",
+    "cooldownUntil",
+    "expiryParseOk"
+  ],
+  "cases": [
+    {
+      "name": "future-expiry-and-cooldown",
+      "agentId": "main",
+      "input": "- openai-codex:FIXTURE_PROFILE (primary) [openai-codex/oauth; expires 2026-10-06T02:00:00Z; cooldown until 2026-10-05T23:00:00Z]",
+      "expectedSharedProjection": {
+        "agentId": "main",
+        "profileCount": 1,
+        "unparsedProfileLineCount": 0,
+        "profiles": [
+          {
+            "agentId": "main",
+            "profileKind": "openai-codex",
+            "provider": "openai-codex",
+            "expiresEpoch": 1791252000,
+            "expiresAt": "2026-10-06T02:00:00Z",
+            "secondsRemaining": 14400,
+            "cooldownUntilEpoch": 1791241200,
+            "cooldownUntil": "2026-10-05T23:00:00Z",
+            "expiryParseOk": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "expired-offset-expiry",
+      "agentId": "cat_voice",
+      "input": "- openai:default [openai/oauth; expires 2026-10-05T22:30:00+01:00]",
+      "expectedSharedProjection": {
+        "agentId": "cat_voice",
+        "profileCount": 1,
+        "unparsedProfileLineCount": 0,
+        "profiles": [
+          {
+            "agentId": "cat_voice",
+            "profileKind": "openai",
+            "provider": "openai",
+            "expiresEpoch": 1791235800,
+            "expiresAt": "2026-10-05T21:30:00Z",
+            "secondsRemaining": -1800,
+            "cooldownUntilEpoch": null,
+            "cooldownUntil": null,
+            "expiryParseOk": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "expiry-unknown",
+      "agentId": "main",
+      "input": "- openai-codex:secondary [openai-codex/oauth; cooldown until 2026-10-05T23:15:00Z]",
+      "expectedSharedProjection": {
+        "agentId": "main",
+        "profileCount": 1,
+        "unparsedProfileLineCount": 0,
+        "profiles": [
+          {
+            "agentId": "main",
+            "profileKind": "openai-codex",
+            "provider": "openai-codex",
+            "expiresEpoch": null,
+            "expiresAt": null,
+            "secondsRemaining": null,
+            "cooldownUntilEpoch": 1791242100,
+            "cooldownUntil": "2026-10-05T23:15:00Z",
+            "expiryParseOk": false
+          }
+        ]
+      }
+    }
+  ]
+}

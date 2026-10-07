@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "source": "Captured by invoking pinned baseline handle_request in memory with audit disabled; no handler executes.",
+  "cases": [
+    {
+      "name": "unknown-method",
+      "request": {
+        "id": 1,
+        "method": "fixture/unknown",
+        "params": {}
+      },
+      "expected": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+          "code": -32601,
+          "message": "method not found: fixture/unknown"
+        }
+      }
+    },
+    {
+      "name": "unknown-tool",
+      "request": {
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+          "name": "fixture-no-such-tool",
+          "arguments": {}
+        }
+      },
+      "expected": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "error": {
+          "code": -32000,
+          "message": "unknown tool: fixture-no-such-tool"
+        }
+      }
+    }
+  ]
+}

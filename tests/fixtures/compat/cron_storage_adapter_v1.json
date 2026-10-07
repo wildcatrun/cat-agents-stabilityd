@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "baselineSymbol": "collect_cron_storage_status",
+  "baselineSymbolSha256": "5aa95f0f509ecc51b461041a892e5a8cf90af83a8b6617f19b4cee9d82969d5b",
+  "captureMethod": "compile one source-hash-pinned adapter function; inject synthetic run_cmd and JSON-only parser; compare exact adapter projections",
+  "parserBoundary": "The adapter mapping is pinned here; extract_json_payload has a separate baseline compatibility fixture.",
+  "cases": [
+    {
+      "name": "successful-sqlite-status",
+      "returnCode": 0,
+      "payload": {
+        "enabled": true,
+        "storePath": "/synthetic/openclaw/cron",
+        "storage": "sqlite",
+        "sqlitePath": "/synthetic/openclaw/cron/jobs.sqlite",
+        "jobs": [
+          {
+            "id": "fixture-job",
+            "state": "running"
+          }
+        ],
+        "nextWakeAtMs": 1791237600000
+      },
+      "expected": {
+        "available": true,
+        "exitCode": 0,
+        "diagnostics": [],
+        "enabled": true,
+        "storePath": "/synthetic/openclaw/cron",
+        "storage": "sqlite",
+        "sqlitePath": "/synthetic/openclaw/cron/jobs.sqlite",
+        "jobs": [
+          {
+            "id": "fixture-job",
+            "state": "running"
+          }
+        ],
+        "nextWakeAtMs": 1791237600000
+      }
+    },
+    {
+      "name": "nonzero-with-structured-sqlite-evidence",
+      "returnCode": 2,
+      "payload": {
+        "enabled": true,
+        "storePath": "/synthetic/openclaw/cron",
+        "storage": "sqlite",
+        "sqlitePath": "/synthetic/openclaw/cron/jobs.sqlite",
+        "jobs": [],
+        "nextWakeAtMs": 1791237600000
+      },
+      "expected": {
+        "available": false,
+        "exitCode": 2,
+        "diagnostics": [],
+        "enabled": true,
+        "storePath": "/synthetic/openclaw/cron",
+        "storage": "sqlite",
+        "sqlitePath": "/synthetic/openclaw/cron/jobs.sqlite",
+        "jobs": [],
+        "nextWakeAtMs": 1791237600000
+      }
+    }
+  ]
+}

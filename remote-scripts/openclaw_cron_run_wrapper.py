@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 
 import fcntl
+import contextlib
+import ctypes
 import json
 import os
 import shutil
 import re
 import socket
+import signal
 import subprocess
 import sys
 import threading
@@ -189,6 +192,19 @@ def acquire_slot_lock() -> object:
 def release_slot_lock(lock_fh: object) -> None:
     fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
     lock_fh.close()
+
+
+@contextlib.contextmanager
+def lease_mutation_lock():
+    """Coordinate lease create/heartbeat/cleanup with stabilityd lease repair."""
+    LEASES_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = LEASES_DIR / ".stabilityd-lease-mutation.lock"
+    with lock_path.open("a+b") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
 
 def cleanup_stale_slots() -> list[str]:
@@ -1040,6 +1056,9 @@ def build_run_record(job: dict, job_id: str, run_id: str, argv: list[str]) -> di
         "finishedAtMs": None,
         "durationMs": None,
         "leaseOwner": f"{socket.gethostname()}:{os.getpid()}",
+        "workloadOwner": None,
+        "workloadState": "not-started",
+        "dispatchState": "not-started",
         "leaseExpiresAtMs": started + (timeout_seconds * 1000),
         "fencingToken": started,
         "timeoutSeconds": timeout_seconds,
@@ -1057,6 +1076,9 @@ def build_lease_record(run_record: dict) -> dict:
         "runId": run_record["runId"],
         "jobId": run_record["jobId"],
         "leaseOwner": run_record["leaseOwner"],
+        "workloadOwner": run_record.get("workloadOwner"),
+        "workloadState": run_record.get("workloadState") or "not-started",
+        "dispatchState": run_record.get("dispatchState") or "not-started",
         "fencingToken": run_record["fencingToken"],
         "acquiredAtMs": run_record["startedAtMs"],
         "heartbeatAtMs": run_record["startedAtMs"],
@@ -1066,20 +1088,24 @@ def build_lease_record(run_record: dict) -> dict:
 
 
 def refresh_lease(run_record: dict, lease_path: Path) -> None:
-    current = now_ms()
-    lease_record = {
-        "runId": run_record["runId"],
-        "jobId": run_record["jobId"],
-        "leaseOwner": run_record["leaseOwner"],
-        "fencingToken": run_record["fencingToken"],
-        "acquiredAtMs": run_record["startedAtMs"],
-        "heartbeatAtMs": current,
-        "expiresAtMs": current + (run_record["timeoutSeconds"] * 1000),
-        "phase": run_record["status"],
-    }
-    run_record["leaseExpiresAtMs"] = lease_record["expiresAtMs"]
-    write_json_atomic(lease_path, lease_record)
-    write_json_atomic(BY_RUN_DIR / f"{run_record['runId']}.json", run_record)
+    with lease_mutation_lock():
+        current = now_ms()
+        lease_record = {
+            "runId": run_record["runId"],
+            "jobId": run_record["jobId"],
+            "leaseOwner": run_record["leaseOwner"],
+            "workloadOwner": run_record.get("workloadOwner"),
+            "workloadState": run_record.get("workloadState") or "not-started",
+            "dispatchState": run_record.get("dispatchState") or "not-started",
+            "fencingToken": run_record["fencingToken"],
+            "acquiredAtMs": run_record["startedAtMs"],
+            "heartbeatAtMs": current,
+            "expiresAtMs": current + (run_record["timeoutSeconds"] * 1000),
+            "phase": run_record["status"],
+        }
+        run_record["leaseExpiresAtMs"] = lease_record["expiresAtMs"]
+        write_json_atomic(lease_path, lease_record)
+        write_json_atomic(BY_RUN_DIR / f"{run_record['runId']}.json", run_record)
 
 
 def lease_heartbeat_loop(
@@ -1095,6 +1121,20 @@ def lease_heartbeat_loop(
             continue
 
 
+def install_parent_death_signal(expected_parent_pid: int) -> None:
+    """Make the direct OpenClaw CLI workload die if its lease-owning wrapper dies."""
+    if sys.platform != "linux":
+        raise RuntimeError("cron workload parent-death containment requires Linux")
+    libc = ctypes.CDLL(None, use_errno=True)
+    # Linux prctl(PR_SET_PDEATHSIG, SIGKILL); this runs in the single-threaded
+    # child pre-exec window before OpenClaw CLI code is loaded.
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    if os.getppid() != expected_parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
 def update_success(run_record: dict, returncode: int) -> dict:
     finished = now_ms()
     run_record["status"] = "succeeded" if returncode == 0 else "failed"
@@ -1107,6 +1147,75 @@ def update_success(run_record: dict, returncode: int) -> dict:
         run_record["result"] = None
         run_record["failure"] = {"class": "cli_exit_nonzero", "returnCode": returncode}
     return run_record
+
+
+def unresolved_dispatch_lease(job_id: str) -> Optional[dict]:
+    """Return an attempted dispatch without a definitive local success receipt.
+
+    This is deliberately conservative: a nonzero CLI exit does not prove that
+    Gateway rejected the remote run. Such a lease requires external reconciliation.
+    """
+    for path in sorted(LEASES_DIR.glob("*.json")):
+        try:
+            lease = load_json(path)
+        except Exception:
+            return {"jobId": job_id, "dispatchState": "unknown", "path": str(path)}
+        if not isinstance(lease, dict):
+            return {"jobId": job_id, "dispatchState": "unknown", "path": str(path)}
+        if lease.get("jobId") != job_id:
+            continue
+        state = lease.get("dispatchState")
+        if state == "not-dispatched":
+            continue
+        if state == "attempted":
+            # Even a successful receipt cannot prove the old lease was closed
+            # before a crash. Only actual lease removal releases this fence.
+            return lease
+        return lease
+    return None
+
+
+def should_retain_attempted_lease(dispatch_state: str, return_code: Optional[int], receipt_persisted: bool) -> bool:
+    return dispatch_state == "attempted" and (return_code != 0 or not receipt_persisted)
+
+
+def cleanup_dispatch_lease(
+    lease_path: Path, run_record: dict, return_code: Optional[int], receipt_persisted: bool,
+) -> bool:
+    """Delete only a lease whose local dispatch outcome is known safe to close."""
+    retained = should_retain_attempted_lease(
+        str(run_record.get("dispatchState") or ""), return_code, receipt_persisted
+    )
+    with lease_mutation_lock():
+        if not retained:
+            try:
+                lease_path.unlink(missing_ok=True)
+            except Exception:
+                if not (run_record.get("dispatchState") == "attempted" and return_code == 0 and receipt_persisted):
+                    raise
+                # Durable remote success plus failed local unlink remains fenced
+                # by the residual lease, and must not become a retryable exit.
+                return True
+    return retained
+
+
+def emit_safe_warning(message: str) -> None:
+    try:
+        print(message, file=sys.stderr)
+    except Exception:
+        # Diagnostics cannot turn a durable external success into a retry.
+        pass
+
+
+def reserve_cron_run(run_record: dict, run_path: Path, lease_path: Path) -> tuple[bool, Optional[dict]]:
+    """Atomically fence same-job dispatches and create this invocation's lease."""
+    with lease_mutation_lock():
+        existing = unresolved_dispatch_lease(str(run_record.get("jobId") or ""))
+        if existing:
+            return False, existing
+        write_json_atomic(run_path, run_record)
+        write_json_atomic(lease_path, build_lease_record(run_record))
+        return True, None
 
 
 def write_job_summary(run_record: dict) -> None:
@@ -1161,6 +1270,20 @@ def persist_post_run_admission(run_record: dict, slot_path: Optional[Path]) -> N
         release_slot_lock(lock_fh)
 
 
+def post_success_bookkeeping(run_record: dict, slot_path: Optional[Path]) -> list[str]:
+    """Keep local bookkeeping failures from converting a durable success into retry."""
+    failures = []
+    for operation, args in (
+        (persist_post_run_admission, (run_record, slot_path)),
+        (write_job_summary, (run_record,)),
+    ):
+        try:
+            operation(*args)
+        except Exception as exc:
+            failures.append(type(exc).__name__)
+    return failures
+
+
 def main() -> int:
     argv = sys.argv[1:]
     if len(argv) < 3 or argv[0] != "cron" or argv[1] != "run":
@@ -1173,24 +1296,24 @@ def main() -> int:
     lease_path = LEASES_DIR / f"{run_id}.json"
 
     run_record = build_run_record(job, job_id, run_id, argv)
-    lease_record = build_lease_record(run_record)
-
-    write_json_atomic(run_path, run_record)
-    write_json_atomic(lease_path, lease_record)
+    reserved, unresolved = reserve_cron_run(run_record, run_path, lease_path)
+    if not reserved:
+        run_record = update_deferred(run_record, "unresolved-gateway-dispatch", {})
+        write_json_atomic(run_path, run_record)
+        write_job_summary(run_record)
+        return 0
 
     env = os.environ.copy()
     env["OPENCLAW_CRON_RUN_ID"] = run_id
     env["OPENCLAW_CRON_JOB_ID"] = job_id
 
     stop_event = threading.Event()
-    heartbeat_thread = threading.Thread(
-        target=lease_heartbeat_loop,
-        args=(run_record, lease_path, stop_event),
-        daemon=True,
-    )
-    heartbeat_thread.start()
+    heartbeat_thread = None
+    workload_proc = None
     slot_path = None
     queue_path = queue_path_for_run(run_id)
+    return_code = None
+    terminal_receipt_persisted = False
     try:
         lane_policy = load_lane_policy()
         lane_allowed, lane_reason = lane_preflight(job, lane_policy)
@@ -1211,19 +1334,60 @@ def main() -> int:
         slot_path = acquire_execution_slot(run_record, job, run_path)
         if slot_path is None:
             return 0
-        proc = subprocess.run([REAL_OPENCLAW, *argv], env=env)
-        run_record = update_success(run_record, proc.returncode)
+        # Persist the external-effect boundary before starting the CLI. If the
+        # wrapper dies after this point, stabilityd must retain the lease as
+        # uncertain because the Gateway may have accepted the run.
+        run_record["dispatchState"] = "attempted"
+        run_record["dispatchAttemptedAtMs"] = now_ms()
+        with lease_mutation_lock():
+            write_json_atomic(run_path, run_record)
+            write_json_atomic(lease_path, build_lease_record(run_record))
+        expected_parent_pid = os.getpid()
+        try:
+            workload_proc = subprocess.Popen(
+                [REAL_OPENCLAW, *argv], env=env,
+                preexec_fn=lambda: install_parent_death_signal(expected_parent_pid),
+            )
+        except Exception as exc:
+            run_record.update({"status": "failed", "dispatchState": "not-dispatched",
+                               "finishedAtMs": now_ms(), "failure": {"class": type(exc).__name__},
+                               "result": None})
+            with lease_mutation_lock():
+                write_json_atomic(run_path, run_record)
+                write_json_atomic(lease_path, build_lease_record(run_record))
+            raise
+        run_record["workloadOwner"] = {"host": socket.gethostname(), "pid": workload_proc.pid}
+        run_record["workloadState"] = "running"
+        with lease_mutation_lock():
+            write_json_atomic(run_path, run_record)
+            write_json_atomic(lease_path, build_lease_record(run_record))
+        heartbeat_thread = threading.Thread(
+            target=lease_heartbeat_loop,
+            args=(run_record, lease_path, stop_event),
+            daemon=True,
+        )
+        heartbeat_thread.start()
+        return_code = workload_proc.wait()
+        run_record = update_success(run_record, return_code)
         write_json_atomic(run_path, run_record)
-        persist_post_run_admission(run_record, slot_path)
-        write_job_summary(run_record)
-        return proc.returncode
+        terminal_receipt_persisted = True
+        bookkeeping_failures = post_success_bookkeeping(run_record, slot_path)
+        if bookkeeping_failures:
+            emit_safe_warning("cron-run post-success bookkeeping failed: " + ",".join(bookkeeping_failures))
+        return return_code
     finally:
         stop_event.set()
-        heartbeat_thread.join(timeout=1)
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=1)
+        if workload_proc is not None and workload_proc.poll() is None:
+            workload_proc.kill()
+            workload_proc.wait(timeout=5)
         queue_path.unlink(missing_ok=True)
         if slot_path is not None:
             slot_path.unlink(missing_ok=True)
-        lease_path.unlink(missing_ok=True)
+        retained = cleanup_dispatch_lease(lease_path, run_record, return_code, terminal_receipt_persisted)
+        if retained and return_code == 0 and terminal_receipt_persisted:
+            emit_safe_warning("cron-run successful receipt lease cleanup failed; same-job admission remains fenced")
 
 
 if __name__ == "__main__":

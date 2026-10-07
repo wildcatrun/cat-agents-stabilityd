@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "jobId": "fixture-job-1",
+  "reason": "compatibility-fixture",
+  "source": "fixture",
+  "status": "pending",
+  "queueState": "ready",
+  "firstDetectedAtMs": 1,
+  "lastDetectedAtMs": 2,
+  "count": 1,
+  "gate": {}
+}

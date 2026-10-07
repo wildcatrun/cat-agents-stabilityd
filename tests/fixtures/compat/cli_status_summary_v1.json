@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "selectedSource": {
+    "symbol": "main(): if cmd == 'status'",
+    "sha256": "0e45f467016c3300579cf30579f2aaa9049932cf3f1dc9ea249316069ef9ea78",
+    "allOtherBaselineModuleCode": "not compiled or executed"
+  },
+  "captureMethod": "compile only the source-hash-pinned status branch with fixed path readers, file age, and output capture",
+  "cases": [
+    {
+      "name": "status-summary-with-findings-and-actions",
+      "latest": {
+        "checkedAt": "2026-10-05T20:00:00+08:00",
+        "completedAt": "2026-10-05T20:00:02+08:00",
+        "severity": "low",
+        "findings": [
+          {
+            "key": "fixture-finding",
+            "severity": "low"
+          }
+        ],
+        "actions": [
+          {
+            "action": "none",
+            "result": "observe-only"
+          }
+        ]
+      },
+      "policy": {
+        "mode": "observe",
+        "updatedAtEpoch": 1800000000
+      },
+      "nowEpoch": 1800000060,
+      "expected": {
+        "checkedAt": "2026-10-05T20:00:00+08:00",
+        "completedAt": "2026-10-05T20:00:02+08:00",
+        "severity": "low",
+        "mode": "observe",
+        "policyAgeSeconds": 60,
+        "findingCount": 1,
+        "lastActions": [
+          {
+            "action": "none",
+            "result": "observe-only"
+          }
+        ]
+      }
+    },
+    {
+      "name": "status-summary-with-empty-snapshot",
+      "latest": {},
+      "policy": {},
+      "nowEpoch": 1800000060,
+      "expected": {
+        "checkedAt": null,
+        "completedAt": null,
+        "severity": null,
+        "mode": null,
+        "policyAgeSeconds": null,
+        "findingCount": 0,
+        "lastActions": null
+      }
+    }
+  ]
+}

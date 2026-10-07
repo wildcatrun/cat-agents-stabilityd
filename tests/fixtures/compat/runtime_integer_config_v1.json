@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "ece4157a38cc60dfbedc0268ca296f7775a956f0",
+  "captureMethod": "AST-isolated evaluation of only three pinned top-level assignments; calls limited to int and os.environ.get",
+  "baselineTargets": {
+    "PORT": "OPENCLAW_GATEWAY_PORT",
+    "INTERVAL_SECONDS": "OPENCLAW_STABILITY_INTERVAL_SECONDS",
+    "POLICY_TTL_SECONDS": "OPENCLAW_STABILITY_POLICY_TTL_SECONDS"
+  },
+  "baselineExpressionSha256": {
+    "PORT": "5d4c7fd5bd805f53554b6d59fdb9b1b1e991e0be1adf2c0d5f9728b1099ca83b",
+    "INTERVAL_SECONDS": "fb76ed2150a71677637fd61005819766e7380442b996df51869f289a7259b663",
+    "POLICY_TTL_SECONDS": "712e7319eb04db663329628ea41197b2501189e08cf282a93b7aa22f528325f8"
+  },
+  "outputNames": [
+    "OPENCLAW_GATEWAY_PORT",
+    "OPENCLAW_STABILITY_INTERVAL_SECONDS",
+    "OPENCLAW_STABILITY_POLICY_TTL_SECONDS"
+  ],
+  "defaults": {
+    "OPENCLAW_GATEWAY_PORT": 23466,
+    "OPENCLAW_STABILITY_INTERVAL_SECONDS": 30,
+    "OPENCLAW_STABILITY_POLICY_TTL_SECONDS": 180
+  },
+  "cases": [
+    {
+      "name": "defaults",
+      "environment": {},
+      "expected": {
+        "OPENCLAW_GATEWAY_PORT": 23466,
+        "OPENCLAW_STABILITY_INTERVAL_SECONDS": 30,
+        "OPENCLAW_STABILITY_POLICY_TTL_SECONDS": 180
+      }
+    },
+    {
+      "name": "valid-overrides",
+      "environment": {
+        "OPENCLAW_GATEWAY_PORT": "24567",
+        "OPENCLAW_STABILITY_INTERVAL_SECONDS": "45",
+        "OPENCLAW_STABILITY_POLICY_TTL_SECONDS": "270"
+      },
+      "expected": {
+        "OPENCLAW_GATEWAY_PORT": 24567,
+        "OPENCLAW_STABILITY_INTERVAL_SECONDS": 45,
+        "OPENCLAW_STABILITY_POLICY_TTL_SECONDS": 270
+      }
+    },
+    {
+      "name": "whitespace-overrides",
+      "environment": {
+        "OPENCLAW_GATEWAY_PORT": " 23467 ",
+        "OPENCLAW_STABILITY_INTERVAL_SECONDS": " 35 ",
+        "OPENCLAW_STABILITY_POLICY_TTL_SECONDS": " 180 "
+      },
+      "expected": {
+        "OPENCLAW_GATEWAY_PORT": 23467,
+        "OPENCLAW_STABILITY_INTERVAL_SECONDS": 35,
+        "OPENCLAW_STABILITY_POLICY_TTL_SECONDS": 180
+      }
+    }
+  ]
+}
