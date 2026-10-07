@@ -121,6 +121,9 @@ INSPECTION_PLUGINS_TTL_SECONDS = max(0, int(os.environ.get("CAT_AGENTS_STABILITY
 _inspection_cache_enabled = False
 _inspection_cache: Dict[str, Any] = {}
 _inspection_gateway_context: Tuple[int, bool] = (0, False)
+CRON_READONLY_RPC_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_CRON_READONLY_RPC", "1") == "1"
+_cron_rpc_cycle: Optional[Dict[str, Any]] = None
+_cron_rpc_retry_after = 0.0
 LOG_PRESSURE_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_LOG_PRESSURE_WINDOW_SECONDS", "900"))
 TREND_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_TREND_WINDOW_SECONDS", "1800"))
 TREND_SAMPLE_LIMIT = int(os.environ.get("OPENCLAW_STABILITY_TREND_SAMPLE_LIMIT", "240"))
@@ -949,7 +952,54 @@ def _collect_gateway_deep_status() -> Dict[str, Any]:
     return parsed
 
 
+def prepare_cron_readonly_rpc() -> None:
+    """One fresh read-only SDK process per daemon cycle; CLI remains the fallback."""
+    global _cron_rpc_cycle, _cron_rpc_retry_after
+    _cron_rpc_cycle = None
+    if not _inspection_cache_enabled or not CRON_READONLY_RPC_ENABLED:
+        return
+    if not _inspection_gateway_context[1]:
+        return
+    if time.monotonic() < _cron_rpc_retry_after:
+        return
+    try:
+        command = shutil.which("openclaw")
+        node = shutil.which("node")
+        if not command or not node:
+            raise RuntimeError("sdk-runtime-unavailable")
+        resolved = Path(command).resolve()
+        root = next((parent for parent in resolved.parents if (parent / "package.json").is_file() and load_json(parent / "package.json", {}).get("name") == "openclaw"), None)
+        if root is None:
+            raise RuntimeError("sdk-package-unavailable")
+        proc = run_cmd([node, str(PACKAGE_ROOT / "scripts" / "gateway_cron_readonly.mjs"), str(root)], timeout=12)
+        payload, _, _ = extract_json_payload(proc.stdout)
+        if proc.returncode != 0 or not isinstance(payload, dict) or payload.get("schemaVersion") != 1 or payload.get("ok") is not True or not isinstance(payload.get("status"), dict) or not isinstance(payload.get("inventory"), dict) or not isinstance(payload["inventory"].get("jobs"), list):
+            raise RuntimeError("sdk-query-unavailable")
+        _cron_rpc_cycle = payload
+        _cron_rpc_cycle["observedMonotonic"] = time.monotonic()
+    except Exception:
+        # Failed auth/API/schema attempts must not become a per-cycle spawn storm.
+        # Every cycle still queries the full CLI freshly during this backoff.
+        _cron_rpc_retry_after = time.monotonic() + 300
+
+
+def cron_readonly_rpc_payload(key: str) -> Optional[Dict[str, Any]]:
+    if _inspection_cache_enabled and _cron_rpc_cycle and 0 <= time.monotonic() - _cron_rpc_cycle["observedMonotonic"] < 12:
+        return _cron_rpc_cycle.get(key)
+    return None
+
+
 def collect_cron_storage_status() -> Dict[str, Any]:
+    payload = cron_readonly_rpc_payload("status")
+    if payload is not None:
+        return {"available": True, "exitCode": 0, "diagnostics": [], "inspectionTransport": "gateway-sdk-read-only", **{key: payload.get(key) for key in ("enabled", "storePath", "storage", "sqlitePath", "jobs", "nextWakeAtMs")}}
+    result = _collect_cron_storage_status_cli()
+    if _inspection_cache_enabled:
+        result["inspectionTransport"] = "cli-fallback" if CRON_READONLY_RPC_ENABLED else "cli"
+    return result
+
+
+def _collect_cron_storage_status_cli() -> Dict[str, Any]:
     try:
         out = run_cmd(["openclaw", "cron", "status", "--json"], timeout=15)
     except Exception as exc:
@@ -4027,14 +4077,20 @@ def classify_cron_heartbeat(state: Dict[str, Any], timeout_ms: int) -> str:
 
 
 def collect_cron_cli_status() -> Dict[str, Any]:
-    """Read OpenClaw's computed cron status when the installed CLI exposes it."""
-    try:
-        out = run_cmd(["openclaw", "cron", "list", "--json"], timeout=15)
-    except Exception as exc:
-        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
-    if out.returncode != 0:
-        return {"available": False, "exitCode": out.returncode, "stderr": out.stderr[-1000:]}
-    payload, diagnostics, error = extract_json_payload("\n".join([out.stdout or "", out.stderr or ""]))
+    """Read fresh cron evidence through the SDK or CLI-compatible fallback."""
+    payload = cron_readonly_rpc_payload("inventory")
+    if payload is not None:
+        diagnostics, error = [], None
+        transport = "gateway-sdk-read-only"
+    else:
+        transport = "cli-fallback" if _inspection_cache_enabled and CRON_READONLY_RPC_ENABLED else "cli"
+        try:
+            out = run_cmd(["openclaw", "cron", "list", "--json"], timeout=15)
+        except Exception as exc:
+            return {"available": False, "error": f"{type(exc).__name__}: {exc}", "inspectionTransport": transport}
+        if out.returncode != 0:
+            return {"available": False, "exitCode": out.returncode, "stderr": out.stderr[-1000:], "inspectionTransport": transport}
+        payload, diagnostics, error = extract_json_payload("\n".join([out.stdout or "", out.stderr or ""]))
     if payload is None:
         return {"available": False, "error": error or "json_parse_failed", "stdoutSample": out.stdout[:1000], "diagnostics": diagnostics}
     jobs = payload.get("jobs") if isinstance(payload, dict) else payload
@@ -4084,6 +4140,7 @@ def collect_cron_cli_status() -> Dict[str, Any]:
         "nonOkSamples": {key: value[:10] for key, value in samples.items()},
         "diagnostics": diagnostics,
         "parseWarning": error,
+        "inspectionTransport": transport,
     }
 
 
@@ -4296,6 +4353,7 @@ def build_cron_runtime_summary(data: Dict[str, Any], cli_status: Optional[Dict[s
 
 
 def cron_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    prepare_cron_readonly_rpc()
     cron_storage = collect_cron_storage_status()
     cli_status = collect_cron_cli_status()
     jobs = load_jobs()

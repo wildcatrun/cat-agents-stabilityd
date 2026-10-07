@@ -29,6 +29,6 @@
     "smoke:gates": "python3 scripts/smoke_policy_gates.py",
     "smoke:auth": "python3 scripts/smoke_auth_readiness.py",
     "smoke:heartbeat": "python3 scripts/smoke_heartbeat_probe.py",
-    "smoke:resources": "python3 scripts/test_inspection_cache.py && node scripts/test_codex_idle_pool.mjs"
+    "smoke:resources": "python3 scripts/test_inspection_cache.py && node scripts/test_codex_idle_pool.mjs && python3 scripts/test_cron_rpc_fallback.py && node scripts/test_gateway_cron_readonly.mjs"
   }
 }
