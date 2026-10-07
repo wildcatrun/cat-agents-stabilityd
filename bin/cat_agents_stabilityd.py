@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import copy
 import datetime as dt
 import errno
 import ctypes
@@ -118,6 +119,8 @@ ACTUATION_LOCK_PATH = STABILITY_DIR / "actuation.lock"
 COLLECTOR_OUTPUT_MAX_BYTES = 1_000_000
 COLLECTOR_BUDGET_MS = 60_000
 COLLECTOR_ENV_ALLOWLIST = frozenset({
+    "CAT_AGENTS_STABILITY_VERSION_PROBE_TTL_SECONDS", "CAT_AGENTS_STABILITY_DEEP_PROBE_TTL_SECONDS",
+    "CAT_AGENTS_STABILITY_PLUGINS_PROBE_TTL_SECONDS", "CAT_AGENTS_STABILITY_CRON_READONLY_RPC",
     "HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
     "OPENCLAW_HOME_DIR", "CAT_AGENTS_WORKFLOW_ROOT", "CAT_AGENTS_WORKFLOW_DB",
     "CAT_AGENTS_WORKFLOW_RUNTIME_AGENTS_SNAPSHOT", "CAT_AGENTS_STABILITY_DESIRED_STATE",
@@ -213,6 +216,24 @@ PORT = RUNTIME_INTEGER_SETTINGS["OPENCLAW_GATEWAY_PORT"]
 INTERVAL_SECONDS = RUNTIME_INTEGER_SETTINGS["OPENCLAW_STABILITY_INTERVAL_SECONDS"]
 STABILITYD_PROGRESS_STALE_SECONDS = max(90, INTERVAL_SECONDS * 3)
 POLICY_TTL_SECONDS = RUNTIME_INTEGER_SETTINGS["OPENCLAW_STABILITY_POLICY_TTL_SECONDS"]
+# Only daemon observations are cached; one-shot CLI/MCP diagnostics stay fresh.
+_inspection_settings = parse_integer_settings(os.environ, {
+    "CAT_AGENTS_STABILITY_VERSION_PROBE_TTL_SECONDS": 900,
+    "CAT_AGENTS_STABILITY_DEEP_PROBE_TTL_SECONDS": 120,
+    "CAT_AGENTS_STABILITY_PLUGINS_PROBE_TTL_SECONDS": 300,
+})
+INSPECTION_VERSION_TTL_SECONDS = max(0, _inspection_settings["CAT_AGENTS_STABILITY_VERSION_PROBE_TTL_SECONDS"])
+INSPECTION_DEEP_TTL_SECONDS = max(0, _inspection_settings["CAT_AGENTS_STABILITY_DEEP_PROBE_TTL_SECONDS"])
+INSPECTION_PLUGINS_TTL_SECONDS = max(0, _inspection_settings["CAT_AGENTS_STABILITY_PLUGINS_PROBE_TTL_SECONDS"])
+_inspection_cache_enabled = False
+_inspection_cache: Dict[str, Any] = {}
+_inspection_gateway_context: Tuple[int, bool] = (0, False)
+CRON_READONLY_RPC_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_CRON_READONLY_RPC", "1") == "1"
+_cron_rpc_cycle: Optional[Dict[str, Any]] = None
+_cron_rpc_retry_after = 0.0
+_INSPECTION_WORKER_ENV = "CAT_AGENTS_STABILITY_INTERNAL_INSPECTION_STATE"
+_INSPECTION_WORKER_FIELD = "_inspectionWorkerState"
+_INSPECTION_STATE_MAX_BYTES = 32768
 LOG_PRESSURE_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_LOG_PRESSURE_WINDOW_SECONDS", "900"))
 TREND_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_TREND_WINDOW_SECONDS", "1800"))
 TREND_SAMPLE_LIMIT = int(os.environ.get("OPENCLAW_STABILITY_TREND_SAMPLE_LIMIT", "240"))
@@ -941,7 +962,111 @@ def parse_openclaw_version(text: str) -> Dict[str, Any]:
     }
 
 
+def inspection_revision() -> Tuple[Any, ...]:
+    """Cheap invalidation evidence, without loading CLI/plugin code or credentials."""
+    paths = [OPENCLAW / "openclaw.json", OPENCLAW / "extensions", OPENCLAW / "plugin-dev", OPENCLAW / "npm" / "projects"]
+    command = shutil.which("openclaw")
+    if command:
+        paths.append(Path(command).resolve())
+    revisions = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            revisions.append((str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            revisions.append((str(path), None))
+    return tuple(revisions)
+
+
+def inspection_worker_state() -> Dict[str, Any]:
+    """Parent-owned ephemeral cache; never an authorization or persistent KV."""
+    now, wall = time.monotonic(), time.time()
+    state = {"enabled": _inspection_cache_enabled,
+             "context": list(_inspection_gateway_context),
+             "retryAfter": wall + max(0, _cron_rpc_retry_after - now) if _cron_rpc_retry_after else 0,
+             "cache": copy.deepcopy(_inspection_cache)}
+    # Python monotonic origins are not portable across fresh interpreters on
+    # every supported host. Transport wall coordinates, then rebase locally.
+    # A backwards clock yields a future local sample, which cannot hit the cache.
+    for entry in state["cache"].values():
+        entry["monotonic"] = wall - (now - entry["monotonic"])
+    encoded = json.dumps(state, allow_nan=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > _INSPECTION_STATE_MAX_BYTES:
+        state["cache"] = {}
+    return state
+
+
+def accept_inspection_worker_state(state: Any, component: str) -> None:
+    """Validate bounded observation state and update only its component owner."""
+    global _inspection_cache, _inspection_gateway_context, _cron_rpc_retry_after
+    if not isinstance(state, dict) or set(state) != {"enabled", "context", "retryAfter", "cache"}:
+        raise ValueError("invalid inspection state")
+    if len(json.dumps(state, allow_nan=False, separators=(",", ":")).encode("utf-8")) > _INSPECTION_STATE_MAX_BYTES:
+        raise ValueError("oversized inspection state")
+    context, retry, cache = state["context"], state["retryAfter"], state["cache"]
+    def finite_clock(value: Any) -> bool:
+        # Bound integers before conversion; malformed JSON can carry huge ints.
+        return type(value) in (int, float) and abs(value) <= 1e15 and math.isfinite(value)
+    if (type(state["enabled"]) is not bool or not isinstance(context, list) or len(context) != 2
+            or type(context[0]) is not int or context[0] < 0 or type(context[1]) is not bool
+            or not finite_clock(retry) or retry < 0
+            or not isinstance(cache, dict) or not set(cache).issubset({"version", "deep-status", "plugins"})):
+        raise ValueError("invalid inspection state fields")
+    def tuples(value: Any) -> Any:
+        return tuple(tuples(item) for item in value) if isinstance(value, list) else value
+    for entry in cache.values():
+        if (not isinstance(entry, dict) or set(entry) != {"revision", "monotonic", "checkedAtEpoch", "value"}
+                or not isinstance(entry["revision"], (list, tuple))
+                or not isinstance(entry["value"], dict)
+                or any(not finite_clock(entry[key])
+                       for key in ("monotonic", "checkedAtEpoch"))):
+            raise ValueError("invalid inspection cache entry")
+        entry["revision"] = tuples(entry["revision"])
+        entry["monotonic"] = time.monotonic() - (time.time() - entry["monotonic"])
+    if component in {"gateway", "input"}:
+        _inspection_cache = copy.deepcopy(cache)
+        _inspection_gateway_context = (context[0], context[1])
+    if component in {"cron", "input"}:
+        _cron_rpc_retry_after = time.monotonic() + min(300, max(0, retry - time.time())) if retry else 0
+
+
+def cached_inspection(name: str, loader: Any, ttl: int, *, force: bool = False) -> Dict[str, Any]:
+    """Cache successful low-frequency observations; never cache failed probes."""
+    if not _inspection_cache_enabled or ttl <= 0:
+        return loader()
+    revision = (_inspection_gateway_context[0], inspection_revision())
+    now = time.monotonic()
+    saved = _inspection_cache.get(name)
+    if not force and saved and saved["revision"] == revision and 0 <= now - saved["monotonic"] < ttl:
+        result = copy.deepcopy(saved["value"])
+        result["inspectionCache"] = {"cached": True, "checkedAtEpoch": saved["checkedAtEpoch"], "ageSeconds": round(now - saved["monotonic"], 3), "ttlSeconds": ttl}
+        return result
+    # Discard the prior success before trying: a failure must never fall back to it.
+    _inspection_cache.pop(name, None)
+    result = loader()
+    probe = result.get("probe") or {}
+    successful = result.get("available") is True or (probe.get("exitCode") == 0 and not probe.get("error"))
+    # CLI deep status can exit zero with a failed network probe; do not reuse it,
+    # except for the explicitly classified local plaintext refusal on a healthy runtime.
+    if result.get("connectivityProbeFailed") and not (result.get("insecurePlaintextWsBlocked") and result.get("runtimeState") == "running" and _inspection_gateway_context[1]):
+        successful = False
+    if name == "deep-status" and (result.get("runtimeState") != "running" or result.get("pluginVersionDrift")):
+        successful = False
+    if name == "plugins" and any(item.get("status") == "error" for item in result.get("enabledPlugins", [])):
+        successful = False
+    finished = time.monotonic()
+    checked = epoch()
+    if successful:
+        _inspection_cache[name] = {"revision": revision, "monotonic": finished, "checkedAtEpoch": checked, "value": copy.deepcopy(result)}
+    result["inspectionCache"] = {"cached": False, "checkedAtEpoch": checked, "ageSeconds": 0, "ttlSeconds": ttl}
+    return result
+
+
 def collect_openclaw_version() -> Dict[str, Any]:
+    return cached_inspection("version", _collect_openclaw_version, INSPECTION_VERSION_TTL_SECONDS)
+
+
+def _collect_openclaw_version() -> Dict[str, Any]:
     probe = command_probe(["openclaw", "--version"], timeout=8, max_chars=2000)
     version = parse_openclaw_version(str(probe.get("stdout") or probe.get("stderr") or ""))
     version["probe"] = {k: v for k, v in probe.items() if k not in {"stdout", "stderr"}}
@@ -980,6 +1105,10 @@ def parse_gateway_deep_status(text: str) -> Dict[str, Any]:
 
 
 def collect_gateway_deep_status() -> Dict[str, Any]:
+    return cached_inspection("deep-status", _collect_gateway_deep_status, INSPECTION_DEEP_TTL_SECONDS, force=not _inspection_gateway_context[1])
+
+
+def _collect_gateway_deep_status() -> Dict[str, Any]:
     probe = command_probe(["openclaw", "gateway", "status", "--deep"], timeout=18, max_chars=20_000)
     text = "\n".join(str(probe.get(key) or "") for key in ("stdout", "stderr"))
     parsed = parse_gateway_deep_status(text)
@@ -987,7 +1116,54 @@ def collect_gateway_deep_status() -> Dict[str, Any]:
     return parsed
 
 
+def prepare_cron_readonly_rpc() -> None:
+    """One fresh read-only SDK process per daemon cycle; CLI remains the fallback."""
+    global _cron_rpc_cycle, _cron_rpc_retry_after
+    _cron_rpc_cycle = None
+    if not _inspection_cache_enabled or not CRON_READONLY_RPC_ENABLED:
+        return
+    if not _inspection_gateway_context[1]:
+        return
+    if time.monotonic() < _cron_rpc_retry_after:
+        return
+    try:
+        command = shutil.which("openclaw")
+        node = shutil.which("node")
+        if not command or not node:
+            raise RuntimeError("sdk-runtime-unavailable")
+        resolved = Path(command).resolve()
+        root = next((parent for parent in resolved.parents if (parent / "package.json").is_file() and load_json(parent / "package.json", {}).get("name") == "openclaw"), None)
+        if root is None:
+            raise RuntimeError("sdk-package-unavailable")
+        proc = run_cmd([node, str(PACKAGE_ROOT / "scripts" / "gateway_cron_readonly.mjs"), str(root)], timeout=12)
+        payload, _, _ = extract_json_payload(proc.stdout)
+        if proc.returncode != 0 or not isinstance(payload, dict) or payload.get("schemaVersion") != 1 or payload.get("ok") is not True or not isinstance(payload.get("status"), dict) or not isinstance(payload.get("inventory"), dict) or not isinstance(payload["inventory"].get("jobs"), list):
+            raise RuntimeError("sdk-query-unavailable")
+        _cron_rpc_cycle = payload
+        _cron_rpc_cycle["observedMonotonic"] = time.monotonic()
+    except Exception:
+        # Failed auth/API/schema attempts must not become a per-cycle spawn storm.
+        # Every cycle still queries the full CLI freshly during this backoff.
+        _cron_rpc_retry_after = time.monotonic() + 300
+
+
+def cron_readonly_rpc_payload(key: str) -> Optional[Dict[str, Any]]:
+    if _inspection_cache_enabled and _cron_rpc_cycle and 0 <= time.monotonic() - _cron_rpc_cycle["observedMonotonic"] < 12:
+        return _cron_rpc_cycle.get(key)
+    return None
+
+
 def collect_cron_storage_status() -> Dict[str, Any]:
+    payload = cron_readonly_rpc_payload("status")
+    if payload is not None:
+        return {"available": True, "exitCode": 0, "diagnostics": [], "inspectionTransport": "gateway-sdk-read-only", **{key: payload.get(key) for key in ("enabled", "storePath", "storage", "sqlitePath", "jobs", "nextWakeAtMs")}}
+    result = _collect_cron_storage_status_cli()
+    if _inspection_cache_enabled:
+        result["inspectionTransport"] = "cli-fallback" if CRON_READONLY_RPC_ENABLED else "cli"
+    return result
+
+
+def _collect_cron_storage_status_cli() -> Dict[str, Any]:
     try:
         out = run_cmd(["openclaw", "cron", "status", "--json"], timeout=15)
     except Exception as exc:
@@ -1019,6 +1195,10 @@ def collect_cron_storage_status() -> Dict[str, Any]:
 
 
 def collect_plugins_status() -> Dict[str, Any]:
+    return cached_inspection("plugins", _collect_plugins_status, INSPECTION_PLUGINS_TTL_SECONDS, force=not _inspection_gateway_context[1])
+
+
+def _collect_plugins_status() -> Dict[str, Any]:
     try:
         out = run_cmd(["openclaw", "plugins", "list", "--json"], timeout=20)
     except Exception as exc:
@@ -2123,13 +2303,15 @@ def child_process_summary(root_pid: int) -> Dict[str, Any]:
 
 
 def gateway_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
-    version = collect_openclaw_version()
+    global _inspection_gateway_context
     service = systemctl_show_gateway()
     active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
     pid = int(service.get("MainPID") or 0)
     port_ok = tcp_ok(PORT)
     http_health = gateway_http_health(PORT, timeout=8) if port_ok else {"healthOk": False, "readyzOk": False, "ok": False}
     health_ok = bool(http_health.get("ok"))
+    _inspection_gateway_context = (pid, bool(active and port_ok and health_ok))
+    version = collect_openclaw_version()
     service_age = None
     start_epoch = parse_iso_epoch(service.get("ExecMainStartTimestamp"))
     if start_epoch:
@@ -4304,15 +4486,20 @@ def classify_cron_heartbeat(state: Dict[str, Any], timeout_ms: int) -> str:
 
 
 def collect_cron_cli_status() -> Dict[str, Any]:
-    """Read OpenClaw's computed cron status when the installed CLI exposes it."""
-    try:
-        out = run_cmd(["openclaw", "cron", "list", "--json"], timeout=15)
-    except Exception as exc:
-        return {"available": False, "error": type(exc).__name__}
-    if out.returncode != 0:
-        return {"available": False, "exitCode": out.returncode, "stderrOmitted": True,
-                "stderrByteCount": len(out.stderr or "")}
-    payload, diagnostics, error = extract_json_payload("\n".join([out.stdout or "", out.stderr or ""]))
+    """Read fresh cron evidence through the SDK or CLI-compatible fallback."""
+    payload = cron_readonly_rpc_payload("inventory")
+    if payload is not None:
+        diagnostics, error = [], None
+        transport = "gateway-sdk-read-only"
+    else:
+        transport = "cli-fallback" if _inspection_cache_enabled and CRON_READONLY_RPC_ENABLED else "cli"
+        try:
+            out = run_cmd(["openclaw", "cron", "list", "--json"], timeout=15)
+        except Exception as exc:
+            return {"available": False, "error": type(exc).__name__, "inspectionTransport": transport}
+        if out.returncode != 0:
+            return {"available": False, "exitCode": out.returncode, "stderrOmitted": True, "stderrByteCount": len(out.stderr or ""), "inspectionTransport": transport}
+        payload, diagnostics, error = extract_json_payload("\n".join([out.stdout or "", out.stderr or ""]))
     if payload is None:
         return {"available": False, "error": error or "json_parse_failed",
                 "stdoutOmitted": True, "stdoutByteCount": len(out.stdout or ""), "diagnostics": diagnostics}
@@ -4363,6 +4550,7 @@ def collect_cron_cli_status() -> Dict[str, Any]:
         "nonOkSamples": {key: value[:10] for key, value in samples.items()},
         "diagnostics": diagnostics,
         "parseWarning": error,
+        "inspectionTransport": transport,
     }
 
 
@@ -4575,6 +4763,7 @@ def build_cron_runtime_summary(data: Dict[str, Any], cli_status: Optional[Dict[s
 
 
 def cron_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    prepare_cron_readonly_rpc()
     cron_storage = collect_cron_storage_status()
     cli_status = collect_cron_cli_status()
     jobs = load_jobs()
@@ -8749,6 +8938,7 @@ def _encode_component_probe_result(
 
 def _component_probe_worker(argv: List[str]) -> int:
     """Fresh-interpreter entry point. Only fixed read-only collectors are selectable."""
+    global _inspection_cache_enabled
     if len(argv) != 2 or argv[0] not in _COMPONENT_PROBE_NAMES:
         return 2
     name, raw_profiles = argv
@@ -8759,6 +8949,13 @@ def _component_probe_worker(argv: List[str]) -> int:
             return 2
         if not install_component_probe_parent_death_guard(expected_parent_pid):
             return 2
+        raw_inspection = os.environ.get(_INSPECTION_WORKER_ENV)
+        if raw_inspection is not None:
+            if name not in {"gateway", "cron"} or len(raw_inspection.encode("utf-8")) > _INSPECTION_STATE_MAX_BYTES:
+                return 2
+            inspection = json.loads(raw_inspection)
+            accept_inspection_worker_state(inspection, "input")
+            _inspection_cache_enabled = inspection["enabled"]
         hermers_profiles = json.loads(raw_profiles)
         if (not isinstance(hermers_profiles, list) or len(hermers_profiles) > 512
                 or any(not isinstance(item, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", item) is None
@@ -8772,6 +8969,8 @@ def _component_probe_worker(argv: List[str]) -> int:
         try:
             with open(os.devnull, "w", encoding="utf-8") as sink, contextlib.redirect_stdout(sink):
                 data = _run_component_collector(name, conn, findings, hermers_profiles, cache_updates)
+            if raw_inspection is not None and isinstance(data, dict):
+                data[_INSPECTION_WORKER_FIELD] = inspection_worker_state()
             if not isinstance(data, dict) or any(
                 not isinstance(item, dict)
                 or any(not isinstance(item.get(field), str) for field in ("key", "severity", "component", "message"))
@@ -8820,6 +9019,7 @@ def collect_snapshot(
     worker_env = collector_worker_environment() if component_probe_runner is None else {}
 
     def collect_component(name: str, fallback: Dict[str, Any], hermers_profiles: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+        global _inspection_gateway_context, _cron_rpc_retry_after
         nonlocal collector_failed
         if snapshot.get("collectorFatal"):
             collector_failed = True
@@ -8839,6 +9039,9 @@ def collect_snapshot(
             json.dumps(requested_profiles, ensure_ascii=False, separators=(",", ":")),
         ]
         child_env = dict(worker_env)
+        if _inspection_cache_enabled and name in {"gateway", "cron"}:
+            child_env[_INSPECTION_WORKER_ENV] = json.dumps(
+                inspection_worker_state(), allow_nan=False, separators=(",", ":"))
         if component_probe_runner is None:
             child_env[_COMPONENT_PROBE_PARENT_PID_ENV] = str(os.getpid())
         result = runner(
@@ -8847,6 +9050,23 @@ def collect_snapshot(
             env=child_env,
         )
         probes[name] = result["probe"]
+        if _inspection_cache_enabled and name in {"gateway", "cron"}:
+            returned_state = result.get("data", {}).pop(_INSPECTION_WORKER_FIELD, None)
+            try:
+                if result["probe"]["status"] != "ok":
+                    raise ValueError("inspection worker failed")
+                accept_inspection_worker_state(returned_state, name)
+            except (ValueError, TypeError):
+                # No previous healthy context survives an incomplete gateway cycle.
+                if name == "gateway":
+                    _inspection_cache.clear()
+                    _inspection_gateway_context = (0, False)
+                else:
+                    _cron_rpc_retry_after = time.monotonic() + 300
+                if result["probe"]["status"] == "ok":
+                    result["probe"].update({"status": "error", "coverage": False,
+                                           "errorClass": "InvalidInspectionWorkerState"})
+                    result["data"] = dict(fallback)
         if (result["probe"].get("fatal") is True
                 or result["probe"].get("noLiveGroupMemberObserved") is False):
             snapshot["collectorFatal"] = True
@@ -8880,6 +9100,11 @@ def collect_snapshot(
         else:
             collector_failed = True
         if result["probe"]["status"] != "ok":
+            if _inspection_cache_enabled and name == "gateway":
+                _inspection_cache.clear()
+                _inspection_gateway_context = (0, False)
+            elif _inspection_cache_enabled and name == "cron":
+                _cron_rpc_retry_after = time.monotonic() + 300
             add_finding(
                 findings,
                 f"stability_collector_{name}_probe_failed",
@@ -9081,6 +9306,7 @@ class DaemonLoopEvidenceWriteFailure(RuntimeError):
 
 
 def daemon_loop(no_action: bool = False) -> int:
+    global _inspection_cache_enabled
     ensure_dirs()
     lock_fh = LOCK_PATH.open("a+", encoding="utf-8")
     try:
@@ -9101,6 +9327,7 @@ def daemon_loop(no_action: bool = False) -> int:
         signal.signal(signal.SIGINT, handle_signal)
 
         conn = init_db()
+        _inspection_cache_enabled = True
         log_line(f"daemon started interval={INTERVAL_SECONDS}s no_action={no_action}")
         while not stopping["value"]:
             started = time.time()

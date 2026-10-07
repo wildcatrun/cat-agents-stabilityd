@@ -1,0 +1,32 @@
+import assert from 'node:assert/strict';
+import {enrichCronStatus,readCompleteCronInventory} from './gateway_cron_readonly.mjs';
+const job=(id,state={},enabled=true)=>({id,enabled,state});
+const page=(jobs,offset=0,total=jobs.length,revision='v1',next=null)=>({jobs,offset,total,snapshotRevision:revision,limit:200,hasMore:next!==null,nextOffset:next});
+assert.equal(enrichCronStatus(job('a',{runningAtMs:123,lastStatus:'error'},false)).status,'running');
+assert.equal(enrichCronStatus(job('a',{},false)).status,'disabled');
+assert.equal(enrichCronStatus(job('a',{lastRunStatus:'ok',lastStatus:'error'})).status,'ok');
+assert.equal(enrichCronStatus(job('a',{lastStatus:'error'})).status,'error');
+assert.equal(enrichCronStatus(job('a')).status,'idle');
+const seen=[];
+const complete=await readCompleteCronInventory(async(method,p)=> {
+  assert.equal(method,'cron.list');assert.equal(p.includeDisabled,false);seen.push(p.offset);
+  return p.offset===0?page([job('a')],0,2,'v1',1):page([job('b',{runningAtMs:100})],1,2,'v1');
+});
+assert.deepEqual(seen,[0,1]);assert.equal(complete.jobs.length,2);assert.equal(complete.jobs[1].status,'running');
+let reads=0;
+const restarted=await readCompleteCronInventory(async(_method,p)=> {
+  reads++;
+  if(reads===1)return page([job('a')],0,2,'old',1);
+  if(reads===2)return page([job('b')],1,2,'new');
+  return page([job('a'),job('b')],0,2,'new');
+});
+assert.equal(reads,3);assert.equal(restarted.snapshotRevision,'new');
+await assert.rejects(readCompleteCronInventory(async()=>page([job('a')],0,1,'v1',0)),/nonadvancing/);
+await assert.rejects(readCompleteCronInventory(async()=>page([job('a')],0,2,'v1')),/incomplete/);
+await assert.rejects(readCompleteCronInventory(async()=>page([job('a'),job('a')],0,2,'v1')),/incomplete/);
+await assert.rejects(readCompleteCronInventory(async()=>({jobs:[job('a')]})),/invalid/);
+await assert.rejects(readCompleteCronInventory(async()=>page([{id:'a'}])),/invalid-job/);
+let unstable=0;
+await assert.rejects(readCompleteCronInventory(async(_method,p)=>p.offset===0?page([job('a')],0,2,String(unstable++),1):page([job('b')],1,2,String(unstable++))),/unstable/);
+assert.equal((await readCompleteCronInventory(async()=>page([]))).jobs.length,0);
+console.log(JSON.stringify({passed:true,checks:['CLI status priority compatibility','fresh complete multi-page inventory','snapshot change restarts','nonadvancing pagination rejected','incomplete inventory rejected','duplicate jobs rejected','legacy schema triggers fallback','invalid job rejected','unstable inventory bounded','valid empty inventory']}));

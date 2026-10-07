@@ -56,7 +56,7 @@ class ShadowComparison:
 
 
 def _semver(value: Any) -> tuple[int, int, int] | None:
-    match = SEMVER_RE.fullmatch(value) if isinstance(value, str) else None
+    match = SEMVER_RE.fullmatch(value) if isinstance(value, str) and len(value) <= 96 else None
     return tuple(int(match.group(i)) for i in (1, 2, 3)) if match else None
 
 
@@ -71,9 +71,9 @@ def qualify_release(evidence: ReleaseEvidence) -> ReleaseDecision:
         reasons.append("version-unparseable")
     elif candidate <= installed:
         reasons.append("candidate-version-not-forward")
-    if not COMMIT_RE.fullmatch(evidence.installed_commit or ""):
+    if not isinstance(evidence.installed_commit, str) or not COMMIT_RE.fullmatch(evidence.installed_commit):
         reasons.append("installed-commit-unknown")
-    if not COMMIT_RE.fullmatch(evidence.candidate_commit or ""):
+    if not isinstance(evidence.candidate_commit, str) or not COMMIT_RE.fullmatch(evidence.candidate_commit):
         reasons.append("candidate-commit-unpinned")
     if evidence.candidate_commit == evidence.installed_commit:
         reasons.append("candidate-commit-not-distinct")
@@ -91,9 +91,9 @@ def qualify_release(evidence: ReleaseEvidence) -> ReleaseDecision:
         reasons.append("candidate-commit-not-pinned")
     if evidence.loaded_generation_verified is not True:
         reasons.append("loaded-generation-unverified")
-    if not SHA256_RE.fullmatch(evidence.artifact_sha256 or ""):
+    if not isinstance(evidence.artifact_sha256, str) or not SHA256_RE.fullmatch(evidence.artifact_sha256):
         reasons.append("candidate-artifact-digest-invalid")
-    if not SHA256_RE.fullmatch(evidence.previous_artifact_sha256 or ""):
+    if not isinstance(evidence.previous_artifact_sha256, str) or not SHA256_RE.fullmatch(evidence.previous_artifact_sha256):
         reasons.append("rollback-artifact-digest-invalid")
     if evidence.artifact_sha256 and evidence.artifact_sha256 == evidence.previous_artifact_sha256:
         reasons.append("candidate-artifact-not-distinct")

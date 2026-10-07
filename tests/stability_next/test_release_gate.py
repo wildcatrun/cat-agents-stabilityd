@@ -67,6 +67,17 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertIn("loaded-commit-does-not-match-candidate", decision.reasons)
         self.assertIn("loaded-generation-does-not-match-candidate", decision.reasons)
 
+    def test_malformed_release_identity_blocks_without_parser_exception(self):
+        fields = ("installed_commit", "candidate_commit", "artifact_sha256", "previous_artifact_sha256")
+        for field in fields:
+            for value in (42, True, [], {}, b"candidate", None):
+                with self.subTest(field=field, value_type=type(value).__name__):
+                    decision = qualify_release(dataclasses.replace(self.evidence(), **{field: value}))
+                    self.assertEqual(decision.status, "blocked")
+                    self.assertFalse(decision.activation_authorized)
+        decision = qualify_release(dataclasses.replace(self.evidence(), candidate_version="9" * 5000 + ".0.0"))
+        self.assertIn("version-unparseable", decision.reasons)
+
     def test_existing_critical_is_not_a_new_regression(self):
         result = compare_shadow_results(self.shadow(), self.shadow(durationMs=1100))
         self.assertEqual(result.status, "comparable")
