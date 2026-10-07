@@ -28,6 +28,7 @@
     "smoke:hermers": "python3 hermers/hermers_stability_probe.py",
     "smoke:gates": "python3 scripts/smoke_policy_gates.py",
     "smoke:auth": "python3 scripts/smoke_auth_readiness.py",
-    "smoke:heartbeat": "python3 scripts/smoke_heartbeat_probe.py"
+    "smoke:heartbeat": "python3 scripts/smoke_heartbeat_probe.py",
+    "smoke:resources": "python3 scripts/test_inspection_cache.py && node scripts/test_codex_idle_pool.mjs"
   }
 }

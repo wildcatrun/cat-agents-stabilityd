@@ -1,0 +1,42 @@
+import assert from 'node:assert/strict';
+import { inspectIdlePoolEntry, sweepIdlePool } from '../patches/codex-pool-2026.9.7/idle-pool.mjs';
+const now = 1000000;
+const policy = { ttlMs:300000, graceMs:60000, maxIdle:1 };
+let nextPid = 100;
+function fixture(extra = {}) {
+  const client = { child:{pid:nextPid++}, closed:false };
+  return { key:Symbol(), client, activeLeases:0, pendingAcquires:0, poolLastUseAt:now-400000, poolIdleGuard:()=>({safe:true}), ...extra };
+}
+const lease = fixture({activeLeases:1});
+const acquire = fixture({pendingAcquires:1});
+const bound = fixture({poolArtifactBound:true});
+const unknown = fixture({poolIdleGuard:undefined});
+const pending = fixture({poolIdleGuard:()=>({safe:false,reason:'pending-rpc-or-decode'})});
+const retained = fixture({poolIdleGuard:()=>({safe:false,reason:'thread-or-workspace-binding'})});
+const native = fixture({poolIdleGuard:()=>({safe:false,reason:'native-work-continuity'})});
+const missingAge = fixture({poolLastUseAt:undefined});
+const young = fixture({poolLastUseAt:now-1000});
+const idle = fixture();
+const entries = [lease,acquire,bound,unknown,pending,retained,native,missingAge,young,idle];
+const state = {clients:new Map(entries.map(e=>[e.key,e]))};
+const retire = client => {
+  const entry=[...state.clients.values()].find(e=>e.client===client);
+  assert.equal(inspectIdlePoolEntry(entry,now).safe,true);
+  state.clients.delete(entry.key); client.closed=true;
+  return {closed:true};
+};
+const result = sweepIdlePool(state,retire,policy,now);
+assert.deepEqual(result.retiredPids,[idle.client.child.pid]);
+assert.equal(state.clients.size,9);
+assert(!JSON.stringify(result).includes('key'));
+const old = fixture({poolLastUseAt:now-90000});
+const newer = fixture({poolLastUseAt:now-70000});
+const capacity={clients:new Map([old,newer].map(e=>[e.key,e]))};
+const capacityResult = sweepIdlePool(capacity,client=>{const e=[...capacity.clients.values()].find(x=>x.client===client);capacity.clients.delete(e.key);return {closed:true};},policy,now);
+assert.deepEqual(capacityResult.retiredPids,[old.client.child.pid]);
+assert.equal(capacity.clients.size,1);
+assert.equal(sweepIdlePool(capacity,()=>{throw Error('disabled sweep invoked');},{...policy,ttlMs:0},now).retiredPids.length,0);
+assert.equal(inspectIdlePoolEntry(fixture({poolLastUseAt:now+1}),now).safe,false);
+assert.equal(inspectIdlePoolEntry(fixture({activeLeases:-1}),now).safe,false);
+assert.equal(inspectIdlePoolEntry(fixture({client:{}}),now).reason,'nonlocal-transport');
+console.log(JSON.stringify({passed:true,checks:['active/acquire leases protected','artifact binding protected','RPC/thread/native guards','unknown state fail closed','young client grace','expired idle retirement','oldest eligible capacity eviction','TTL zero rollback','clock rollback','invalid counters','local transports only','secret-free summary']}));

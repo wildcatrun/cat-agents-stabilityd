@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import copy
 import datetime as dt
 import errno
 import fcntl
@@ -113,6 +114,13 @@ GATEWAY_ERR_LOG = LOG_DIR / "gateway.err.log"
 PORT = int(os.environ.get("OPENCLAW_GATEWAY_PORT", "23466"))
 INTERVAL_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_INTERVAL_SECONDS", "30"))
 POLICY_TTL_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_POLICY_TTL_SECONDS", "180"))
+# Only daemon observations are cached; one-shot CLI/MCP diagnostics stay fresh.
+INSPECTION_VERSION_TTL_SECONDS = max(0, int(os.environ.get("CAT_AGENTS_STABILITY_VERSION_PROBE_TTL_SECONDS", "900")))
+INSPECTION_DEEP_TTL_SECONDS = max(0, int(os.environ.get("CAT_AGENTS_STABILITY_DEEP_PROBE_TTL_SECONDS", "120")))
+INSPECTION_PLUGINS_TTL_SECONDS = max(0, int(os.environ.get("CAT_AGENTS_STABILITY_PLUGINS_PROBE_TTL_SECONDS", "300")))
+_inspection_cache_enabled = False
+_inspection_cache: Dict[str, Any] = {}
+_inspection_gateway_context: Tuple[int, bool] = (0, False)
 LOG_PRESSURE_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_LOG_PRESSURE_WINDOW_SECONDS", "900"))
 TREND_WINDOW_SECONDS = int(os.environ.get("OPENCLAW_STABILITY_TREND_WINDOW_SECONDS", "1800"))
 TREND_SAMPLE_LIMIT = int(os.environ.get("OPENCLAW_STABILITY_TREND_SAMPLE_LIMIT", "240"))
@@ -839,7 +847,59 @@ def parse_openclaw_version(text: str) -> Dict[str, Any]:
     }
 
 
+def inspection_revision() -> Tuple[Any, ...]:
+    """Cheap invalidation evidence, without loading CLI/plugin code or credentials."""
+    paths = [OPENCLAW / "openclaw.json", OPENCLAW / "extensions", OPENCLAW / "plugin-dev", OPENCLAW / "npm" / "projects"]
+    command = shutil.which("openclaw")
+    if command:
+        paths.append(Path(command).resolve())
+    revisions = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            revisions.append((str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            revisions.append((str(path), None))
+    return tuple(revisions)
+
+
+def cached_inspection(name: str, loader: Any, ttl: int, *, force: bool = False) -> Dict[str, Any]:
+    """Cache successful low-frequency observations; never cache failed probes."""
+    if not _inspection_cache_enabled or ttl <= 0:
+        return loader()
+    revision = (_inspection_gateway_context[0], inspection_revision())
+    now = time.monotonic()
+    saved = _inspection_cache.get(name)
+    if not force and saved and saved["revision"] == revision and 0 <= now - saved["monotonic"] < ttl:
+        result = copy.deepcopy(saved["value"])
+        result["inspectionCache"] = {"cached": True, "checkedAtEpoch": saved["checkedAtEpoch"], "ageSeconds": round(now - saved["monotonic"], 3), "ttlSeconds": ttl}
+        return result
+    # Discard the prior success before trying: a failure must never fall back to it.
+    _inspection_cache.pop(name, None)
+    result = loader()
+    probe = result.get("probe") or {}
+    successful = result.get("available") is True or (probe.get("exitCode") == 0 and not probe.get("error"))
+    # CLI deep status can exit zero with a failed network probe; do not reuse it,
+    # except for the explicitly classified local plaintext refusal on a healthy runtime.
+    if result.get("connectivityProbeFailed") and not (result.get("insecurePlaintextWsBlocked") and result.get("runtimeState") == "running" and _inspection_gateway_context[1]):
+        successful = False
+    if name == "deep-status" and (result.get("runtimeState") != "running" or result.get("pluginVersionDrift")):
+        successful = False
+    if name == "plugins" and any(item.get("status") == "error" for item in result.get("enabledPlugins", [])):
+        successful = False
+    finished = time.monotonic()
+    checked = epoch()
+    if successful:
+        _inspection_cache[name] = {"revision": revision, "monotonic": finished, "checkedAtEpoch": checked, "value": copy.deepcopy(result)}
+    result["inspectionCache"] = {"cached": False, "checkedAtEpoch": checked, "ageSeconds": 0, "ttlSeconds": ttl}
+    return result
+
+
 def collect_openclaw_version() -> Dict[str, Any]:
+    return cached_inspection("version", _collect_openclaw_version, INSPECTION_VERSION_TTL_SECONDS)
+
+
+def _collect_openclaw_version() -> Dict[str, Any]:
     probe = command_probe(["openclaw", "--version"], timeout=8, max_chars=2000)
     version = parse_openclaw_version(str(probe.get("stdout") or probe.get("stderr") or ""))
     version["probe"] = {k: v for k, v in probe.items() if k not in {"stdout", "stderr"}}
@@ -878,6 +938,10 @@ def parse_gateway_deep_status(text: str) -> Dict[str, Any]:
 
 
 def collect_gateway_deep_status() -> Dict[str, Any]:
+    return cached_inspection("deep-status", _collect_gateway_deep_status, INSPECTION_DEEP_TTL_SECONDS, force=not _inspection_gateway_context[1])
+
+
+def _collect_gateway_deep_status() -> Dict[str, Any]:
     probe = command_probe(["openclaw", "gateway", "status", "--deep"], timeout=18, max_chars=20_000)
     text = "\n".join(str(probe.get(key) or "") for key in ("stdout", "stderr"))
     parsed = parse_gateway_deep_status(text)
@@ -916,6 +980,10 @@ def collect_cron_storage_status() -> Dict[str, Any]:
 
 
 def collect_plugins_status() -> Dict[str, Any]:
+    return cached_inspection("plugins", _collect_plugins_status, INSPECTION_PLUGINS_TTL_SECONDS, force=not _inspection_gateway_context[1])
+
+
+def _collect_plugins_status() -> Dict[str, Any]:
     try:
         out = run_cmd(["openclaw", "plugins", "list", "--json"], timeout=20)
     except Exception as exc:
@@ -1838,13 +1906,15 @@ def child_process_summary(root_pid: int) -> Dict[str, Any]:
 
 
 def gateway_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
-    version = collect_openclaw_version()
+    global _inspection_gateway_context
     service = systemctl_show_gateway()
     active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
     pid = int(service.get("MainPID") or 0)
     port_ok = tcp_ok(PORT)
     http_health = gateway_http_health(PORT, timeout=8) if port_ok else {"healthOk": False, "readyzOk": False, "ok": False}
     health_ok = bool(http_health.get("ok"))
+    _inspection_gateway_context = (pid, bool(active and port_ok and health_ok))
+    version = collect_openclaw_version()
     service_age = None
     start_epoch = parse_iso_epoch(service.get("ExecMainStartTimestamp"))
     if start_epoch:
@@ -7107,6 +7177,7 @@ class StopSignal(Exception):
 
 
 def daemon_loop(no_action: bool = False) -> int:
+    global _inspection_cache_enabled
     ensure_dirs()
     lock_fh = LOCK_PATH.open("a+", encoding="utf-8")
     try:
@@ -7126,6 +7197,7 @@ def daemon_loop(no_action: bool = False) -> int:
     signal.signal(signal.SIGINT, handle_signal)
 
     conn = init_db()
+    _inspection_cache_enabled = True
     log_line(f"daemon started interval={INTERVAL_SECONDS}s no_action={no_action}")
     while not stopping["value"]:
         started = time.time()
