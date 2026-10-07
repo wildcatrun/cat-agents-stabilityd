@@ -10,6 +10,22 @@ from stability_core.preflight_recovery import (
 
 
 class PreflightRecoveryTests(unittest.TestCase):
+    def test_readonly_reader_sees_committed_wal_without_changing_durable_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.db'
+            with ActionLedger(path) as ledger:
+                ledger.plan_action(idempotency_key='wal-visible', action_type='fixture',
+                                   target='fixture-host', generation='fixture-generation',
+                                   input_data={'synthetic': True})
+                wal = Path(str(path) + '-wal')
+                self.assertGreater(wal.stat().st_size, 32)
+                before = (path.read_bytes(), wal.read_bytes())
+                loaded = load_action_ledger_readonly(path)
+                self.assertEqual(loaded['status'], 'available')
+                self.assertEqual(loaded['counts']['planned'], 1)
+                self.assertEqual(len(loaded['records']), 1)
+                self.assertEqual(before, (path.read_bytes(), wal.read_bytes()))
+
     def test_preflight_generation_mismatch_and_stale_evidence_block_review(self):
         result = build_preflight_summary(
             {"generationId": "g2", "completedAt": "2026-10-05T00:00:00Z", "severity": "low"},
@@ -60,12 +76,15 @@ class PreflightRecoveryTests(unittest.TestCase):
                 ledger.transition(executing.action_id, expected_state="executing", expected_version=1,
                                   new_state="uncertain")
             # SQLite may update transient WAL shared-memory lock marks while
-            # opening a read-only reader; persistent DB/WAL content must stay stable.
+            # opening a read-only reader, and SQLite versions may create an
+            # empty WAL. Persistent DB and nonempty WAL bytes must stay stable.
             before = {item.name: item.read_bytes() for item in Path(directory).iterdir()
-                      if item.is_file() and not item.name.endswith("-shm")}
+                      if item.is_file() and not item.name.endswith("-shm")
+                      and not (item.name.endswith("-wal") and item.stat().st_size == 0)}
             loaded = load_action_ledger_readonly(path, limit=10)
             after = {item.name: item.read_bytes() for item in Path(directory).iterdir()
-                     if item.is_file() and not item.name.endswith("-shm")}
+                     if item.is_file() and not item.name.endswith("-shm")
+                     and not (item.name.endswith("-wal") and item.stat().st_size == 0)}
             summary = build_recovery_summary(
                 loaded["records"], ledger_status=loaded["status"], limit=10,
                 ledger_counts=loaded.get("counts"), total_candidate_count=loaded.get("candidateCount"),

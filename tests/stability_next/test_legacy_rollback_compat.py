@@ -3,12 +3,16 @@ import ast
 import hashlib
 import json
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List
 
 from stability_core.action_ledger import ActionConflict, ActionLedger
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from compat_verifiers.ast_compat import canonical_ast_dump
 
 FIXTURE = Path(__file__).resolve().parents[1] / 'fixtures/compat/legacy_rollback_symbols_v1.json'
 BASELINE = 'ece4157a38cc60dfbedc0268ca296f7775a956f0'
@@ -33,8 +37,8 @@ def load_legacy(fixture, path, *, source=None):
         pinned = fixture['symbols'][name]
         if hashlib.sha256(pinned['source'].encode()).hexdigest() != pinned['sourceSha256']:
             raise ValueError('source identity mismatch')
-        expected = hashlib.sha256(ast.dump(ast.parse(pinned['source']), include_attributes=False).encode()).hexdigest()
-        actual = hashlib.sha256(ast.dump(ast.Module(body=[node], type_ignores=[]), include_attributes=False).encode()).hexdigest()
+        expected = hashlib.sha256(canonical_ast_dump(ast.parse(pinned['source'])).encode()).hexdigest()
+        actual = hashlib.sha256(canonical_ast_dump(ast.Module(body=[node], type_ignores=[])).encode()).hexdigest()
         if expected != pinned['astSha256'] or actual != expected:
             raise ValueError('selected symbol drift')
         selected.append(node)

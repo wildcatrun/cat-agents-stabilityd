@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from compat_verifiers.ast_compat import canonical_ast_dump
 
 from stability_core.action_classes import classify_commands
 from stability_core.config import (
@@ -371,7 +373,7 @@ class PolicyCliGoldenTests(unittest.TestCase):
         ]
         self.assertEqual(len(functions), 1)
         current_hash = hashlib.sha256(
-            ast.dump(functions[0], include_attributes=False).encode("utf-8")
+            canonical_ast_dump(functions[0]).encode("utf-8")
         ).hexdigest()
         self.assertEqual(current_hash, config_fixture["recentRestartHistoryFunctionSha256"])
 
