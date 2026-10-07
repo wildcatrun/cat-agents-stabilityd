@@ -34,6 +34,10 @@ def make_jwt(exp: int, iat: int | None = None) -> str:
 
 def load_stabilityd(tmp: str):
     os.environ["OPENCLAW_HOME_DIR"] = tmp
+    # The smoke owns its synthetic credential fixture even when the caller
+    # supplies explicit runtime paths. Never read the caller's actual auth.
+    os.environ["CAT_AGENTS_STABILITY_CODEX_HOME"] = str(Path(tmp) / ".codex")
+    os.environ["CAT_AGENTS_STABILITY_CODEX_AUTH_PATH"] = str(Path(tmp) / ".codex" / "auth.json")
     os.environ["CAT_AGENTS_WORKFLOW_DB"] = str(Path(tmp) / "missing-tracking.db")
     os.environ["CAT_AGENTS_STABILITY_AUTH_OPENCLAW_AGENT_IDS"] = "main"
     module_path = Path(__file__).resolve().parents[1] / "bin" / "cat_agents_stabilityd.py"
