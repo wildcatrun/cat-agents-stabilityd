@@ -179,7 +179,33 @@ def lanes(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def nodes(args: dict[str, Any]) -> dict[str, Any]:
-    return stability_call({**args, "action": "nodes"})
+    source = str(args.get("source") or "remote").strip()
+    if source == "local":
+        return stability_call({**args, "action": "nodes"})
+    if source != "remote":
+        raise ValueError("source must be local or remote")
+    # This operation has a fixed read-only scope. Request/environment host or
+    # command overrides used by legacy CLI transport do not grant that scope.
+    root = str(Path(__file__).resolve().parents[1])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from stability_core.node_inventory import evaluate_inventory
+    from stability_core.node_transport_contract import collect_dev_metadata, is_trusted_observation
+    observation = collect_dev_metadata()
+    accepted = is_trusted_observation(observation)
+    report = evaluate_inventory(
+        [observation] if accepted else [],
+        now_epoch=dt.datetime.now(dt.timezone.utc).timestamp(),
+    )
+    if not accepted:
+        report["transportFailure"] = {
+            "nodeId": "dev-server", "reason": observation.reason,
+            "scope": "fixed-dev-readonly-metadata",
+        }
+    result = {"ok": accepted, "returncode": 0 if accepted else 1,
+              "stdout": json.dumps(report, ensure_ascii=False, sort_keys=True), "stderr": ""}
+    audit({"event": "stability_call", "source": source, "action": "nodes", "ok": accepted})
+    return {"source": source, "action": "nodes", "result": result, "json": report}
 
 
 def surfaces(args: dict[str, Any]) -> dict[str, Any]:
@@ -283,7 +309,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
     },
     "stability_nodes": {
-        "description": "Return offline-first node inventory, freshness, service coverage and explicit prohibited-scope states. It performs no remote probes.",
+        "description": "Return node inventory and freshness. Remote source reads fixed authenticated dev-server host metadata; service readiness remains unknown without evidence. Local source retains offline fixtures; production is excluded.",
         "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
     },
     "stability_surfaces": {

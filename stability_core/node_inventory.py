@@ -1,8 +1,8 @@
 """Offline-first multi-node inventory and observation freshness contracts.
 
 This module deliberately has no SSH, socket, subprocess, service-control, or
-credential capability. Runtime-specific collectors may supply bounded,
-read-only observations later; production/trading entries stay fixture-only.
+credential capability. The fixed transport adapter may supply authenticated
+host metadata; missing runtime readiness stays unknown. Production is excluded.
 """
 
 from __future__ import annotations
@@ -65,7 +65,9 @@ _REASON_CODES = frozenset({"observed", "network-unreachable", "dependency-missin
 def _epoch(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)) and math.isfinite(value):
+    if isinstance(value, (int, float)):
+        if abs(value) > 1e12 or not math.isfinite(value):
+            return None
         return float(value)
     if not isinstance(value, str):
         return None
@@ -79,15 +81,25 @@ def _epoch(value: Any) -> float | None:
 
 
 def evaluate_inventory(
-    observations: Iterable[Mapping[str, Any]], *, now_epoch: float,
+    observations: Iterable[Any], *, now_epoch: float,
     max_age_seconds: int = 300, max_future_skew_seconds: int = 30,
     max_clock_skew_seconds: int = 300,
 ) -> dict[str, Any]:
     """Join explicit observations to the fixed inventory; missing stays unknown."""
     seen: dict[str, Mapping[str, Any]] = {}
+    trusted: dict[str, Any] = {}
     duplicate_ids: set[str] = set()
     rejected: list[str] = []
     for observation in observations:
+        from .node_transport_contract import is_trusted_observation
+        if is_trusted_observation(observation):
+            node_id = "dev-server"
+            if node_id in seen:
+                duplicate_ids.add(node_id)
+            else:
+                seen[node_id] = {}
+                trusted[node_id] = observation
+            continue
         if not isinstance(observation, Mapping):
             rejected.append("observation-not-object")
             continue
@@ -135,6 +147,24 @@ def evaluate_inventory(
             )
         elif descriptor.node_id in duplicate_ids:
             result.update(state="unknown", reason="duplicate-observation", coverageStatus="invalid")
+        elif descriptor.node_id in trusted:
+            from .node_transport_contract import trusted_summary
+            summary = trusted_summary(
+                trusted[descriptor.node_id], now_epoch=now_epoch,
+                max_age_seconds=max_age_seconds,
+                max_future_skew_seconds=max_future_skew_seconds,
+                max_clock_skew_seconds=max_clock_skew_seconds,
+            )
+            # Authenticated host metadata cannot establish runtime readiness.
+            result.update(
+                state="unknown", reason="runtime-readiness-not-observed",
+                coverageStatus=("partial" if summary.get("coverageStatus") in {"partial", "metadata-only"}
+                                else summary.get("coverageStatus", "invalid")),
+                serviceCoverageComplete=False,
+                transportEvidence=summary,
+            )
+            if summary.get("coverageStatus") not in {"partial", "metadata-only"}:
+                result["reason"] = summary.get("reason", "invalid-transport-evidence")
         elif observation is not None:
             observed_at = _epoch(observation.get("observedAt"))
             received_at = _epoch(observation.get("receivedAt"))
@@ -216,6 +246,7 @@ def evaluate_inventory(
             "stale": sum(1 for item in results if item.get("coverageStatus") == "stale"),
             "invalid": sum(1 for item in results if item.get("coverageStatus") == "invalid"),
             "fixtures": sum(1 for item in results if item.get("coverageStatus") == "fixture"),
+            "partial": sum(1 for item in results if item.get("coverageStatus") == "partial"),
             "prohibited": sum(1 for item in results if item.get("coverageStatus") == "prohibited"),
             "unknown": sum(1 for item in results if item.get("state") == "unknown" and item.get("coverageStatus") != "prohibited"),
             "expectedServices": sum(len(item.expected_services) for item in NODES if not item.fixture_only),

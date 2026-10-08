@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "3f742b490fc4fa67d15727668d5c720b6034631d",
+  "candidateCommit": "a167d874c320b192855b42e680b9bced9de7ac70",
+  "boundary": "selected hash-pinned pure policy functions; synthetic configuration, time, histories and recovery; no collector/actuator/module body",
+  "pins": {
+    "baseline": {
+      "sourceSha256": "8812067097c07b49bb778dd54dc7d367b9fa52c8c7f96380c2a84c213f0188c5",
+      "functions": {
+        "max_severity": "888d3f29e901da76e93cab0e3288b526385b6635c69af0560e159fb90c3377cb",
+        "resource_pressure_active": "7b273e61dc2a698846e31126cc9d95433b4078ecce551573a81bace2319baca7",
+        "auth_finding_is_pressure": "81a06c7109ad826ad91ed4b01d1ba1d3f86eaa4ca06d6710fc102018d8ad2e97",
+        "hot": "18e667f832e979b3e25b701477912336ee5c811b2f6f01330cd1c586aaabf1e8",
+        "sustained": "f23b77b2c54813093f2f58ac241038df0371c89ffbb3fc1a554ca877d397cfb5",
+        "build_lane_policy": "29bd8b61a8ff78909dda26cc6f16117e4ae6123e991cdd19abe70308bcd2d079",
+        "policy_from_findings": "5cdfefe92056d985c63f36ccb5f940d19d09c6e0de9726e6b3dade730dcd4135",
+        "build_repair_gate_from_policy": "f8de589254290cf855f5ec908f22ca2af10e879a2a98a564e5d95d2a90b0700e"
+      }
+    },
+    "candidate": {
+      "sourceSha256": "28456ff913e70c8da4edf930f416bee6272992f3e7e596c8477269b75021931f",
+      "functions": {
+        "max_severity": "888d3f29e901da76e93cab0e3288b526385b6635c69af0560e159fb90c3377cb",
+        "resource_pressure_active": "7b273e61dc2a698846e31126cc9d95433b4078ecce551573a81bace2319baca7",
+        "auth_finding_is_pressure": "81a06c7109ad826ad91ed4b01d1ba1d3f86eaa4ca06d6710fc102018d8ad2e97",
+        "hot": "18e667f832e979b3e25b701477912336ee5c811b2f6f01330cd1c586aaabf1e8",
+        "sustained": "f23b77b2c54813093f2f58ac241038df0371c89ffbb3fc1a554ca877d397cfb5",
+        "build_lane_policy": "29bd8b61a8ff78909dda26cc6f16117e4ae6123e991cdd19abe70308bcd2d079",
+        "policy_from_findings": "44ba1bbcab2d1d1ac4ffdd9c977c41fe0bbb302b8d8d47f665d000ddc5ff74c9",
+        "build_repair_gate_from_policy": "f8de589254290cf855f5ec908f22ca2af10e879a2a98a564e5d95d2a90b0700e"
+      }
+    }
+  },
+  "permittedAddedFields": [
+    "canReapExpiredLeases",
+    "hermersProfileModeEnabled",
+    "hermersProfileModeActuateEnabled",
+    "hermersProfileModeStartEnabled"
+  ],
+  "permittedChangedFields": [],
+  "extensionReview": {
+    "artifact": "execution/W12/policy-decision-extension-review-2026-10-05.md",
+    "sha256": "344a903d68a8638f0aa7a980a3530901a35f117b39a105e382d9e77adc2515d2",
+    "scope": "additive visibility of existing actuator flags, no grant or change to baseline fields"
+  }
+}
