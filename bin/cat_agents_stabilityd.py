@@ -28,6 +28,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -57,9 +58,11 @@ from stability_core.config import (
     parse_restart_actuator_settings, parse_hermers_gateway_restart_limit, startup_grace_active,
 )
 from stability_core.action_ledger import ActionLedger
+from stability_core.event_outbox import EventOutbox, EventOutboxError
 from stability_core.action_classes import classify_action_types, classify_commands
 from stability_core.preflight_recovery import (
     build_preflight_summary, build_recovery_summary, load_action_ledger_readonly,
+    load_action_ledger_connection_readonly,
 )
 from stability_core.action_executor import (
     ActionExecutor, ActionSpec, BoundaryCheck, OperationResult, PostcheckResult,
@@ -112,6 +115,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 LATEST_PATH = STABILITY_DIR / "latest.json"
 POLICY_PATH = STABILITY_DIR / "policy.json"
 EVENTS_JSONL = STABILITY_DIR / "events.jsonl"
+EVENT_OUTBOX_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_EVENT_OUTBOX_ENABLED", "0") == "1"
 ACTIONS_JSONL = STABILITY_DIR / "actions.jsonl"
 STATE_DB = STABILITY_DIR / "state.db"
 LOCK_PATH = STABILITY_DIR / "stabilityd.lock"
@@ -1287,11 +1291,24 @@ def etime_seconds(value: Any) -> int:
         return 0
 
 
+class StabilityStateConnection(sqlite3.Connection):
+    """Writer connection with process-local file identity provenance."""
+
+
 def init_db() -> sqlite3.Connection:
     ensure_dirs()
-    conn = sqlite3.connect(str(STATE_DB))
+    if STATE_DB.is_symlink():
+        raise RuntimeError("state-store-path-invalid")
+    before = STATE_DB.stat() if STATE_DB.exists() else None
+    conn = sqlite3.connect(str(STATE_DB), factory=StabilityStateConnection)
+    after = STATE_DB.stat()
+    if (not stat.S_ISREG(after.st_mode) or STATE_DB.is_symlink()
+            or before is not None and (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)):
+        conn.close()
+        raise RuntimeError("state-store-identity-changed")
+    conn._stability_store_identity = (after.st_dev, after.st_ino)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA synchronous=FULL" if EVENT_OUTBOX_ENABLED else "PRAGMA synchronous=NORMAL")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)"
     )
@@ -1333,7 +1350,36 @@ def db_set(conn: sqlite3.Connection, key: str, value: Any) -> None:
     conn.commit()
 
 
-def db_record_event(conn: sqlite3.Connection, event: Dict[str, Any]) -> None:
+def db_record_event(conn: sqlite3.Connection, event: Dict[str, Any], *,
+                    generation: Optional[str] = None, seq: Optional[int] = None) -> Any:
+    if EVENT_OUTBOX_ENABLED:
+        if not isinstance(generation, str) or not generation or type(seq) is not int or seq < 0:
+            raise EventOutboxError("event-context-required")
+        if conn.in_transaction:
+            raise EventOutboxError("caller-transaction-active")
+        database = next((row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), "")
+        if not database:
+            raise EventOutboxError("durable-path-required")
+        with EventOutbox(database, connection=conn,
+                         connection_identity=getattr(conn, "_stability_store_identity", None)) as outbox:
+            try:
+                conn.execute("INSERT OR IGNORE INTO kv(key,value,updated_at) VALUES(?,?,?)",
+                             ("stabilityd_event_producer_id", json.dumps("stabilityd:" + uuid.uuid4().hex), epoch()))
+                conn.commit()
+                producer = json.loads(conn.execute("SELECT value FROM kv WHERE key=?",
+                                      ("stabilityd_event_producer_id",)).fetchone()[0])
+                if not isinstance(producer, str) or re.fullmatch(r"stabilityd:[0-9a-f]{32}", producer) is None:
+                    raise ValueError("invalid producer identity")
+            except (sqlite3.Error, ValueError, TypeError, IndexError):
+                raise EventOutboxError("producer-identity-unavailable") from None
+            receipt = outbox.record(event, producer=producer, generation=generation, attempt=1, seq=seq)
+            try:
+                export = outbox.drain(EVENTS_JSONL, max_batch=50, max_batch_bytes=1048576)
+            except EventOutboxError:
+                # Intent survives; lack of an export receipt is explicit evidence,
+                # never grounds to insert a second observation or clear the queue.
+                export = {"coverage": "unknown", "complete": False, "errorClass": "EventExportFailed"}
+            return {"record": receipt, "export": export}
     conn.execute(
         "INSERT INTO events(ts_epoch, source, component, severity, key, payload) VALUES(?, ?, ?, ?, ?, ?)",
         (
@@ -1903,6 +1949,8 @@ def build_workflow_stability_evidence(snapshot: Optional[Dict[str, Any]] = None)
             "mode": policy.get("mode"),
             "findingCount": len(findings),
             "actionCount": len(actions),
+            "actionRecovery": latest.get("actionRecovery") if isinstance(latest.get("actionRecovery"), dict) else None,
+            "eventPipeline": latest.get("eventPipeline") if isinstance(latest.get("eventPipeline"), dict) else None,
         },
         "policy": {
             "mode": policy.get("mode"),
@@ -9000,6 +9048,19 @@ def collect_snapshot(
         "checkedAt": ts(),
         "checkedAtEpoch": epoch(),
     }
+    recovery = action_recovery_evidence(conn, checked_at=snapshot["checkedAt"],
+                                        checked_at_epoch=snapshot["checkedAtEpoch"])
+    snapshot["actionRecovery"] = recovery
+    snapshot["eventPipeline"] = event_pipeline_evidence(conn)
+    if recovery["counts"].get("executing") or recovery["counts"].get("uncertain"):
+        add_finding(findings, "stabilityd_action_recovery_required", "warning", "stabilityd",
+                    "durable prior action requires evidence reconciliation; automatic replay is prohibited",
+                    recoveryState=recovery["recoveryState"], counts=recovery["counts"],
+                    candidateCount=recovery["candidateCount"], automaticReplay=False)
+    elif recovery["ledgerStatus"] in {"invalid", "unavailable"}:
+        add_finding(findings, "stabilityd_action_ledger_unavailable", "warning", "stabilityd",
+                    "durable action recovery evidence is unavailable; do not infer a clear ledger",
+                    ledgerStatus=recovery["ledgerStatus"], coverage=False)
     self_progress = stabilityd_progress_evidence(snapshot["checkedAtEpoch"])
     snapshot["selfProgress"] = self_progress
     if self_progress.get("state") == "stale_previous_generation":
@@ -9182,6 +9243,62 @@ def collect_snapshot(
     return snapshot, findings, policy
 
 
+def event_pipeline_evidence(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Read export receipt state only; does not claim end-to-end delivery."""
+    result = {"mode": "outbox" if EVENT_OUTBOX_ENABLED else "legacy", "checkedAt": ts(),
+              "checkedAtEpoch": epoch(), "scope": "local-export-receipts",
+              "historyCoverage": "legacy-history-not-replayed", "automaticReplay": False}
+    if not EVENT_OUTBOX_ENABLED:
+        return {**result, "coverage": "legacy-unverified", "transactionalExport": False}
+    try:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        required = {"stability_event_outbox", "stability_event_outbox_version", "stability_event_outbox_target"}
+        if not required.issubset(tables):
+            return {**result, "coverage": "unknown", "reason": "outbox-not-initialized", "transactionalExport": True}
+        if conn.execute('SELECT version FROM stability_event_outbox_version').fetchall() != [(1,)]:
+            return {**result, "coverage": "unknown", "reason": "outbox-version-unknown", "transactionalExport": True}
+        states = dict(conn.execute('SELECT state,COUNT(*) FROM stability_event_outbox GROUP BY state'))
+        if not set(states).issubset({"pending", "exporting", "exported", "unknown"}):
+            raise ValueError("invalid event state")
+        exported = conn.execute("SELECT MAX(seq) FROM stability_event_outbox WHERE state='exported'").fetchone()[0]
+        coverage = "unknown" if states.get("unknown") else "pending" if states.get("pending") or states.get("exporting") else "receipt-clear"
+        return {**result, "coverage": coverage, "states": states,
+                "lastExportedSeq": exported, "transactionalExport": True}
+    except (sqlite3.Error, ValueError, TypeError):
+        return {**result, "coverage": "unknown", "reason": "event-evidence-unavailable", "transactionalExport": True}
+
+
+def drain_event_exports(conn: sqlite3.Connection) -> None:
+    if not EVENT_OUTBOX_ENABLED:
+        return
+    database = next((row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), "")
+    if not database or conn.in_transaction:
+        raise EventOutboxError("event-writer-unavailable")
+    with EventOutbox(database, connection=conn,
+                     connection_identity=getattr(conn, "_stability_store_identity", None)) as outbox:
+        try:
+            outbox.drain(EVENTS_JSONL, max_batch=50, max_batch_bytes=1048576)
+        except EventOutboxError:
+            pass  # durable unknown/pending state is surfaced by receipt evidence
+
+
+def action_recovery_evidence(conn: sqlite3.Connection, *, checked_at: str,
+                             checked_at_epoch: int) -> Dict[str, Any]:
+    """Observe only the current writer's committed ledger; never creates or replays."""
+    try:
+        loaded = load_action_ledger_connection_readonly(conn, limit=20, budget_ms=250)
+    except (sqlite3.Error, OSError, ValueError, TypeError):
+        loaded = {"status": "unavailable", "records": []}
+    summary = build_recovery_summary(
+        loaded.get("records") or [], ledger_status=str(loaded.get("status") or "unavailable"),
+        limit=20, ledger_counts=loaded.get("counts"), total_candidate_count=loaded.get("candidateCount"),
+    )
+    summary.update(checkedAt=checked_at, checkedAtEpoch=checked_at_epoch,
+                   evidenceScope="current-writer-committed-ledger", queryBudgetMs=250,
+                   queryBudgetType="sqlite-vm")
+    return summary
+
+
 def stabilityd_progress_evidence(now_epoch: Optional[int] = None) -> Dict[str, Any]:
     """Observe prior committed-loop freshness without adding a supervisor/timer."""
     now_value = int(now_epoch if now_epoch is not None else epoch())
@@ -9221,6 +9338,7 @@ def run_once(conn: sqlite3.Connection, no_action: bool = False) -> Dict[str, Any
 
 def _run_once_body(conn: sqlite3.Connection, no_action: bool = False) -> Dict[str, Any]:
     ensure_dirs()
+    drain_event_exports(conn)
     snapshot, findings, policy = collect_snapshot(conn)
     generation_id = uuid.uuid4().hex
     snapshot["generationId"] = generation_id
@@ -9230,8 +9348,7 @@ def _run_once_body(conn: sqlite3.Connection, no_action: bool = False) -> Dict[st
     snapshot["actions"] = actions
     snapshot["completedAt"] = ts()
     snapshot["completedAtEpoch"] = epoch()
-    snapshot["workflowEvidence"] = write_workflow_stability_evidence(snapshot)
-    for finding in findings:
+    for finding_seq, finding in enumerate(findings):
         if SEVERITY_RANK.get(str(finding.get("severity")), 0) >= SEVERITY_RANK["high"]:
             event_key = f"event:{finding.get('key')}"
             last_event_at = int(db_get(conn, event_key, 0) or 0)
@@ -9248,10 +9365,15 @@ def _run_once_body(conn: sqlite3.Connection, no_action: bool = False) -> Dict[st
                 "policyMode": policy.get("mode"),
                 "evidence": {k: v for k, v in finding.items() if k not in {"key", "severity", "component", "message"}},
             }
-            db_record_event(conn, event)
+            if EVENT_OUTBOX_ENABLED:
+                db_record_event(conn, event, generation=generation_id, seq=finding_seq)
+            else:
+                db_record_event(conn, event)
             db_set(conn, event_key, snapshot["checkedAtEpoch"])
     for action in actions:
         db_record_action(conn, action)
+    snapshot["eventPipeline"] = event_pipeline_evidence(conn)
+    snapshot["workflowEvidence"] = write_workflow_stability_evidence(snapshot)
     log_line(
         "severity={} mode={} findings={} actions={}".format(
             snapshot.get("severity"),
@@ -9340,7 +9462,10 @@ def daemon_loop(no_action: bool = False) -> int:
                 err = daemon_loop_error_event(exc)
                 evidence_write_failed = False
                 try:
-                    db_record_event(conn, err)
+                    if EVENT_OUTBOX_ENABLED:
+                        db_record_event(conn, err, generation=uuid.uuid4().hex, seq=0)
+                    else:
+                        db_record_event(conn, err)
                 except Exception:
                     # Do not let a storage exception (which may contain SQL,
                     # paths, or provider data) escape into the service journal.

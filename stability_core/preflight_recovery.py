@@ -8,6 +8,7 @@ import json
 import math
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -126,7 +127,7 @@ def build_recovery_summary(
 ) -> dict[str, Any]:
     if type(limit) is not int or not 1 <= limit <= 1000:
         raise ValueError("limit must be an integer from 1 to 1000")
-    if ledger_status not in {"available", "missing", "invalid", "unavailable"}:
+    if ledger_status not in {"available", "missing", "not-initialized", "invalid", "unavailable"}:
         ledger_status = "unavailable"
     states = {"planned": 0, "executing": 0, "uncertain": 0, "succeeded": 0, "failed": 0, "blocked": 0}
     candidates = []
@@ -204,55 +205,104 @@ def load_action_ledger_readonly(path: Path, *, limit: int = 100) -> dict[str, An
     try:
         conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1.0)
         conn.execute("PRAGMA query_only=ON")
-        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if not {"action_ledger", "stability_schema_versions"}.issubset(tables):
-            return {"status": "invalid", "records": []}
-        version = conn.execute(
-            "SELECT version FROM stability_schema_versions WHERE component='action_ledger'"
-        ).fetchone()
-        if not version or version[0] != LEDGER_SCHEMA_VERSION:
-            return {"status": "invalid", "records": []}
-        names = [item[1] for item in conn.execute("PRAGMA table_info(action_ledger)")]
-        expected = {"action_id", "action_type", "target", "generation", "state", "input_digest",
-                    "authorization_ref", "policy_ref", "evidence_refs_json", "created_at_ms", "updated_at_ms",
-                    "outcome_ref", "postcheck_ref", "precheck_ref", "idempotency_key", "metadata_json", "version"}
-        if set(names) != expected:
-            return {"status": "invalid", "records": []}
-        counts = {row[0]: row[1] for row in conn.execute(
-            "SELECT state,COUNT(*) FROM action_ledger GROUP BY state"
-        )}
-        candidates_count = sum(counts.get(state, 0) for state in ("planned", "executing", "uncertain"))
-        rows = conn.execute(
-            """SELECT action_id,action_type,target,generation,state,input_digest,authorization_ref,
-                      policy_ref,evidence_refs_json,created_at_ms,updated_at_ms,outcome_ref,postcheck_ref,precheck_ref
-               FROM action_ledger WHERE state IN ('planned','executing','uncertain')
-               ORDER BY created_at_ms,action_id LIMIT ?""", (limit,)
-        ).fetchall()
-        records = []
-        for row in rows:
-            if (not all(isinstance(row[index], str) for index in (0, 1, 2, 3, 4, 5, 8))
-                    or any(row[index] is not None and not isinstance(row[index], str) for index in (6, 7))):
-                return {"status": "invalid", "records": []}
-            if (not re.fullmatch(r"[0-9a-f]{64}", row[5]) or len(row[8]) > 64_000
-                    or row[4] not in {"planned", "executing", "uncertain"}):
-                return {"status": "invalid", "records": []}
-            refs = json.loads(row[8])
-            if (not isinstance(refs, list) or len(refs) > 64
-                    or any(not isinstance(ref, str) or len(ref) > 1000 for ref in refs)):
-                return {"status": "invalid", "records": []}
-            if (type(row[9]) is not int or type(row[10]) is not int
-                    or any(value is not None and not isinstance(value, str) for value in row[11:14])):
-                return {"status": "invalid", "records": []}
-            records.append({
-                "action_id": row[0], "action_type": row[1], "target": row[2], "generation": row[3],
-                "state": row[4], "input_digest": row[5], "authorization_ref": row[6], "policy_ref": row[7],
-                "evidence_refs": refs, "created_at_ms": row[9], "updated_at_ms": row[10],
-                "outcome_ref": row[11], "postcheck_ref": row[12], "precheck_ref": row[13],
-            })
-        return {"status": "available", "records": records, "counts": counts,
-                "candidateCount": candidates_count}
+        return load_action_ledger_connection_readonly(conn, limit=limit, budget_ms=250)
     except (sqlite3.Error, ValueError, TypeError, OSError):
         return {"status": "unavailable", "records": []}
     finally:
         if conn is not None:
             conn.close()
+
+
+def _read_action_ledger_state(conn: sqlite3.Connection, *, limit: int) -> dict[str, Any]:
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if not {"action_ledger", "stability_schema_versions"}.intersection(tables):
+        return {"status": "not-initialized", "records": []}
+    if not {"action_ledger", "stability_schema_versions"}.issubset(tables):
+        return {"status": "invalid", "records": []}
+    version = conn.execute(
+        "SELECT version FROM stability_schema_versions WHERE component='action_ledger'"
+    ).fetchone()
+    if not version or version[0] != LEDGER_SCHEMA_VERSION:
+        return {"status": "invalid", "records": []}
+    names = [item[1] for item in conn.execute("PRAGMA table_info(action_ledger)")]
+    expected = {"action_id", "action_type", "target", "generation", "state", "input_digest",
+                "authorization_ref", "policy_ref", "evidence_refs_json", "created_at_ms", "updated_at_ms",
+                "outcome_ref", "postcheck_ref", "precheck_ref", "idempotency_key", "metadata_json", "version"}
+    if set(names) != expected:
+        return {"status": "invalid", "records": []}
+    counts = {row[0]: row[1] for row in conn.execute(
+        "SELECT state,COUNT(*) FROM action_ledger GROUP BY state"
+    )}
+    candidates_count = sum(counts.get(state, 0) for state in ("planned", "executing", "uncertain"))
+    rows = conn.execute(
+        """SELECT action_id,action_type,target,generation,state,input_digest,authorization_ref,
+                  policy_ref,evidence_refs_json,created_at_ms,updated_at_ms,outcome_ref,postcheck_ref,precheck_ref
+           FROM action_ledger WHERE state IN ('planned','executing','uncertain')
+           ORDER BY created_at_ms,action_id LIMIT ?""", (limit,)
+    ).fetchall()
+    records = []
+    for row in rows:
+        if (not all(isinstance(row[index], str) for index in (0, 1, 2, 3, 4, 5, 8))
+                or any(row[index] is not None and not isinstance(row[index], str) for index in (6, 7))):
+            return {"status": "invalid", "records": []}
+        if (not re.fullmatch(r"[0-9a-f]{64}", row[5]) or len(row[8]) > 64_000
+                or row[4] not in {"planned", "executing", "uncertain"}):
+            return {"status": "invalid", "records": []}
+        refs = json.loads(row[8])
+        if (not isinstance(refs, list) or len(refs) > 64
+                or any(not isinstance(ref, str) or len(ref) > 1000 for ref in refs)):
+            return {"status": "invalid", "records": []}
+        if (type(row[9]) is not int or type(row[10]) is not int
+                or any(value is not None and not isinstance(value, str) for value in row[11:14])):
+            return {"status": "invalid", "records": []}
+        records.append({
+            "action_id": row[0], "action_type": row[1], "target": row[2], "generation": row[3],
+            "state": row[4], "input_digest": row[5], "authorization_ref": row[6], "policy_ref": row[7],
+            "evidence_refs": refs, "created_at_ms": row[9], "updated_at_ms": row[10],
+            "outcome_ref": row[11], "postcheck_ref": row[12], "precheck_ref": row[13],
+        })
+    return {"status": "available", "records": records, "counts": counts,
+            "candidateCount": candidates_count}
+
+
+def load_action_ledger_connection_readonly(conn: sqlite3.Connection, *, limit: int = 100,
+                                          budget_ms: int | None = None) -> dict[str, Any]:
+    """Read the actual borrowed connection in an owned read transaction.
+
+    Existing caller transactions are rejected, never committed or rolled back.
+    The reader cannot silently switch to another inode at the same filename.
+    A requested budget reserves the connection's progress handler for this read;
+    callers using their own handler should omit it. The budget bounds SQLite VM
+    work, not an operating-system filesystem stall.
+    """
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise ValueError("limit must be an integer from 1 to 1000")
+    if budget_ms is not None and (type(budget_ms) is not int or not 1 <= budget_ms <= 1000):
+        raise ValueError("invalid read budget")
+    begun = False
+    handler_installed = False
+    result = {"status": "unavailable", "records": []}
+    try:
+        if conn.in_transaction:
+            return result
+        conn.execute("BEGIN")
+        begun = True
+        if budget_ms is not None:
+            deadline = time.monotonic() + budget_ms / 1000
+            conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            handler_installed = True
+        result = _read_action_ledger_state(conn, limit=limit)
+    except (sqlite3.Error, ValueError, TypeError, OSError):
+        result = {"status": "unavailable", "records": []}
+    finally:
+        if handler_installed:
+            try:
+                conn.set_progress_handler(None, 0)
+            except sqlite3.Error:
+                result = {"status": "unavailable", "records": []}
+        if begun:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                result = {"status": "unavailable", "records": []}
+    return result
