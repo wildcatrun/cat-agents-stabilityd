@@ -1,6 +1,6 @@
 {
   "name": "@flashcat/cat-agents-stability",
-  "version": "0.1.0",
+  "version": "1.0.0-rc.1",
   "type": "module",
   "description": "Companion stability-governance plugin and control plane for trading-agents workflow, OpenClaw Gateway, Hermers runtime, IM delivery, cron, sessions, and production readiness.",
   "license": "UNLICENSED",
