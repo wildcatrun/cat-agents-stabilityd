@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
-from .action_ledger import LEDGER_SCHEMA_VERSION
+from .action_ledger import LEDGER_SCHEMA_VERSION, STATES
 from .action_classes import ACTUATOR_CLASSES
 
 
@@ -233,6 +233,9 @@ def _read_action_ledger_state(conn: sqlite3.Connection, *, limit: int) -> dict[s
     counts = {row[0]: row[1] for row in conn.execute(
         "SELECT state,COUNT(*) FROM action_ledger GROUP BY state"
     )}
+    if any(state not in STATES or type(count) is not int or count < 0
+           for state, count in counts.items()):
+        return {"status": "invalid", "records": []}
     candidates_count = sum(counts.get(state, 0) for state in ("planned", "executing", "uncertain"))
     rows = conn.execute(
         """SELECT action_id,action_type,target,generation,state,input_digest,authorization_ref,

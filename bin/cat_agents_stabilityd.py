@@ -116,6 +116,8 @@ LATEST_PATH = STABILITY_DIR / "latest.json"
 POLICY_PATH = STABILITY_DIR / "policy.json"
 EVENTS_JSONL = STABILITY_DIR / "events.jsonl"
 EVENT_OUTBOX_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_EVENT_OUTBOX_ENABLED", "0") == "1"
+EVENT_OUTBOX_V2_ENABLED = os.environ.get("CAT_AGENTS_STABILITY_EVENT_OUTBOX_V2_ENABLED", "0") == "1"
+EVENT_V2_ARCHIVE_ROOT = STABILITY_DIR / "event-v2-archives"
 ACTIONS_JSONL = STABILITY_DIR / "actions.jsonl"
 STATE_DB = STABILITY_DIR / "state.db"
 LOCK_PATH = STABILITY_DIR / "stabilityd.lock"
@@ -1294,6 +1296,12 @@ def etime_seconds(value: Any) -> int:
 class StabilityStateConnection(sqlite3.Connection):
     """Writer connection with process-local file identity provenance."""
 
+    def close(self) -> None:
+        pipeline = getattr(self, "_event_pipeline_v2", None)
+        if pipeline is not None:
+            pipeline.close()
+        super().close()
+
 
 def init_db() -> sqlite3.Connection:
     ensure_dirs()
@@ -1307,8 +1315,21 @@ def init_db() -> sqlite3.Connection:
         conn.close()
         raise RuntimeError("state-store-identity-changed")
     conn._stability_store_identity = (after.st_dev, after.st_ino)
+    try:
+        if EVENT_OUTBOX_ENABLED and EVENT_OUTBOX_V2_ENABLED:
+            raise EventOutboxError("event-backend-config-conflict")
+        version_table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stability_event_outbox_version'").fetchone()
+        if version_table:
+            versions = [tuple(row) for row in conn.execute("SELECT version FROM stability_event_outbox_version LIMIT 2")]
+            if versions not in ([(1,)], [(2,)]):
+                raise EventOutboxError("event-store-version-unsupported")
+            if versions == [(2,)] and not EVENT_OUTBOX_V2_ENABLED:
+                raise EventOutboxError("event-store-protocol-config-mismatch")
+    except BaseException:
+        conn.close()
+        raise
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=FULL" if EVENT_OUTBOX_ENABLED else "PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA synchronous=FULL" if EVENT_OUTBOX_ENABLED or EVENT_OUTBOX_V2_ENABLED else "PRAGMA synchronous=NORMAL")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)"
     )
@@ -1319,7 +1340,29 @@ def init_db() -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS actions (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_epoch INTEGER NOT NULL, action_id TEXT, action TEXT, result TEXT, payload TEXT NOT NULL)"
     )
     conn.commit()
+    if EVENT_OUTBOX_V2_ENABLED:
+        try:
+            event_pipeline_v2(conn)
+        except BaseException:
+            conn.close()
+            raise
     return conn
+
+
+def event_pipeline_v2(conn: sqlite3.Connection):
+    from stability_core.event_pipeline_v2 import EventPipelineV2
+    if not isinstance(conn, StabilityStateConnection) or conn.in_transaction:
+        raise EventOutboxError("event-writer-factory-required")
+    cached = getattr(conn, "_event_pipeline_v2", None)
+    if cached is not None and cached.core is not None:
+        return cached
+    database = next((row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), "")
+    if not database:
+        raise EventOutboxError("event-durable-writer-required")
+    cached = EventPipelineV2(conn, database, getattr(conn, "_stability_store_identity", None),
+                             EVENTS_JSONL, EVENT_V2_ARCHIVE_ROOT, initialize=True)
+    conn._event_pipeline_v2 = cached
+    return cached
 
 
 def init_memory_kv_db() -> sqlite3.Connection:
@@ -1352,6 +1395,10 @@ def db_set(conn: sqlite3.Connection, key: str, value: Any) -> None:
 
 def db_record_event(conn: sqlite3.Connection, event: Dict[str, Any], *,
                     generation: Optional[str] = None, seq: Optional[int] = None) -> Any:
+    if EVENT_OUTBOX_V2_ENABLED:
+        if generation is not None or seq is not None:
+            raise EventOutboxError("event-v2-batch-handle-required")
+        return event_pipeline_v2(conn).record([event])
     if EVENT_OUTBOX_ENABLED:
         if not isinstance(generation, str) or not generation or type(seq) is not int or seq < 0:
             raise EventOutboxError("event-context-required")
@@ -9245,6 +9292,13 @@ def collect_snapshot(
 
 def event_pipeline_evidence(conn: sqlite3.Connection) -> Dict[str, Any]:
     """Read export receipt state only; does not claim end-to-end delivery."""
+    if EVENT_OUTBOX_V2_ENABLED:
+        pipeline = getattr(conn, "_event_pipeline_v2", None)
+        if pipeline is not None and pipeline.core is not None:
+            return pipeline.evidence()
+        return {"mode": "outbox-v2", "checkedAt": ts(), "checkedAtEpoch": epoch(),
+                "scope": "local-export-receipts", "coverage": "unknown",
+                "reason": "event-writer-unavailable", "automaticReplay": False}
     result = {"mode": "outbox" if EVENT_OUTBOX_ENABLED else "legacy", "checkedAt": ts(),
               "checkedAtEpoch": epoch(), "scope": "local-export-receipts",
               "historyCoverage": "legacy-history-not-replayed", "automaticReplay": False}
@@ -9269,6 +9323,19 @@ def event_pipeline_evidence(conn: sqlite3.Connection) -> Dict[str, Any]:
 
 
 def drain_event_exports(conn: sqlite3.Connection) -> None:
+    if EVENT_OUTBOX_V2_ENABLED:
+        from stability_core.event_stream_v2 import EventStreamError
+        pipeline = event_pipeline_v2(conn)
+        try:
+            pipeline.maintain()
+            pipeline.last_error = None
+        except EventStreamError:
+            pipeline.last_error = "EventStreamError"
+        except EventOutboxError as exc:
+            if str(exc) not in {"v2-retirement-catalog-budget", "v2-export-recovery-required", "v2-archive-budget"}:
+                raise
+            pipeline.last_error = "EventOutboxError"
+        return
     if not EVENT_OUTBOX_ENABLED:
         return
     database = next((row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), "")
@@ -9348,6 +9415,7 @@ def _run_once_body(conn: sqlite3.Connection, no_action: bool = False) -> Dict[st
     snapshot["actions"] = actions
     snapshot["completedAt"] = ts()
     snapshot["completedAtEpoch"] = epoch()
+    v2_events, v2_event_keys = [], []
     for finding_seq, finding in enumerate(findings):
         if SEVERITY_RANK.get(str(finding.get("severity")), 0) >= SEVERITY_RANK["high"]:
             event_key = f"event:{finding.get('key')}"
@@ -9365,11 +9433,23 @@ def _run_once_body(conn: sqlite3.Connection, no_action: bool = False) -> Dict[st
                 "policyMode": policy.get("mode"),
                 "evidence": {k: v for k, v in finding.items() if k not in {"key", "severity", "component", "message"}},
             }
+            if EVENT_OUTBOX_V2_ENABLED:
+                v2_events.append(event)
+                v2_event_keys.append(event_key)
+                continue
             if EVENT_OUTBOX_ENABLED:
                 db_record_event(conn, event, generation=generation_id, seq=finding_seq)
             else:
                 db_record_event(conn, event)
             db_set(conn, event_key, snapshot["checkedAtEpoch"])
+    if EVENT_OUTBOX_V2_ENABLED:
+        try:
+            event_pipeline_v2(conn).record(v2_events)
+            for event_key in v2_event_keys:
+                db_set(conn, event_key, snapshot["checkedAtEpoch"])
+        except EventOutboxError:
+            snapshot["eventPipelineError"] = {"scope": "local-export-receipts", "coverage": "unknown",
+                                              "errorClass": "EventOutboxError"}
     for action in actions:
         db_record_action(conn, action)
     snapshot["eventPipeline"] = event_pipeline_evidence(conn)

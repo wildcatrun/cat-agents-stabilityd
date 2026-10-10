@@ -154,6 +154,20 @@ class PreflightRecoveryTests(unittest.TestCase):
             self.assertEqual(loaded["status"], "invalid")
             self.assertNotIn(secret, str(loaded))
 
+    def test_unknown_stored_state_is_invalid_and_cannot_appear_as_zero_pending(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.db"
+            with ActionLedger(path) as ledger:
+                ledger.plan_action(idempotency_key="corrupt-state-fixture", action_type="fixture",
+                                   target="fixture", generation="fixture", input_data={})
+            with sqlite3.connect(path) as connection:
+                connection.execute("PRAGMA ignore_check_constraints=ON")
+                connection.execute("UPDATE action_ledger SET state='PRIVATE-UNKNOWN-STATE'")
+            loaded = load_action_ledger_readonly(path)
+            self.assertEqual(loaded, {"status": "invalid", "records": []})
+            self.assertNotIn("PRIVATE-UNKNOWN-STATE", str(loaded))
+
     def test_recovery_limit_counts_all_rows_and_never_replays(self):
         records = [
             {"action_id": f"a{i}", "action_type": "unknown.action", "target": f"target-{i}",
