@@ -261,13 +261,21 @@ class CliCompatibilityTests(unittest.TestCase):
         )
         for case in fixture["cases"]:
             with self.subTest(case=case["name"]), mock.patch.object(mcp, "audit"):
+                expected = json.loads(json.dumps(case["expected"]))
+                if case["request"].get("method") == "initialize":
+                    # Retain the historic response fixture. The reviewed rc.1
+                    # release changes only serverInfo.version in this envelope.
+                    self.assertEqual(expected["result"]["serverInfo"]["version"], "0.1.0")
+                    expected["result"]["serverInfo"]["version"] = "1.0.0-rc.1"
+                    self.assertEqual(json.loads((ROOT / "package.json").read_text())["version"], "1.0.0-rc.1")
+                    self.assertEqual(json.loads((ROOT / "openclaw.plugin.json").read_text())["version"], "1.0.0-rc.1")
                 if case["name"] == "tools-call-status-success-envelope":
                     with mock.patch.object(mcp, "status", return_value=case["payload"]):
                         actual = mcp.handle_request(case["request"])
                 else:
                     self.assertNotEqual(case["request"].get("method"), "tools/call")
                     actual = mcp.handle_request(case["request"])
-                self.assertEqual(actual, case["expected"])
+                self.assertEqual(actual, expected)
 
     def test_cli_readers_ignore_uncommitted_newer_alias_after_partial_publish(self):
         with tempfile.TemporaryDirectory() as tmp:

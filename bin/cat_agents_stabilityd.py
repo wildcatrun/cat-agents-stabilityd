@@ -46,7 +46,7 @@ if str(_CODE_ROOT) not in sys.path:
     sys.path.insert(0, str(_CODE_ROOT))
 from stability_core.actuation_lock import ActuationBusy, ActuationLock
 from stability_core.process_identity import identities_match, read_process_identity, terminate_process_instance
-from stability_core.probe_runner import run_component_probe
+from stability_core.probe_runner import run_component_probe, run_component_probe_hard
 from stability_core.protected_scope import is_protected_identity, resolve_protection_scope
 from stability_core.generation import artifact_metadata, publish_generation, write_json_atomic, write_text_atomic
 from stability_core.redaction import redact_sensitive_text, safe_error_category
