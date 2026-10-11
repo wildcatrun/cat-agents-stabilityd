@@ -288,11 +288,11 @@ class CliCompatibilityTests(unittest.TestCase):
             calls = []
             original = generation.write_json_atomic
 
-            def fail_lanes(path, payload):
+            def fail_lanes(path, payload, **kwargs):
                 if path == lanes_path:
                     raise OSError("simulated mid-publication crash")
                 calls.append(path)
-                return original(path, payload)
+                return original(path, payload, **kwargs)
 
             new_policy = {"generationId": "g-new", "mode": "restart-storm", "severity": "critical"}
             with mock.patch.object(generation, "write_json_atomic", side_effect=fail_lanes):
