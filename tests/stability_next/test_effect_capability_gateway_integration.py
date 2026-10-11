@@ -113,6 +113,35 @@ class GatewayCapabilityIntegrationTests(unittest.TestCase):
         self.assertEqual(self.call()['result'], 'blocked')
         self.assertEqual(self.effects, [])
 
+    def test_owned_executable_symlink_preserves_mechanical_restart(self):
+        actual = self.root / 'actual-runtime'
+        self.binary.rename(actual)
+        self.binary.symlink_to(actual.name)
+        self.assertEqual(self.call()['result'], 'ok')
+        self.assertEqual(len(self.effects), 1)
+
+    def test_executable_link_retarget_with_same_bytes_after_claim_blocks_restart(self):
+        actual = self.root / 'actual-runtime'
+        other = self.root / 'other-runtime'
+        self.binary.rename(actual)
+        other.write_bytes(actual.read_bytes()); other.chmod(0o700)
+        self.binary.symlink_to(actual.name)
+        original = m.ActionLedger.begin_execution
+        def change(ledger, *args, **kwargs):
+            result = original(ledger, *args, **kwargs)
+            self.binary.unlink(); self.binary.symlink_to(other.name)
+            return result
+        with mock.patch.object(m.ActionLedger, 'begin_execution', change):
+            self.assertEqual(self.call()['result'], 'blocked')
+        self.assertEqual(self.effects, [])
+
+    def test_executable_link_cycle_blocks_restart(self):
+        self.binary.unlink()
+        self.binary.symlink_to('cycle')
+        (self.root / 'cycle').symlink_to(self.binary.name)
+        self.assertEqual(self.call()['result'], 'blocked')
+        self.assertEqual(self.effects, [])
+
     def test_effective_executable_path_conflict_blocks_restart(self):
         self.props = self.props.replace('path=' + str(self.binary), 'path=/unknown/runtime')
         self.assertEqual(self.call()['result'], 'blocked')

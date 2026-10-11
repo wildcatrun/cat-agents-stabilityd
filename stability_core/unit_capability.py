@@ -81,6 +81,38 @@ def _file_binding(path, request, owner):
         os.close(fd)
 
 
+def resolve_unit_executable(entry):
+    """Resolve only owned final-component links, retaining every birth identity."""
+    path = Path(entry)
+    if not path.is_absolute():
+        raise ValueError('unit-executable-path-invalid')
+    route, seen = [], set()
+    for _ in range(9):
+        if any(p.is_symlink() for p in path.parents) or path in seen:
+            raise ValueError('unit-executable-route-invalid')
+        seen.add(path)
+        parent = path.parent.stat()
+        if parent.st_uid not in {0, os.getuid()} or parent.st_mode & 0o022:
+            raise ValueError('unit-executable-parent-untrusted')
+        before = path.lstat()
+        if before.st_uid not in {0, os.getuid()}:
+            raise ValueError('unit-executable-owner-invalid')
+        identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_mode, s.st_uid)
+        if stat.S_ISLNK(before.st_mode):
+            target = os.readlink(path)
+            if identity(before) != identity(path.lstat()):
+                raise ValueError('unit-executable-link-drift')
+            route.append((str(path), identity(before), target))
+            path = Path(os.path.abspath(path.parent / target))
+            continue
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_mode & 0o022 or not os.access(path, os.X_OK)):
+            raise ValueError('unit-executable-owner-mode')
+        route.append((str(path), identity(before), None))
+        return path, tuple(route)
+    raise ValueError('unit-executable-link-budget')
+
+
 def read_unit_binding(request, *, unit, read_properties, clock_ms):
     if not re.fullmatch(r'[A-Za-z0-9_.@-]+\.service', unit):
         raise ValueError('unit-name-invalid')
@@ -88,16 +120,14 @@ def read_unit_binding(request, *, unit, read_properties, clock_ms):
     owner = 'runtime-unit://' + unit
     file = _file_binding(fragment, request, owner)
     drop_files = tuple(_file_binding(p, request, owner) for p in drops)
-    executable = Path(argv[0])
-    if any(p.is_symlink() for p in (executable, *executable.parents)):
-        raise ValueError('unit-executable-symlink')
-    executable_info = executable.stat()
-    if (not stat.S_ISREG(executable_info.st_mode) or executable_info.st_uid not in {0, os.getuid()}
-            or executable_info.st_mode & 0o022 or not os.access(executable, os.X_OK)):
-        raise ValueError('unit-executable-owner-mode')
-    return UnitBinding(request, unit, file, executable, sha256_file(str(executable)), owner,
+    entry = Path(argv[0])
+    executable, route = resolve_unit_executable(entry)
+    digest = sha256_file(str(executable))
+    if resolve_unit_executable(entry) != (executable, route):
+        raise ValueError('unit-executable-route-drift')
+    return UnitBinding(request, unit, file, executable, digest, owner,
                        drop_files, UnitEffectiveConfiguration(fragment, drops, argv, request.node_id,
-                       request.generation, clock_ms(), 'complete'))
+                       request.generation, clock_ms(), 'complete'), entry, route)
 
 
 def binding_identity(binding):
@@ -105,4 +135,5 @@ def binding_identity(binding):
     return (binding.unit, binding.fragment, binding.dropin_files, binding.executable,
             binding.executable_sha256, binding.runtime_owner_ref, binding.effective_config.fragment_path,
             binding.effective_config.dropin_paths, binding.effective_config.execstart_argv,
-            binding.effective_config.node_id, binding.effective_config.generation)
+            binding.effective_config.node_id, binding.effective_config.generation,
+            binding.executable_entry, binding.executable_route)

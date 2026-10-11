@@ -104,6 +104,8 @@ class UnitBinding:
     runtime_owner_ref: str
     dropin_files: tuple[FileBinding, ...] = ()
     effective_config: UnitEffectiveConfiguration | None = None
+    executable_entry: Path | None = None
+    executable_route: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -374,14 +376,23 @@ class EffectCapabilityProvider:
                         raise ValueError("unit-schema-owner-binding")
                     contents.append(_read_bound_file(file))
                 argv = _unit_execstart(contents)
-                if argv != config.execstart_argv or argv[0] != str(binding.executable):
+                if argv != config.execstart_argv or argv[0] != str(binding.executable_entry or binding.executable):
                     raise ValueError("unit-effective-execstart-conflict")
+                if binding.executable_entry is not None:
+                    from .unit_capability import resolve_unit_executable
+                    resolved, route = resolve_unit_executable(binding.executable_entry)
+                    if resolved != binding.executable or route != binding.executable_route:
+                        raise ValueError('unit-executable-route-drift')
                 if (type(binding.executable_sha256) is not str
                         or not _HASH.fullmatch(binding.executable_sha256)
                         or sha256_file(str(binding.executable)) != binding.executable_sha256):
                     raise ValueError('unit-executable-drift')
+                if binding.executable_entry is not None:
+                    if resolve_unit_executable(binding.executable_entry) != (binding.executable, binding.executable_route):
+                        raise ValueError('unit-executable-route-drift')
                 evidence = (binding.unit,tuple(file.sha256 for file in (binding.fragment,*binding.dropin_files)),
-                            argv,binding.executable_sha256,binding.runtime_owner_ref)
+                            argv,binding.executable_sha256,binding.runtime_owner_ref,
+                            binding.executable_entry,binding.executable_route)
             else:
                 if not callable(self.process_reader) or not callable(self.process_owner_reader):
                     return issue('unknown','process-provider-unavailable',requirement)
