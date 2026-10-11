@@ -1,6 +1,8 @@
 import importlib.util
 import json
 import sys
+import sqlite3
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -17,6 +19,39 @@ SPEC.loader.exec_module(stabilityd)
 
 
 class AuthMaintenanceCompatibilityTests(unittest.TestCase):
+    def test_server_executor_refuses_refresh_even_with_misconfigured_broker_and_real_token(self):
+        sentinel = "SYNTHETIC_REAL_REFRESH_MISCONFIGURATION"
+        for broker_enabled in (False, True):
+            with self.subTest(broker_enabled=broker_enabled), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                conn = sqlite3.connect(str(root / "state.db"))
+                conn.execute("CREATE TABLE actions (id INTEGER PRIMARY KEY, ts_epoch INTEGER, "
+                             "action_id TEXT, action TEXT, result TEXT, payload TEXT)")
+                plan = {"actions": [{"actionId": "fixture-refresh", "target": "codex-cli",
+                    "kind": "refresh", "canAutoRun": True, "humanGateRequired": False,
+                    "refresh_token": sentinel, "access_token": sentinel}]}
+                try:
+                    with mock.patch.object(stabilityd, "AUTH_REFRESH_BROKER_ENABLED", broker_enabled), \
+                         mock.patch.object(stabilityd, "AUTH_REFRESH_BROKER_LOCK_PATH", root / "broker.lock"), \
+                         mock.patch.object(stabilityd, "ACTIONS_JSONL", root / "actions.jsonl"), \
+                         mock.patch.object(stabilityd, "run_mac_codex_oauth_mirror",
+                                           side_effect=AssertionError("server cannot mirror or refresh")), \
+                         mock.patch.object(stabilityd.subprocess, "run",
+                                           side_effect=AssertionError("no external command")):
+                        result = stabilityd.execute_auth_maintenance_plan(conn, plan)
+                    execution = result["executions"][0]
+                    self.assertEqual(execution["result"], "blocked")
+                    self.assertEqual(execution["blockedReason"],
+                        "mac-codex-is-refresh-owner" if broker_enabled else "refresh-broker-disabled")
+                    self.assertTrue(execution["tokenValuesRedacted"])
+                    row = conn.execute("SELECT result, payload FROM actions").fetchone()
+                    self.assertEqual(row[0], "blocked")
+                    self.assertNotIn(sentinel, row[1])
+                    self.assertNotIn(sentinel, str(result))
+                    self.assertNotIn(sentinel, (root / "actions.jsonl").read_text())
+                finally:
+                    conn.close()
+
     @classmethod
     def setUpClass(cls):
         cls.fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))

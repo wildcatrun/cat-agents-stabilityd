@@ -5,6 +5,53 @@ from stability_core.surface_contracts import SURFACE_CONTRACTS, evaluate_surface
 
 
 class SurfaceContractTests(unittest.TestCase):
+    def fixture(self, surface, fields, **overrides):
+        observation = dict(surfaceId=surface, observedAt=990, receivedAt=991,
+                           timezone="UTC", sourceKind="synthetic-fixture", generation="fixture", fields=fields)
+        observation.update(overrides)
+        report = evaluate_surface_observations([observation], now_epoch=1000)
+        return next(item for item in report["surfaces"] if item["surfaceId"] == surface)
+
+    def test_receipts_do_not_prove_human_or_semantic_confirmation(self):
+        for kind in ("local-inbox", "runtime-ack", "delivery"):
+            with self.subTest(kind=kind):
+                result = self.fixture("im-delivery", dict(gatewayConnected=True, messageFlowReady=True,
+                    receiptStatus="fresh", receiptKind=kind, humanConfirmation=True, actionAuthorized=True))
+                self.assertEqual(result["state"], "fixture")
+                self.assertEqual(result["fields"]["receiptKind"], kind)
+                self.assertEqual(result["humanConfirmation"], "unknown")
+                self.assertEqual(result["semanticReadiness"], "unknown")
+                self.assertFalse(result["actionAuthorized"])
+
+    def test_data_thresholds_are_business_owned_metadata_without_policy_numbers(self):
+        fields = dict(apiReady=True, mcpReady=True, datasetFresh=True, writerAvailable=True,
+                      thresholdOwner="business-layer", thresholdDigest="a" * 64, maxAgeSeconds=1)
+        result = self.fixture("data-plane", fields)
+        self.assertEqual(result["thresholdBinding"], "fixture-business-owned")
+        self.assertNotIn("maxAgeSeconds", result["fields"])
+        fields["thresholdOwner"] = "stabilityd"
+        result = self.fixture("data-plane", fields)
+        self.assertEqual(result["thresholdBinding"], "unknown")
+        self.assertNotIn("thresholdOwner", result["fields"])
+
+    def test_paper_and_live_modes_are_synthetic_only_and_never_authorize_trades(self):
+        for mode in ("paper", "live"):
+            with self.subTest(mode=mode):
+                result = self.fixture("trading-core", dict(executionMode=mode, adapterReady=True,
+                    accountBalance="SECRET", credential="SECRET", actionAuthorized=True))
+                self.assertEqual(result["state"], "fixture")
+                self.assertTrue(result["fixtureOnly"])
+                self.assertFalse(result["actionAuthorized"])
+                self.assertNotIn("SECRET", str(result))
+                self.assertEqual(self.fixture("trading-core", {}, sourceKind="offline-metadata")["state"], "blocked")
+
+    def test_reversed_time_order_never_admits_readiness_fields(self):
+        result = self.fixture("im-delivery", dict(gatewayConnected=True, messageFlowReady=True,
+                              receiptStatus="fresh"), receivedAt=989)
+        self.assertEqual(result["state"], "unknown")
+        self.assertEqual(result["reason"], "observation-time-order-invalid")
+        self.assertEqual(result["fields"], {})
+
     def test_oauth_owner_and_no_raw_credentials_or_payloads(self):
         sentinel = "FIXTURE_SECRET_DO_NOT_PERSIST"
         fields = {

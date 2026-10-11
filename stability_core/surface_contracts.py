@@ -40,6 +40,7 @@ SURFACE_CONTRACTS: dict[str, dict[str, Any]] = {
         "accessClass": "governed-receipt-metadata-only",
         "allowedFields": {"gatewayConnected": "bool", "messageFlowReady": "bool", "receiptStatus": "receipt-status",
                            },
+        "optionalFields": {"receiptKind": "receipt-kind"},
         "dependencies": ["openclaw-runtime", "trading-agents-workflow", "telegram-or-wecom"],
         "fixtureOnly": False,
     },
@@ -48,13 +49,14 @@ SURFACE_CONTRACTS: dict[str, dict[str, Any]] = {
         "accessClass": "health-and-freshness-metadata-only",
         "allowedFields": {"apiReady": "bool", "mcpReady": "bool", "datasetFresh": "bool",
                            "writerAvailable": "bool"},
+        "optionalFields": {"thresholdOwner": "threshold-owner", "thresholdDigest": "digest"},
         "dependencies": ["wsl-datalab", "postgresql", "windows-host-forwarding", "system-clock"],
         "fixtureOnly": False,
     },
     "trading-core": {
         "owner": "trading-core",
-        "accessClass": "prohibited-in-g1-offline-contract-only",
-        "allowedFields": {},
+        "accessClass": "synthetic-readiness-only-production-access-prohibited",
+        "allowedFields": {"executionMode": "execution-mode", "adapterReady": "bool"},
         "dependencies": [],
         "fixtureOnly": True,
     },
@@ -91,6 +93,12 @@ def _valid_field(field_type: str, value: Any) -> bool:
         return isinstance(value, str) and value in _RECEIPT_STATUS
     if field_type == "owner":
         return isinstance(value, str) and value in _OWNER
+    if field_type == "receipt-kind":
+        return isinstance(value, str) and value in {"local-inbox", "runtime-ack", "delivery"}
+    if field_type == "threshold-owner":
+        return isinstance(value, str) and value == "business-layer"
+    if field_type == "execution-mode":
+        return isinstance(value, str) and value in {"paper", "live"}
     if field_type == "digest":
         return isinstance(value, str) and len(value) == 64 and all(ch in "0123456789abcdef" for ch in value.lower())
     return False
@@ -119,7 +127,7 @@ def evaluate_surface_observations(
         if contract is None:
             rejected.append("unknown-surface-id")
             continue
-        if contract["fixtureOnly"]:
+        if contract["fixtureOnly"] and observation.get("sourceKind") != "synthetic-fixture":
             rejected.append("surface-out-of-g1-scope")
             continue
         if surface_id in by_surface:
@@ -140,7 +148,7 @@ def evaluate_surface_observations(
             "fields": {},
         }
         observation = by_surface.get(surface_id)
-        if contract["fixtureOnly"]:
+        if contract["fixtureOnly"] and observation is None:
             result["state"] = "blocked"
         elif surface_id in duplicates:
             result["reason"] = "duplicate-observation"
@@ -159,6 +167,8 @@ def evaluate_surface_observations(
                 result["reason"] = "malformed-or-unbound-observation"
             elif observed_at > now_epoch + 30 or received_at > now_epoch + 30:
                 result["reason"] = "clock-skew-future"
+            elif received_at < observed_at:
+                result["reason"] = "observation-time-order-invalid"
             elif now_epoch - observed_at > max_age_seconds or now_epoch - received_at > max_age_seconds:
                 result["state"], result["reason"] = "unknown", "stale-observation"
             else:
@@ -166,7 +176,9 @@ def evaluate_surface_observations(
                 raw_fields = raw_fields if isinstance(raw_fields, Mapping) else {}
                 fields = {
                     field_name: value
-                    for field_name, field_type in contract["allowedFields"].items()
+                    for field_name, field_type in {
+                        **contract["allowedFields"], **contract.get("optionalFields", {})
+                    }.items()
                     if (value := raw_fields.get(field_name)) is not None and _valid_field(field_type, value)
                 }
                 required = set(contract["allowedFields"])
@@ -182,6 +194,16 @@ def evaluate_surface_observations(
                     generationDigest=hashlib.sha256(generation.encode("utf-8")).hexdigest(),
                     ageSeconds=max(0, int(now_epoch - observed_at)),
                 )
+                # Metadata and transport receipts never confer semantic approval.
+                result["actionAuthorized"] = False
+                if surface_id == "im-delivery":
+                    result["humanConfirmation"] = "unknown"
+                    result["semanticReadiness"] = "unknown"
+                elif surface_id == "data-plane":
+                    result["thresholdBinding"] = (
+                        "fixture-business-owned" if fields.get("thresholdOwner") == "business-layer"
+                        and "thresholdDigest" in fields else "unknown"
+                    )
         results.append(result)
     return {
         "schemaVersion": 1,
