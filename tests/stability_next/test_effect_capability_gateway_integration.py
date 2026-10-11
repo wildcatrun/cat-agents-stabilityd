@@ -142,6 +142,27 @@ class GatewayCapabilityIntegrationTests(unittest.TestCase):
         self.assertEqual(self.call()['result'], 'blocked')
         self.assertEqual(self.effects, [])
 
+    def test_executable_link_depth_budget_blocks_restart(self):
+        actual = self.root / 'actual-runtime'
+        self.binary.rename(actual)
+        links = [self.binary] + [self.root / ('hop-' + str(n)) for n in range(9)]
+        for index, link in enumerate(links):
+            link.symlink_to((links[index + 1] if index + 1 < len(links) else actual).name)
+        self.assertEqual(self.call()['result'], 'blocked')
+        self.assertEqual(self.effects, [])
+
+    def test_link_target_under_writable_parent_blocks_restart(self):
+        parent = self.root / 'untrusted'
+        parent.mkdir(); parent.chmod(0o777)
+        actual = parent / 'actual-runtime'
+        self.binary.rename(actual)
+        self.binary.symlink_to('untrusted/actual-runtime')
+        try:
+            self.assertEqual(self.call()['result'], 'blocked')
+            self.assertEqual(self.effects, [])
+        finally:
+            parent.chmod(0o700)
+
     def test_effective_executable_path_conflict_blocks_restart(self):
         self.props = self.props.replace('path=' + str(self.binary), 'path=/unknown/runtime')
         self.assertEqual(self.call()['result'], 'blocked')
