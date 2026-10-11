@@ -105,6 +105,8 @@ class CronLeaseActuatorTests(unittest.TestCase):
                 "jobId": job_id, "runId": run_id, "status": "running",
                 "startedAtMs": stabilityd.now_ms() - 5000, "dispatchState": "not-started",
             }), encoding="utf-8")
+            original_lease_bytes = lease_path.read_bytes()
+            original_run_bytes = run_path.read_bytes()
             item = {"path": str(lease_path), "jobId": job_id, "runId": run_id}
             policy = {"canReapExpiredLeases": True,
                       "updatedAtEpoch": stabilityd.epoch() - 1,
@@ -123,6 +125,9 @@ class CronLeaseActuatorTests(unittest.TestCase):
                 duplicate = stabilityd.governed_reap_expired_lease(item, gate, policy, "fixture-generation")
             self.assertEqual(result["ledgerState"], "succeeded", result)
             self.assertEqual(result["result"], "ok")
+            self.assertEqual(Path(result["leaseBackupPath"]).read_bytes(), original_lease_bytes)
+            self.assertEqual(Path(result["runBackupPath"]).read_bytes(), original_run_bytes)
+            self.assertEqual(Path(result["leaseBackupPath"]).parent, root / "snapshots" / "lease-reap")
             self.assertFalse(lease_path.exists())
             self.assertEqual(json.loads(run_path.read_text(encoding="utf-8"))["status"], "orphaned")
             self.assertTrue((pending_dir / f"{job_id}__lease_expired.json").exists())

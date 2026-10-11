@@ -32,3 +32,11 @@ numbers. Declared dependency minimums do not establish compatibility with every
 future runtime. Known local and Linux fixture results must be read within their
 recorded source/scope; production, live activation and real model/IM calls are not
 part of this candidate's qualification.
+
+- Retain lease/run backup pointers in governed cron repair results and verify
+  their original contents. Classify damaged and missing-table registries without
+  granting snapshot write eligibility.
+- Fence publication parent identity and use private dirfd-relative atomic files.
+  Keep every file fsync; batch sidecar rename-directory barriers per parent
+  before the independent latest-pointer barrier. Failure/identity/permissions
+  fixtures pass; performance and full revised Linux qualification remain pending.

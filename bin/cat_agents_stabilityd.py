@@ -7206,6 +7206,9 @@ def governed_reap_expired_lease(
                       "errorClass": type(exc).__name__, "partialWrites": {}}
         outcome.update(result=result.get("result"), failedStage=result.get("failedStage"),
                        errorClass=result.get("errorClass"), partialWrites=result.get("partialWrites"))
+        for backup_key in ("leaseBackupPath", "runBackupPath"):
+            if isinstance(result.get(backup_key), str):
+                outcome[backup_key] = result[backup_key]
         if isinstance(result.get("runAuditEventId"), str):
             outcome["runAuditEventId"] = result["runAuditEventId"]
         outcome_digest = hashlib.sha256(json.dumps(
@@ -7272,6 +7275,8 @@ def governed_reap_expired_lease(
             "leaseDigest": lease_digest,
             "failedStage": outcome.get("failedStage"), "errorClass": outcome.get("errorClass"),
             "partialWrites": outcome.get("partialWrites"),
+            "leaseBackupPath": outcome.get("leaseBackupPath"),
+            "runBackupPath": outcome.get("runBackupPath"),
             "runAuditEventId": outcome.get("runAuditEventId")}
 
 

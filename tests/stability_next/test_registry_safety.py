@@ -125,6 +125,30 @@ class RegistrySafetyTests(unittest.TestCase):
         self.assertIn("catnose", profiles)
         self.assertFalse(meta["scopeComplete"])
 
+    def test_damaged_database_is_distinct_and_snapshot_never_grants_writes(self):
+        original = b"not-a-sqlite-database" * 32
+        self.db.write_bytes(original)
+        self.write_snapshot()
+        registry = stabilityd.workflow_runtime_registry_records()
+        self.assertEqual(registry["fallbackReason"], "workflow_db_error")
+        self.assertEqual(registry["dbError"], "DatabaseError")
+        self.assertFalse(registry["writeEligible"])
+        self.assertEqual(self.db.read_bytes(), original)
+        _, meta = stabilityd.hermers_profiles_from_runtime_registry([], registry)
+        self.assertFalse(meta["scopeComplete"])
+
+    def test_existing_database_without_registry_table_is_distinct(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("CREATE TABLE unrelated(value TEXT)")
+        self.write_snapshot()
+        registry = stabilityd.workflow_runtime_registry_records()
+        self.assertEqual(registry["fallbackReason"], "runtime_agents_table_missing")
+        self.assertEqual(registry["dbError"], "runtime_agents table not found")
+        self.assertTrue(registry["exists"])
+        self.assertFalse(registry["writeEligible"])
+        _, meta = stabilityd.hermers_profiles_from_runtime_registry([], registry)
+        self.assertFalse(meta["scopeComplete"])
+
     def test_valid_empty_db_is_authoritative_and_does_not_restore_snapshot(self):
         self.create_db()
         self.write_snapshot()
