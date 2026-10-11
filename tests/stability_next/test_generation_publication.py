@@ -21,6 +21,25 @@ SPEC.loader.exec_module(stabilityd)
 
 
 class GenerationPublicationTests(unittest.TestCase):
+    def test_latest_commit_pointer_does_not_reread_unused_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            latest, sidecar = root / 'latest.json', root / 'policy.json'
+            original = generation.artifact_metadata
+            inspected = []
+            def metadata(path):
+                inspected.append(path)
+                self.assertNotEqual(path, latest)
+                return original(path)
+            with mock.patch.object(generation, 'artifact_metadata', side_effect=metadata):
+                result = generation.publish_generation({'generationId': 'new'}, [(sidecar, {'ready': True})], latest)
+            self.assertEqual(inspected, [sidecar])
+            self.assertEqual(json.loads(latest.read_text()), result)
+            self.assertEqual(result['generationManifest']['artifacts'][0]['sha256'],
+                             hashlib.sha256(sidecar.read_bytes()).hexdigest())
+            # Existing public writers keep their metadata return contract.
+            self.assertEqual(generation.write_json_atomic(root / 'standalone.json', {})['bytes'], 3)
+
     def test_wrong_borrowed_fence_cannot_create_destination_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

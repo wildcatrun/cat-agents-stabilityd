@@ -53,7 +53,7 @@ def _fsync_directory(path: Path, *, _fence=None) -> None:
         os.fsync(check.fd)
 
 
-def _atomic_replace(path: Path, writer, *, directory_identity=None, sync_directory=True, parent_fence=None) -> Dict[str, Any]:
+def _atomic_replace(path: Path, writer, *, directory_identity=None, sync_directory=True, parent_fence=None, return_metadata=True) -> Dict[str, Any]:
     if parent_fence is not None:
         if parent_fence.path != path.parent:
             raise OSError("publication directory fence scope changed")
@@ -80,7 +80,7 @@ def _atomic_replace(path: Path, writer, *, directory_identity=None, sync_directo
             if sync_directory:
                 _fsync_directory(path.parent, _fence=check)
             check()
-            return artifact_metadata(path)
+            return artifact_metadata(path) if return_metadata else {}
         except Exception:
             try:
                 os.unlink(tmp_name, dir_fd=fd)
@@ -89,11 +89,11 @@ def _atomic_replace(path: Path, writer, *, directory_identity=None, sync_directo
             raise
 
 
-def write_json_atomic(path: Path, payload: Any, *, directory_identity=None, _sync_directory=True, _parent_fence=None) -> Dict[str, Any]:
+def write_json_atomic(path: Path, payload: Any, *, directory_identity=None, _sync_directory=True, _parent_fence=None, _return_metadata=True) -> Dict[str, Any]:
     def write(handle) -> None:
         json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=False)
         handle.write("\n")
-    return _atomic_replace(path, write, directory_identity=directory_identity, sync_directory=_sync_directory, parent_fence=_parent_fence)
+    return _atomic_replace(path, write, directory_identity=directory_identity, sync_directory=_sync_directory, parent_fence=_parent_fence, return_metadata=_return_metadata)
 
 
 def write_text_atomic(path: Path, text: str) -> Dict[str, Any]:
@@ -142,5 +142,7 @@ def publish_generation(
             "status": "committed",
             "artifacts": artifact_metas + list(extra_metadata),
         }
-        write_json_atomic(latest_path, snapshot, directory_identity=identities[latest_path.parent], _parent_fence=fences[latest_path.parent])
+        # Latest is the commit pointer, not a self-listed artifact. Its returned
+        # metadata was unused; retain both durability barriers without rereading it.
+        write_json_atomic(latest_path, snapshot, directory_identity=identities[latest_path.parent], _parent_fence=fences[latest_path.parent], _return_metadata=False)
     return snapshot
