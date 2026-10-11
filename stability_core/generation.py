@@ -7,7 +7,7 @@ import json
 import os
 import time
 import stat
-from contextlib import contextmanager, ExitStack
+from contextlib import contextmanager, ExitStack, nullcontext
 from pathlib import Path
 from typing import Any, Dict, Iterable, Tuple
 
@@ -18,7 +18,13 @@ def _directory_fence(path: Path):
     fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
                  | getattr(os, "O_NOFOLLOW", 0))
     expected = os.fstat(fd)
+    active = True
     def check():
+        if not active:
+            raise OSError("publication directory fence closed")
+        held = os.fstat(fd)
+        if (held.st_dev, held.st_ino) != (expected.st_dev, expected.st_ino):
+            raise OSError("publication directory descriptor changed")
         current = path.lstat()
         if (not stat.S_ISDIR(current.st_mode)
                 or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)):
@@ -26,28 +32,39 @@ def _directory_fence(path: Path):
     try:
         check()
         check.identity = (expected.st_dev, expected.st_ino)
+        check.fd = fd
+        check.path = path
         yield check
         check()
     finally:
+        active = False
         os.close(fd)
 
 
-def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    fd = os.open(str(path), flags)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+def _fsync_directory(path: Path, *, _fence=None) -> None:
+    if _fence is not None:
+        if _fence.path != path:
+            raise OSError("publication directory fence scope changed")
+        _fence()
+        os.fsync(_fence.fd)
+        _fence()
+        return
+    with _directory_fence(path) as check:
+        os.fsync(check.fd)
 
 
-def _atomic_replace(path: Path, writer, *, directory_identity=None, sync_directory=True) -> Dict[str, Any]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with _directory_fence(path.parent) as check:
+def _atomic_replace(path: Path, writer, *, directory_identity=None, sync_directory=True, parent_fence=None) -> Dict[str, Any]:
+    if parent_fence is not None:
+        if parent_fence.path != path.parent:
+            raise OSError("publication directory fence scope changed")
+        parent_fence()
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    with (nullcontext(parent_fence) if parent_fence is not None else _directory_fence(path.parent)) as check:
+        check()
         if directory_identity is not None and check.identity != directory_identity:
             raise OSError("publication directory identity changed")
-        fd = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-                     | getattr(os, "O_NOFOLLOW", 0))
+        fd = check.fd
         tmp_name = f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
         try:
             if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) != check.identity:
@@ -61,7 +78,7 @@ def _atomic_replace(path: Path, writer, *, directory_identity=None, sync_directo
             check()
             os.replace(tmp_name, path.name, src_dir_fd=fd, dst_dir_fd=fd)
             if sync_directory:
-                _fsync_directory(path.parent)
+                _fsync_directory(path.parent, _fence=check)
             check()
             return artifact_metadata(path)
         except Exception:
@@ -70,15 +87,13 @@ def _atomic_replace(path: Path, writer, *, directory_identity=None, sync_directo
             except OSError:
                 pass
             raise
-        finally:
-            os.close(fd)
 
 
-def write_json_atomic(path: Path, payload: Any, *, directory_identity=None, _sync_directory=True) -> Dict[str, Any]:
+def write_json_atomic(path: Path, payload: Any, *, directory_identity=None, _sync_directory=True, _parent_fence=None) -> Dict[str, Any]:
     def write(handle) -> None:
         json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=False)
         handle.write("\n")
-    return _atomic_replace(path, write, directory_identity=directory_identity, sync_directory=_sync_directory)
+    return _atomic_replace(path, write, directory_identity=directory_identity, sync_directory=_sync_directory, parent_fence=_parent_fence)
 
 
 def write_text_atomic(path: Path, text: str) -> Dict[str, Any]:
@@ -100,22 +115,24 @@ def publish_generation(
     with ExitStack() as stack:
         checks = []
         identities = {}
+        fences = {}
         for parent in parents:
             parent.mkdir(parents=True, exist_ok=True)
             check = stack.enter_context(_directory_fence(parent))
             checks.append(check)
             identities[parent] = check.identity
+            fences[parent] = check
         artifact_metas = []
         for path, payload in artifacts:
             for check in checks:
                 check()
-            artifact_metas.append(write_json_atomic(path, payload, directory_identity=identities[path.parent], _sync_directory=False))
+            artifact_metas.append(write_json_atomic(path, payload, directory_identity=identities[path.parent], _sync_directory=False, _parent_fence=fences[path.parent]))
         for check in checks:
             check()
         # All sidecar files are synced; commit each distinct rename directory
         # before the independent latest-pointer file/directory barrier.
         for parent in dict.fromkeys(path.parent for path, _ in artifacts):
-            _fsync_directory(parent)
+            _fsync_directory(parent, _fence=fences[parent])
         for check in checks:
             check()
         snapshot["generationManifest"] = {
@@ -125,5 +142,5 @@ def publish_generation(
             "status": "committed",
             "artifacts": artifact_metas + list(extra_metadata),
         }
-        write_json_atomic(latest_path, snapshot, directory_identity=identities[latest_path.parent])
+        write_json_atomic(latest_path, snapshot, directory_identity=identities[latest_path.parent], _parent_fence=fences[latest_path.parent])
     return snapshot

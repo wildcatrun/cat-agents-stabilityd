@@ -21,6 +21,15 @@ SPEC.loader.exec_module(stabilityd)
 
 
 class GenerationPublicationTests(unittest.TestCase):
+    def test_wrong_borrowed_fence_cannot_create_destination_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing = root / "not-created"
+            with generation._directory_fence(root) as fence:
+                with self.assertRaisesRegex(OSError, "scope changed"):
+                    generation.write_json_atomic(missing / "result.json", {}, _parent_fence=fence)
+            self.assertFalse(missing.exists())
+
     def test_latest_is_last_commit_pointer_and_manifest_matches_sidecars(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -133,11 +142,11 @@ class GenerationPublicationTests(unittest.TestCase):
             root = Path(tmp); latest = root / 'latest.json'; sidecar = root / 'policy.json'
             latest.write_text('{"generationId":"old"}\n')
             original = generation._fsync_directory; count = 0
-            def sync(path):
+            def sync(path, **kwargs):
                 nonlocal count
                 count += 1
                 if count == 2: raise OSError('synthetic-latest-directory-fsync-failure')
-                return original(path)
+                return original(path, **kwargs)
             with mock.patch.object(generation, '_fsync_directory', side_effect=sync):
                 with self.assertRaisesRegex(OSError, 'latest-directory-fsync-failure'):
                     generation.publish_generation({'generationId':'new'}, [(sidecar, {'generationId':'new'})], latest)
@@ -230,6 +239,31 @@ class GenerationPublicationTests(unittest.TestCase):
                     generation.publish_generation({'generationId':'new'}, files, latest)
             self.assertTrue(all(path.exists() for path, _ in files))
             self.assertEqual(json.loads(latest.read_text())['generationId'], 'old')
+
+
+    def test_publication_reuses_one_parent_descriptor_without_removing_syncs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); latest = root / 'latest.json'
+            files = [(root / f'side-{i}.json', {'generationId':'new'}) for i in range(5)]
+            original = os.open; directory_opens = []
+            def opened(file, flags, *args, **kwargs):
+                if flags & os.O_DIRECTORY:
+                    directory_opens.append(str(file))
+                return original(file, flags, *args, **kwargs)
+            with mock.patch.object(generation.os, 'open', side_effect=opened):
+                generation.publish_generation({'generationId':'new'}, files, latest)
+            self.assertEqual(directory_opens, [str(root)])
+
+    def test_closed_or_wrong_parent_fence_cannot_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); other = root/'other'; other.mkdir()
+            with generation._directory_fence(root) as fence:
+                with self.assertRaises(OSError):
+                    generation.write_json_atomic(other/'wrong.json', {}, _parent_fence=fence)
+            with self.assertRaisesRegex(OSError, 'fence closed'):
+                generation.write_json_atomic(root/'closed.json', {}, _parent_fence=fence)
+            self.assertFalse((other/'wrong.json').exists())
+            self.assertFalse((root/'closed.json').exists())
 
 
 if __name__ == "__main__":
