@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import shutil
+import stat
 import unittest
 from unittest import mock
 from typing import Any, Dict
@@ -20,6 +21,23 @@ from stability_core.event_pipeline_v2 import EventPipelineV2
 
 
 class OfflineMigrationTests(unittest.TestCase):
+    def test_package_permissions_remain_private_under_permissive_umask(self):
+        previous = os.umask(0)
+        try:
+            self.build()
+            rollback = self.root / 'permission-rollback'
+            result = preserve_rollback(self.package, self.db, self.stream, rollback)
+            self.assertFalse(result['activationAllowed'])
+        finally:
+            os.umask(previous)
+        for path in (self.package, *self.package.rglob('*'), rollback, *rollback.rglob('*')):
+            with self.subTest(path=path.relative_to(self.root)):
+                self.assertFalse(path.is_symlink())
+                mode = stat.S_IMODE(path.stat().st_mode)
+                self.assertEqual(mode & 0o077, 0, 'package artifacts must be owner-only')
+                self.assertEqual(mode & 0o700, 0o700 if path.is_dir() else
+                                 0o400 if path.name in {'history.sqlite', 'history.jsonl'} else 0o600)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name).resolve()
