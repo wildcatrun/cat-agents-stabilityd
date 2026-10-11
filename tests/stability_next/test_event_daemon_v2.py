@@ -83,7 +83,7 @@ class EventDaemonV2Tests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(m, "ACTUATION_LOCK_PATH", self.root / "actuation.lock"))
             stack.enter_context(mock.patch.object(m, "ACTIONS_JSONL", self.root / "actions.jsonl"))
-            stack.enter_context(mock.patch.object(m, "collect_snapshot", side_effect=lambda conn: self._synthetic_loop()))
+            stack.enter_context(mock.patch.object(m, "collect_snapshot", side_effect=lambda conn, **kwargs: self._synthetic_loop()))
             stack.enter_context(mock.patch.object(m, "control_plane_backpressure", return_value={}))
             actuator = stack.enter_context(mock.patch.object(m, "actuate_collected_snapshot", return_value=[
                 {"tsEpoch": 1000, "actionId": "fixture", "action": "none", "result": "blocked"}]))

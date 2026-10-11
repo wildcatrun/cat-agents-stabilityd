@@ -49,6 +49,7 @@ from stability_core.process_identity import identities_match, read_process_ident
 from stability_core.probe_runner import run_component_probe, run_component_probe_hard
 from stability_core.protected_scope import is_protected_identity, resolve_protection_scope
 from stability_core.generation import artifact_metadata, publish_generation, write_json_atomic, write_text_atomic
+from stability_core.collector_budget import RoundBudget, parse_config as parse_round_budget_config
 from stability_core.redaction import redact_sensitive_text, safe_error_category
 from stability_core.node_inventory import evaluate_inventory
 from stability_core.surface_contracts import evaluate_surface_observations
@@ -9087,8 +9088,10 @@ def _component_probe_worker(argv: List[str]) -> int:
 
 
 def collect_snapshot(
-    conn: sqlite3.Connection, *, component_probe_runner: Any = None,
+    conn: sqlite3.Connection, *, component_probe_runner: Any = None, round_budget: Any = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
+    if round_budget is None:
+        round_budget = RoundBudget(parse_round_budget_config(os.environ), clock=time.monotonic)
     findings: List[Dict[str, Any]] = []
     snapshot: Dict[str, Any] = {
         "schemaVersion": 1,
@@ -9126,14 +9129,14 @@ def collect_snapshot(
     runner = component_probe_runner or run_component_probe_hard
     worker_env = collector_worker_environment() if component_probe_runner is None else {}
 
-    def collect_component(name: str, fallback: Dict[str, Any], hermers_profiles: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+    def _collect_component(name: str, fallback: Dict[str, Any], hermers_profiles: Optional[Iterable[str]] = None, *, budget_ms: int) -> Dict[str, Any]:
         global _inspection_gateway_context, _cron_rpc_retry_after
         nonlocal collector_failed
         if snapshot.get("collectorFatal"):
             collector_failed = True
             probes[name] = {
                 "component": name, "status": "error", "source": "cat-agents-stabilityd",
-                "coverage": False, "durationMs": 0, "budgetMs": COLLECTOR_BUDGET_MS,
+                "coverage": False, "durationMs": 0, "budgetMs": budget_ms,
                 "maxOutputBytes": COLLECTOR_OUTPUT_MAX_BYTES, "errorClass": "PriorWorkerCleanupUnverified",
                 "fatal": True, "noLiveGroupMemberObserved": False,
             }
@@ -9154,7 +9157,7 @@ def collect_snapshot(
             child_env[_COMPONENT_PROBE_PARENT_PID_ENV] = str(os.getpid())
         result = runner(
             name, command, fallback, source="cat-agents-stabilityd",
-            max_output_bytes=COLLECTOR_OUTPUT_MAX_BYTES, budget_ms=COLLECTOR_BUDGET_MS,
+            max_output_bytes=COLLECTOR_OUTPUT_MAX_BYTES, budget_ms=budget_ms,
             env=child_env,
         )
         probes[name] = result["probe"]
@@ -9226,6 +9229,39 @@ def collect_snapshot(
             )
         return result["data"]
 
+    def collect_component(name: str, fallback: Dict[str, Any], hermers_profiles: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+        global _inspection_gateway_context, _cron_rpc_retry_after
+        nonlocal collector_failed
+        allocation = round_budget.allocate(name)
+        try:
+            if allocation.status == "skip":
+                collector_failed = True
+                pending_cache_updates.clear()
+                if name == "gateway":
+                    _inspection_cache.clear()
+                    _inspection_gateway_context = (0, False)
+                elif name == "cron":
+                    _inspection_cache.clear()
+                    _cron_rpc_retry_after = time.monotonic() + 300
+                probes[name] = {
+                    "component": name, "status": "unknown", "source": "cat-agents-stabilityd",
+                    "coverage": False, "durationMs": 0, "budgetMs": 0,
+                    "maxOutputBytes": COLLECTOR_OUTPUT_MAX_BYTES, "errorClass": "RoundBudgetSkipped",
+                    "budgetReason": allocation.reason, "roundBudget": allocation.evidence(),
+                    "workerSpawned": False, "cleanupQualification": "not-required-no-worker",
+                }
+                add_finding(findings, f"stability_collector_{name}_round_budget_skipped", "warning", name,
+                            "collector evidence is unknown because its round allocation was skipped",
+                            reason=allocation.reason, coverage=False)
+                return dict(fallback)
+            result = _collect_component(name, fallback, hermers_profiles, budget_ms=allocation.allocated_ms)
+            probes[name]["roundBudget"] = allocation.evidence()
+            return result
+        finally:
+            # Accounting consumes the owned token; it never certifies cleanup.
+            # _collect_component still raises its original fatal cleanup fence.
+            round_budget.finish(allocation)
+
     snapshot["gateway"] = collect_component(
         "gateway",
         {"active": None, "pid": 0, "portOk": None, "healthOk": None, "status": "unknown"},
@@ -9284,6 +9320,9 @@ def collect_snapshot(
     snapshot["findings"] = findings
     snapshot["severity"] = max_severity(findings)
     snapshot["streaks"] = streaks
+    snapshot["collectorBudget"] = round_budget.evidence()
+    snapshot["collectorBudgetChecks"] = {"policy": round_budget.check_parent("policy")}
+    snapshot["collectorBudgetStatus"] = "partial" if collector_failed or snapshot["collectorBudgetChecks"]["policy"]["status"] != "available" else "available"
     policy = policy_from_findings(conn, findings, snapshot, streaks)
     snapshot["policy"] = policy
     snapshot["authMaintenance"] = build_auth_maintenance_plan(snapshot.get("auth") if isinstance(snapshot.get("auth"), dict) else {}, findings)
@@ -9404,14 +9443,22 @@ def run_once(conn: sqlite3.Connection, no_action: bool = False) -> Dict[str, Any
 
 
 def _run_once_body(conn: sqlite3.Connection, no_action: bool = False) -> Dict[str, Any]:
+    round_budget = RoundBudget(parse_round_budget_config(os.environ), clock=time.monotonic)
     ensure_dirs()
     drain_event_exports(conn)
-    snapshot, findings, policy = collect_snapshot(conn)
+    snapshot, findings, policy = collect_snapshot(conn, round_budget=round_budget)
     generation_id = uuid.uuid4().hex
     snapshot["generationId"] = generation_id
     policy["generationId"] = generation_id
     snapshot["controlPlane"] = control_plane_backpressure(snapshot, policy)
-    actions = actuate_collected_snapshot(conn, snapshot, policy, no_action=no_action)
+    checks = snapshot.setdefault("collectorBudgetChecks", {})
+    checks["actuation"] = round_budget.check_parent("actuation")
+    snapshot["collectorBudget"] = round_budget.evidence()
+    if checks["actuation"]["status"] != "available":
+        snapshot["collectorBudgetStatus"] = "partial"
+        actions = [{"action": "none", "result": "blocked", "reason": "round-budget-unavailable"}]
+    else:
+        actions = actuate_collected_snapshot(conn, snapshot, policy, no_action=no_action)
     snapshot["actions"] = actions
     snapshot["completedAt"] = ts()
     snapshot["completedAtEpoch"] = epoch()
@@ -9479,6 +9526,10 @@ def _run_once_body(conn: sqlite3.Connection, no_action: bool = False) -> Dict[st
         (AUTH_MAINTENANCE_PLAN_PATH, auth_plan),
         (CONTROL_PLANE_BACKPRESSURE_PATH, backpressure),
     ]
+    checks["publication"] = round_budget.check_parent("publication")
+    snapshot["collectorBudget"] = round_budget.evidence()
+    if checks["publication"]["status"] != "available":
+        snapshot["collectorBudgetStatus"] = "partial"
     legacy_meta = write_legacy_watchdog_health(snapshot, policy)
     # Fixed-path readers must compare generationId; only latest.json is the
     # atomic commit pointer across the set of compatibility aliases.
@@ -9488,7 +9539,13 @@ def _run_once_body(conn: sqlite3.Connection, no_action: bool = False) -> Dict[st
             artifact_metadata(Path(snapshot["workflowEvidence"]["jsonPath"])),
             artifact_metadata(Path(snapshot["workflowEvidence"]["markdownPath"])),
         ])
-    return publish_generation(snapshot, artifacts, LATEST_PATH, artifacts_meta_extra)
+    published = publish_generation(snapshot, artifacts, LATEST_PATH, artifacts_meta_extra)
+    # This check occurs AFTER latest publication, so it is an independent receipt.
+    # Never mutate published snapshot and make returned/latest evidence diverge.
+    completion = {"scope": "post-publication-cooperative-budget", "generationId": generation_id,
+                  "checkedAt": ts(), "check": round_budget.check_parent("return")}
+    log_line("collector_round_completion=" + json.dumps(completion, ensure_ascii=False, separators=(",", ":")))
+    return published
 
 
 def actuate_collected_snapshot(
