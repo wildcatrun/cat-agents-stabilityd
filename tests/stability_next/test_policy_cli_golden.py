@@ -246,6 +246,43 @@ class PolicyCliGoldenTests(unittest.TestCase):
         conn.close()
         return policy
 
+    def test_observation_retry_clock_jumps_do_not_refresh_receipt_or_remove_cooldown(self):
+        from stability_core import observation_adapter_contract as adapter
+        from stability_core.observation_store import load_observation_records
+        evidence = {'coverage': True, 'sampleCount': 1}
+        record = dict(producerId='fixture-producer', adapterVersion='v1', nodeId='fixture-clock',
+                      sourceKind='synthetic-fixture', eventId='b' * 64, generationDigest='a' * 64,
+                      evidenceDigest=adapter.evidence_digest(evidence), observedAtEpoch=10000,
+                      evidence=evidence)
+        grants = {'fixture-producer': adapter.ProducerGrant('v1', frozenset({'fixture-clock'}))}
+        with sqlite3.connect(':memory:') as conn:
+            for now in (10000, 9950, 10050, 11799):
+                with self.subTest(now=now):
+                    result = adapter.ingest_synthetic_observation(conn, record,
+                        trusted_producer_id='fixture-producer', grants=grants,
+                        current_generations={'fixture-clock': 'a' * 64}, now_epoch=now)
+                    stored = load_observation_records(conn)
+                    self.assertEqual(len(stored), 1)
+                    self.assertEqual(stored[0]['receivedAtEpoch'], 10000)
+                    self.assertFalse(result['actionReplay'])
+                    self.assertFalse(result['readinessEvaluated'])
+                    policy = self._restart_policy(now=now, last_restart=10000)
+                    self.assertFalse(policy['canRestartGateway'])
+                    self.assertEqual(policy['cooldownUntilEpoch'], 11800)
+                    self.assertIn('cooldown', policy['restartBlockedReasons'])
+                    if now == 9950:
+                        self.assertEqual(result['observationFreshness'], 'clock-invalid')
+                    else:
+                        # Retry preserves the first receipt. Later arrival is
+                        # not skew when the original observed/received pair agrees.
+                        self.assertEqual(result['observationFreshness'], 'fresh')
+            expired = adapter.ingest_synthetic_observation(conn, record,
+                trusted_producer_id='fixture-producer', grants=grants,
+                current_generations={'fixture-clock': 'a' * 64}, now_epoch=10000 + 7 * 86400 + 1)
+            self.assertIsNone(expired['observationFreshness'])
+            self.assertEqual(load_observation_records(conn), [])
+            self.assertFalse(expired['actionReplay'])
+
     def test_restart_policy_decision_threshold_boundaries(self):
         cases = [
             {
