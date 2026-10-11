@@ -92,7 +92,7 @@ def test_unlink_failure_is_not_reaped_or_queued_and_records_partial_run_write(mo
     lease = paths["LEASE_DIR"] / "j1.json"
     _expired_lease(lease, "j1", "r1")
     run = paths["RUNS_BY_RUN_DIR"] / "r1.json"
-    run.write_text(json.dumps({"status": "running", "startedAtMs": 1,
+    run.write_text(json.dumps({"jobId": "j1", "runId": "r1", "status": "running", "startedAtMs": 1,
                                "dispatchState": "not-started"}), encoding="utf-8")
     real_unlink = Path.unlink
 
@@ -126,7 +126,9 @@ def test_completed_run_unlink_failure_is_failed_without_claiming_reap(monkeypatc
     lease = paths["LEASE_DIR"] / "j2.json"
     _expired_lease(lease, "j2", "r2")
     run = paths["RUNS_BY_RUN_DIR"] / "r2.json"
-    run.write_text(json.dumps({"status": "succeeded", "finishedAtMs": 2}), encoding="utf-8")
+    run.write_text(json.dumps({"jobId": "j2", "runId": "r2", "status": "succeeded",
+                               "startedAtMs": 1, "finishedAtMs": 2,
+                               "dispatchState": "not-started"}), encoding="utf-8")
     snapshot = {"generationId": "fixture-generation", "cron": {"expiredLeases": [{"path": str(lease), "jobId": "j2", "runId": "r2"}]}}
 
     with mock.patch.object(Path, "unlink", autospec=True, side_effect=PermissionError("private")):
@@ -161,7 +163,7 @@ class RepairFailureTests(unittest.TestCase):
             lease = paths["LEASE_DIR"] / "j1.json"
             _expired_lease(lease, "j1", "r1")
             run = paths["RUNS_BY_RUN_DIR"] / "r1.json"
-            run.write_text(json.dumps({"status": "running", "startedAtMs": 1,
+            run.write_text(json.dumps({"jobId": "j1", "runId": "r1", "status": "running", "startedAtMs": 1,
                                        "dispatchState": "not-started"}))
             snapshot = {"generationId": "fixture-generation", "cron": {"expiredLeases": [{"path": str(lease), "jobId": "j1", "runId": "r1"}]}}
             with mock.patch.object(stabilityd, "append_jsonl", side_effect=PermissionError("private")):
@@ -215,7 +217,7 @@ class RepairFailureTests(unittest.TestCase):
             lease = paths["LEASE_DIR"] / "j1.json"
             _expired_lease(lease, "j1", "r1")
             run = paths["RUNS_BY_RUN_DIR"] / "r1.json"
-            run.write_text(json.dumps({"status": "running", "startedAtMs": 1,
+            run.write_text(json.dumps({"jobId": "j1", "runId": "r1", "status": "running", "startedAtMs": 1,
                                        "dispatchState": "not-started"}))
             snapshot = {"generationId": "fixture-generation", "cron": {"expiredLeases": [{"path": str(lease), "jobId": "j1", "runId": "r1"}]}}
             policy = _policy()
@@ -236,6 +238,7 @@ class RepairFailureTests(unittest.TestCase):
             lease = paths["LEASE_DIR"] / "j1.json"
             _expired_lease(lease, "j1", "r1")
             run_record = {
+                "jobId": "j1", "runId": "r1", "dispatchState": "not-started",
                 "status": "orphaned", "startedAtMs": 1, "finishedAtMs": 2, "durationMs": 1,
                 "failure": {"class": "lease_expired"},
             }

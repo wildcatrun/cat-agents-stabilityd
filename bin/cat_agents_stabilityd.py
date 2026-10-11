@@ -7049,6 +7049,148 @@ def lease_mutation_lock():
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
 
+def lease_effect_file_snapshot(path: Path, owner_root: Path):
+    """Bounded fd-bound bytes; absent companions are explicitly non-created."""
+    path, owner_root = Path(path), Path(owner_root)
+    for ancestor in (path, *path.parents):
+        if ancestor.is_symlink():
+            raise ValueError("lease-protocol-symlink")
+    if path.parent.resolve() != owner_root.resolve() or not owner_root.is_dir():
+        raise ValueError("lease-protocol-root-unavailable")
+    if not path.exists():
+        return None
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 65536:
+            raise ValueError("lease-protocol-file-invalid")
+        raw = bytearray()
+        while len(raw) <= 65536:
+            block = os.read(descriptor, min(8192, 65537 - len(raw)))
+            if not block:
+                break
+            raw.extend(block)
+        identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
+        after = os.fstat(descriptor)
+        final = path.lstat()
+        if (len(raw) > 65536 or not stat.S_ISREG(final.st_mode) or final.st_nlink != 1
+                or identity(before) != identity(after) or identity(after) != identity(final)):
+            raise ValueError("lease-protocol-file-drift")
+        return bytes(raw), (before.st_dev, before.st_ino), hashlib.sha256(raw).hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def lease_effect_capability_provider(job_id: str, run_id: str, lease_path: Path,
+                                     generation: str, canonical_digest: str):
+    """Pin actual lease/run/repair protocol bytes, not action input assertions."""
+    from stability_core.effect_capability import (
+        EffectCapabilityProvider, EffectOperation, FileBinding, SchemaBinding,
+    )
+    node = platform.node()
+    target = "cron-lease:" + hashlib.sha256(job_id.encode()).hexdigest() + ":" + hashlib.sha256(run_id.encode()).hexdigest()
+    if lease_path.is_symlink() or any(root.is_symlink() for root in (LEASE_DIR, RUNS_BY_RUN_DIR, REPAIR_PENDING_DIR)):
+        raise ValueError("lease-protocol-root-symlink")
+    lease_root, run_root, repair_root = LEASE_DIR.resolve(), RUNS_BY_RUN_DIR.resolve(), REPAIR_PENDING_DIR.resolve()
+    if lease_path.parent.resolve() != lease_root:
+        raise ValueError("lease-protocol-root-mismatch")
+    lease_path = lease_root / lease_path.name
+    roots = tuple((root, (root.stat().st_dev, root.stat().st_ino)) for root in (lease_root, run_root, repair_root))
+    run_path = run_root / (run_id + ".json") if run_id else None
+    repair_path = repair_root / (job_id + "__lease_expired.json")
+
+    def validate_lease(raw):
+        data = json.loads(raw)
+        if (not isinstance(data, dict) or data.get("jobId") != job_id or str(data.get("runId") or "") != run_id
+                or "schemaVersion" in data and (type(data["schemaVersion"]) is not int or data["schemaVersion"] != 1)
+                or type(data.get("expiresAtMs")) is not int or data["expiresAtMs"] > now_ms()
+                or not isinstance(data.get("leaseOwner"), str) or not data["leaseOwner"].strip()
+                or data.get("dispatchState") not in {"not-started", "not-dispatched", "attempted"}):
+            raise ValueError("lease-protocol-schema-invalid")
+        workload = data.get("workloadState")
+        if workload == "not-started":
+            if data.get("workloadOwner") is not None:
+                raise ValueError("lease-protocol-workload-invalid")
+        elif workload == "running":
+            owner = data.get("workloadOwner")
+            if (not isinstance(owner, dict) or owner.get("host") != socket.gethostname()
+                    or type(owner.get("pid")) is not int or owner["pid"] <= 1):
+                raise ValueError("lease-protocol-workload-invalid")
+        else:
+            raise ValueError("lease-protocol-workload-invalid")
+        digest = hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True,
+                                          separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        if digest != canonical_digest:
+            raise ValueError("lease-protocol-canonical-drift")
+        return SchemaBinding("openclaw-lease-files-v1", target,
+                             "lease-owner://sha256/" + hashlib.sha256(data["leaseOwner"].encode()).hexdigest())
+
+    def validate_run(snapshot):
+        if snapshot is None:
+            return  # Existing native operation skips a missing run, never creates it.
+        data = json.loads(snapshot[0])
+        if (not isinstance(data, dict) or data.get("jobId") != job_id or data.get("runId") != run_id
+                or "schemaVersion" in data and (type(data["schemaVersion"]) is not int or data["schemaVersion"] != 1)
+                or data.get("status") not in {"running", "orphaned", "succeeded", "failed"}
+                or type(data.get("startedAtMs")) is not int or data["startedAtMs"] < 0
+                or data.get("status") == "running" and data.get("dispatchState") not in {"not-started", "not-dispatched", "attempted"}
+                or data.get("status") == "orphaned" and not isinstance(data.get("failure"), dict)):
+            raise ValueError("run-protocol-schema-invalid")
+
+    def validate_repair(snapshot):
+        if snapshot is None:
+            return  # Known enqueue_repair_request producer creates schema v1 below this owned root.
+        data = json.loads(snapshot[0])
+        if not isinstance(data, dict):
+            raise ValueError("repair-protocol-type-invalid")
+        version = data.get("schemaVersion")
+        if version is None and LEGACY_REPAIR_REQUEST_REQUIRED_FIELDS <= set(data):
+            version = 0
+        if (type(version) is not int or version not in {0, REPAIR_REQUEST_SCHEMA_VERSION}
+                or not (LEGACY_REPAIR_REQUEST_REQUIRED_FIELDS if version == 0 else REPAIR_REQUEST_REQUIRED_FIELDS) <= set(data)
+                or data.get("jobId") != job_id
+                or any(not isinstance(data.get(key), str) or not data[key].strip() for key in ("reason", "source", "status"))
+                or any(type(data.get(key)) is not int or data[key] < 0 for key in ("firstDetectedAtMs", "lastDetectedAtMs", "count"))
+                or not isinstance(data.get("gate"), dict)):
+            raise ValueError("repair-protocol-schema-invalid")
+
+    captured = lease_effect_file_snapshot(lease_path, lease_root)
+    if captured is None:
+        raise ValueError("lease-protocol-missing")
+    schema = validate_lease(captured[0])
+    companions = [(run_path, run_root, lease_effect_file_snapshot(run_path, run_root))] if run_path else []
+    companions.append((repair_path, repair_root, lease_effect_file_snapshot(repair_path, repair_root)))
+    validate_run(companions[0][2] if run_path else None)
+    validate_repair(companions[-1][2])
+
+    def validate_protocols():
+        for root, expected_identity in roots:
+            current = root.lstat()
+            if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != expected_identity:
+                raise ValueError("lease-protocol-owner-directory-drift")
+        for path, root, expected in companions:
+            current = lease_effect_file_snapshot(path, root)
+            if current != expected:
+                raise ValueError("lease-companion-protocol-drift")
+        if current_host_generation() != generation or platform.node() != node:
+            raise ValueError("lease-node-generation-drift")
+
+    def read_binding(request):
+        if (request.action_type != "cron.expired_lease.repair" or request.operation is not EffectOperation.LEASE_FILES
+                or request.target != target or request.node_id != node or request.generation != generation):
+            raise ValueError("lease-capability-request-out-of-scope")
+        validate_protocols()
+        return FileBinding(request, lease_root, lease_path, captured[1], captured[2], schema)
+
+    def parse_schema(raw):
+        validate_protocols()
+        return validate_lease(raw)
+
+    return EffectCapabilityProvider(clock_ms=lambda: epoch() * 1000,
+        node_reader=lambda: (platform.node(), current_host_generation()),
+        file_reader=read_binding, schema_validator=parse_schema)
+
+
 def governed_reap_expired_lease(
     item: Dict[str, Any], gate: Dict[str, Any], policy: Dict[str, Any], snapshot_generation: str,
 ) -> Dict[str, Any]:
@@ -7145,6 +7287,10 @@ def governed_reap_expired_lease(
         return {"targetRef": target_ref, "result": "blocked",
                 "blockedReason": "lease-owner-or-workload-live-or-unverifiable"}
     lease_digest = lease_state["digest"]
+    try:
+        capability_provider = lease_effect_capability_provider(job_text, run_text, lease_path, generation, lease_digest)
+    except Exception:
+        return {"targetRef": target_ref, "result": "blocked", "blockedReason": "lease-capability-protocol-unavailable"}
     path_digest = hashlib.sha256(str(lease_path.resolve()).encode()).hexdigest()
     policy_digest, policy_ref = policy_reference(policy)
     rule = STANDING_RULES["cron.expired_lease.repair"]
@@ -7183,18 +7329,30 @@ def governed_reap_expired_lease(
         allowed, ref = boundary()
         return (f"evidence://snapshot/{snapshot_generation}", ref) if allowed else ()
 
+    def capability_check():
+        from stability_core.effect_capability import EffectRequest, EffectOperation
+        request = EffectRequest("cron.expired_lease.repair", EffectOperation.LEASE_FILES,
+                                f"cron-lease:{job_digest}:{run_digest}", platform.node(), generation)
+        receipt = capability_provider.assess(request)
+        return capability_provider.accepts(receipt, request), receipt
+
     def precheck(_spec: ActionSpec, _record: Any) -> BoundaryCheck:
         allowed, ref = boundary()
         if not allowed:
             return BoundaryCheck("rejected", "evidence://cron-lease-scope/changed")
-        return BoundaryCheck("approved", ref)
+        capable, receipt = capability_check()
+        if not capable:
+            return BoundaryCheck("rejected", "evidence://cron-lease-capability/unverified")
+        bound = hashlib.sha256(json.dumps([ref, receipt.evidence_ref], separators=(",", ":")).encode()).hexdigest()
+        return BoundaryCheck("approved", "evidence://cron-lease-precheck/sha256/" + bound)
 
     outcome: Dict[str, Any] = {}
     def operation(_spec: ActionSpec, _record: Any) -> OperationResult:
         try:
             with lease_mutation_lock():
                 allowed, _ref = boundary()
-                if not allowed:
+                capable, _receipt = capability_check() if allowed else (False, None)
+                if not allowed or not capable:
                     result = {"result": "blocked", "failedStage": "locked-lease-fence",
                               "partialWrites": {}}
                 else:
@@ -8431,6 +8589,68 @@ def hermers_profile_live_owner(profile: str, expected_agents: List[str], expecte
         return False, "registry-or-generation-unavailable", ""
 
 
+def process_effect_pidfd_protocol_available() -> bool:
+    """Read-only kernel protocol probe on our own process; sends no signal."""
+    opener = getattr(os, "pidfd_open", None)
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if not callable(opener) or not callable(sender):
+        return False
+    try:
+        descriptor = opener(os.getpid(), 0)
+    except (OSError, ValueError):
+        return False
+    try:
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def process_effect_capability_provider(profile: str, expected_agents: List[str],
+                                       generation: str, expected_identity: Dict[str, Any], *, action_type: str):
+    """Build readers from local identity and current registry, never request data."""
+    from stability_core.effect_capability import (
+        EffectCapabilityProvider, EffectOperation, ProcessBinding, read_local_boot_id,
+    )
+    from stability_core.process_identity import IDENTITY_FIELDS
+    captured_identity = copy.deepcopy(expected_identity)
+    captured_agents = tuple(expected_agents)
+    captured_node = platform.node()
+    if action_type not in {"hermes.process.orphan_reap", "hermes.process.idle_lsp_reap"}:
+        raise ValueError("process-capability-action-unsupported")
+
+    def current_process(request):
+        pid = captured_identity.get("pid")
+        if type(pid) is not int or pid <= 1:
+            raise ValueError("process-capability-pid-invalid")
+        if (request.action_type != action_type or request.operation is not EffectOperation.PIDFD_SIGNAL
+                or request.target != f"hermes-process:{profile}:{pid}"
+                or request.generation != generation or request.node_id != captured_node):
+            raise ValueError("process-capability-request-out-of-scope")
+        current = read_process_identity(pid)
+        matched, _reason = identities_match(captured_identity, current)
+        if not matched:
+            raise ValueError("process-capability-identity-changed")
+        owner = current_owner(pid)
+        if not owner:
+            raise ValueError("process-capability-owner-unavailable")
+        return ProcessBinding(request, tuple(current[key] for key in IDENTITY_FIELDS), owner)
+
+    def current_owner(pid):
+        if pid != captured_identity.get("pid"):
+            return None
+        valid, _reason, reference = hermers_profile_live_owner(profile, list(captured_agents), generation)
+        return reference if valid else None
+
+    return EffectCapabilityProvider(
+        clock_ms=lambda: epoch() * 1000,
+        node_reader=lambda: (platform.node(), current_host_generation()),
+        process_reader=current_process, process_owner_reader=current_owner,
+        process_identity_reader=read_process_identity,
+        boot_id_reader=read_local_boot_id,
+        process_protocol_reader=process_effect_pidfd_protocol_available,
+    )
+
+
 def execute_hermers_process_signal(
     item: Dict[str, Any], action_type: str, policy_flag: str, verifier: Any,
     rows_provider: Any,
@@ -8498,8 +8718,21 @@ def execute_hermers_process_signal(
             verified = False
         if not verified:
             return BoundaryCheck("rejected", "evidence://hermes-process-identity/changed")
+        from stability_core.effect_capability import EffectRequest, EffectOperation
+        provider = process_effect_capability_provider(
+            profile, list(item.get("agentIds") or []), generation, identity, action_type=action_type,
+        )
+        request = EffectRequest(action_type, EffectOperation.PIDFD_SIGNAL,
+                                _spec.target, platform.node(), generation)
+        receipt = provider.assess(request)
+        latest["capabilityEvidence"] = receipt.evidence()
+        if not provider.accepts(receipt, request):
+            return BoundaryCheck("rejected", "evidence://hermes-process-capability/unverified")
         latest["scopeRef"] = ref
-        return BoundaryCheck("approved", ref)
+        boundary_digest = hashlib.sha256(json.dumps(
+            [ref, receipt.evidence_ref], separators=(",", ":"),
+        ).encode()).hexdigest()
+        return BoundaryCheck("approved", "evidence://hermes-process-precheck/sha256/" + boundary_digest)
 
     result_box: Dict[str, Any] = {}
     def operation(_spec: ActionSpec, _record: Any) -> OperationResult:
@@ -8538,6 +8771,7 @@ def execute_hermers_process_signal(
     state_map = {"succeeded": "ok", "failed": "failed", "blocked": "blocked", "uncertain": "uncertain"}
     return {**base_result, "result": state_map.get(execution.record.state, "existing"),
             "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
+            "capabilityEvidence": latest.get("capabilityEvidence"),
             "reason": result_box.get("reason") if execution.disposition == "executed" else None}
 
 

@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import shutil
 import sys
 import tempfile
 import unittest
@@ -93,9 +94,15 @@ class ProcessIdentityTest(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
-        identity = {"status": "known", "pid": 42, "starttime": 7, "uid": 1, "euid": 1,
-                    "bootId": "b", "cmdlineDigest": "c", "cgroupDigest": "g"}
-        worker = {"pid": "42", "ppid": "1", "cmd": "/opt/hermes -p catnose acp --accept-hooks",
+        fixture = tempfile.TemporaryDirectory()
+        self.addCleanup(fixture.cleanup)
+        proc = Path(fixture.name) / "proc"
+        pid = 987654321
+        write_proc(proc, pid)
+        raw_boot = "12345678-1234-1234-1234-123456789abc"
+        (proc / "sys/kernel/random/boot_id").write_text(raw_boot)
+        identity = read_process_identity(pid, proc)
+        worker = {"pid": str(pid), "ppid": "1", "cmd": "/opt/hermes -p catnose acp --accept-hooks",
                   "profile": "catnose", "processIdentity": identity, "agentIds": ["cat_nose"],
                   "registryProfile": "catnose", "registryProfileMatched": True,
                   "registryScopeComplete": True}
@@ -110,9 +117,12 @@ class ProcessIdentityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir, \
              mock.patch.object(module, "STATE_DB", Path(tmpdir) / "state.db"), \
              mock.patch.object(module, "workflow_runtime_registry_records", return_value=registry), \
-             mock.patch.object(module, "current_host_generation", return_value="fixture-node:boot-generation"), \
+             mock.patch.object(module, "current_host_generation", return_value="fixture-node:" + raw_boot), \
+             mock.patch.object(module.platform, "node", return_value="fixture-node"), \
+             mock.patch("stability_core.effect_capability.read_local_boot_id", side_effect=lambda: (proc / "sys/kernel/random/boot_id").read_text()), \
+             mock.patch.object(module, "process_effect_pidfd_protocol_available", return_value=True), \
              mock.patch.object(module, "ps_rows", return_value=[worker]), \
-             mock.patch.object(module, "read_process_identity", return_value=identity), \
+             mock.patch.object(module, "read_process_identity", side_effect=lambda value: read_process_identity(value, proc)), \
              mock.patch.object(module, "terminate_process_instance", return_value={"result": "uncertain", "reason": "still-running"}), \
              mock.patch.object(module, "hermers_profile_mode_actuate", return_value=[]):
             actions = module.hermers_actuate(mock.Mock(), snapshot, policy, snapshot_generation="fixture-generation")
@@ -125,8 +135,17 @@ class ProcessIdentityTest(unittest.TestCase):
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         pid = 987654321
-        identity = {"status": "known", "pid": pid, "starttime": 7, "uid": 1, "euid": 1,
-                    "bootId": "b", "cmdlineDigest": "c", "cgroupDigest": "g"}
+        fixture = tempfile.TemporaryDirectory()
+        self.addCleanup(fixture.cleanup)
+        proc = Path(fixture.name) / "proc"
+        write_proc(proc, pid)
+        raw_boot = "12345678-1234-1234-1234-123456789abc"
+        (proc / "sys/kernel/random/boot_id").write_text(raw_boot)
+        identity = read_process_identity(pid, proc)
+        def exited_effect(captured):
+            self.assertEqual(captured, identity)
+            shutil.rmtree(proc / str(pid))
+            return {"result": "succeeded", "reason": "process-exited"}
         worker = {"pid": str(pid), "ppid": "1", "cmd": "/opt/hermes -p catnose acp --accept-hooks",
                   "profile": "catnose", "processIdentity": identity, "agentIds": ["cat_nose"],
                   "registryProfile": "catnose", "registryProfileMatched": True,
@@ -142,11 +161,13 @@ class ProcessIdentityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir, \
              mock.patch.object(module, "STATE_DB", Path(tmpdir) / "state.db"), \
              mock.patch.object(module, "workflow_runtime_registry_records", return_value=registry), \
-             mock.patch.object(module, "current_host_generation", return_value="fixture-node:boot-generation"), \
+             mock.patch.object(module, "current_host_generation", return_value="fixture-node:" + raw_boot), \
+             mock.patch.object(module.platform, "node", return_value="fixture-node"), \
+             mock.patch("stability_core.effect_capability.read_local_boot_id", side_effect=lambda: (proc / "sys/kernel/random/boot_id").read_text()), \
+             mock.patch.object(module, "process_effect_pidfd_protocol_available", return_value=True), \
              mock.patch.object(module, "ps_rows", return_value=[worker]), \
-             mock.patch.object(module, "read_process_identity", side_effect=[identity, identity, identity, identity,
-                                                                               {"status": "unknown", "pid": pid}]), \
-             mock.patch.object(module, "terminate_process_instance", return_value={"result": "succeeded", "reason": "process-exited"}) as signaler, \
+             mock.patch.object(module, "read_process_identity", side_effect=lambda value: read_process_identity(value, proc)), \
+             mock.patch.object(module, "terminate_process_instance", side_effect=exited_effect) as signaler, \
              mock.patch.object(module, "hermers_profile_mode_actuate", return_value=[]):
             first = module.execute_hermers_process_signal(
                 worker, "hermes.process.orphan_reap", "canReapHermersOrphanWorkers",
