@@ -17,6 +17,71 @@ SPEC.loader.exec_module(stabilityd)
 
 
 class SessionActuatorTests(unittest.TestCase):
+    def test_handler_entry_receipt_completes_actual_governed_reset_and_persists_only_digests(self):
+        key, session_id = 'agent:cat_voice:fixture:private-channel', 'private-stable-session-id'
+        effects = []
+        registry = self._registry()
+        registry['records'][0].update(agent_id='cat_voice', endpoint_ref='openclaw-agent:cat_voice')
+        def command(argv, **kwargs):
+            self.assertEqual(argv[:3], ['openclaw', 'gateway', 'call'])
+            params = json.loads(argv[argv.index('--params') + 1])
+            self.assertEqual(params['key'], key)
+            if argv[3] == 'sessions.describe':
+                response = {'key': key, 'agentId': 'cat_voice', 'sessionId': session_id, 'hasActiveRun': False}
+            elif argv[3] == 'sessions.reset':
+                self.assertEqual(params['expectedSessionId'], session_id)
+                effects.append(params)
+                response = {'ok': True, 'key': key, 'entry': {'sessionId': session_id,
+                            'private': 'SYNTHETIC_PRIVATE_ENTRY'}, 'resolved': {}}
+            else:
+                self.fail('unexpected runtime method')
+            return SimpleNamespace(returncode=0, stdout=json.dumps(response), stderr='')
+        with tempfile.TemporaryDirectory() as directory, stabilityd.init_memory_kv_db() as conn:
+            path = Path(directory) / 'ledger.db'
+            policy = dict(canResetSession=True, updatedAtEpoch=999, validUntilEpoch=1060)
+            with mock.patch.object(stabilityd, 'STATE_DB', path), \
+                 mock.patch.object(stabilityd, 'epoch', return_value=1000), \
+                 mock.patch.object(stabilityd, 'now_ms', return_value=1000000), \
+                 mock.patch.object(stabilityd, 'current_host_generation', return_value='fixture-node:boot'), \
+                 mock.patch.object(stabilityd, 'workflow_runtime_registry_records', return_value=registry), \
+                 mock.patch.object(stabilityd, 'analyze_session_activity', return_value={'active': False, 'heavy': False}), \
+                 mock.patch.object(stabilityd, 'run_cmd', side_effect=command):
+                first = stabilityd.governed_reset_session(conn, key, 'repeated_failures', policy, 'fixture-generation', session_id)
+                second = stabilityd.governed_reset_session(conn, key, 'repeated_failures', policy, 'fixture-generation', session_id)
+            self.assertEqual(first['ledgerState'], 'succeeded')
+            self.assertEqual(second['ledgerDisposition'], 'existing')
+            self.assertEqual(len(effects), 1)
+            for sentinel in (key, session_id, 'SYNTHETIC_PRIVATE_ENTRY'):
+                self.assertNotIn(sentinel, str(first))
+                self.assertNotIn(sentinel.encode(), path.read_bytes())
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM kv').fetchone()[0], 1)
+
+    def test_actual_handler_entry_receipt_is_normalized_without_session_payload(self):
+        key = 'agent:cat_voice:fixture'
+        receipt = {'ok': True, 'key': key, 'entry': {'sessionId': 'reset-id',
+                   'privatePayload': 'SYNTHETIC_PRIVATE_SESSION'}, 'resolved': {'private': 'SYNTHETIC_PRIVATE_SESSION'}}
+        for envelope in (receipt, {'ok': True, 'result': receipt}):
+            with self.subTest(envelope=envelope), mock.patch.object(stabilityd, 'run_cmd', return_value=SimpleNamespace(
+                    returncode=0, stdout=json.dumps(envelope), stderr='')):
+                result, status = stabilityd.openclaw_gateway_call('sessions.reset', {'key': key})
+                self.assertEqual(status, 'ok')
+                self.assertEqual(result, {'sessionId': 'reset-id'})
+                self.assertNotIn('SYNTHETIC_PRIVATE_SESSION', str(result))
+
+    def test_entry_receipt_wrong_target_missing_identity_or_unknown_schema_is_rejected(self):
+        key = 'agent:cat_voice:fixture'
+        for receipt in ({'ok': True, 'key': 'different', 'entry': {'sessionId': 'id'}},
+                        {'ok': True, 'key': key, 'entry': []},
+                        {'ok': True, 'key': key, 'entry': {}},
+                        {'ok': True, 'entry': {'sessionId': 'id'}},
+                        {'ok': 'true', 'key': key, 'entry': {'sessionId': 'id'}},
+                        {'ok': True, 'key': key, 'entry': {'sessionId': True}}):
+            with self.subTest(receipt=receipt), mock.patch.object(stabilityd, 'run_cmd', return_value=SimpleNamespace(
+                    returncode=0, stdout=json.dumps(receipt), stderr='')):
+                result, status = stabilityd.openclaw_gateway_call('sessions.reset', {'key': key})
+                self.assertIsNone(result)
+                self.assertIn(status, {'gateway-reset-target-mismatch', 'gateway-reset-invalid-receipt'})
+
     def _registry(self):
         return {"source": "db", "writeEligible": True, "records": [{
             "agent_id": "catbody", "runtime": "openclaw", "platform": "openclaw",

@@ -7480,6 +7480,22 @@ def openclaw_gateway_call(method: str, params: Dict[str, Any], timeout_seconds: 
     if payload.get("ok") is False or payload.get("error"):
         return None, "gateway-rpc-rejected"
     result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    if method == "sessions.reset":
+        if "key" in result and result["key"] != params.get("key"):
+            return None, "gateway-reset-target-mismatch"
+        if "entry" in result:
+            # Current server handler returns {ok,key,entry,resolved}. Never
+            # expose unrelated session fields as reset completion evidence.
+            entry = result.get("entry")
+            expected_key = params.get("key")
+            if (result.get("ok") is not True or not isinstance(entry, dict)
+                    or not isinstance(expected_key, str) or not expected_key.strip()
+                    or result.get("key") != expected_key):
+                return None, "gateway-reset-invalid-receipt"
+            session_id = entry.get("sessionId")
+            if not isinstance(session_id, str) or not session_id.strip():
+                return None, "gateway-reset-invalid-receipt"
+            return {"sessionId": session_id}, "ok"
     if isinstance(result.get("session"), dict):
         result = result["session"]
     return result, "ok"
