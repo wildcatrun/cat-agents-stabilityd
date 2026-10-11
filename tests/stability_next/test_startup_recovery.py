@@ -89,6 +89,30 @@ raise SystemExit(m.daemon_loop())
 
 
 class StartupRecoveryTests(unittest.TestCase):
+    def test_physical_store_corruption_blocks_daemon_before_collection_or_effect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / 'state.db'
+            damaged = b'CORRUPT_PRIVATE_STATE_SENTINEL\x00not-sqlite'
+            database.write_bytes(damaged)
+            logs = []
+            with mock.patch.object(m, 'STATE_DB', database), \
+                 mock.patch.object(m, 'LOCK_PATH', root / 'daemon.lock'), \
+                 mock.patch.object(m, 'ensure_dirs'), \
+                 mock.patch.object(m.signal, 'signal'), \
+                 mock.patch.object(m, 'log_line', side_effect=logs.append), \
+                 mock.patch.object(m, 'run_once') as cycle:
+                self.assertEqual(m.daemon_loop(), 1)
+                cycle.assert_not_called()
+            self.assertEqual(database.read_bytes(), damaged)
+            self.assertEqual(len(logs), 1)
+            self.assertIn('startup_blocked stage=state-store errorClass=DatabaseError', logs[0])
+            self.assertIn('actionReadiness=unknown automaticRecovery=false', logs[0])
+            self.assertNotIn('CORRUPT_PRIVATE_STATE_SENTINEL', str(logs))
+            self.assertEqual({p.name for p in root.iterdir()}, {'state.db', 'daemon.lock'})
+            with (root / 'daemon.lock').open('a+') as handle:
+                m.fcntl.flock(handle.fileno(), m.fcntl.LOCK_EX | m.fcntl.LOCK_NB)
+
     def test_large_recovery_query_budget_returns_unknown_and_releases_read_transaction(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'state.db'

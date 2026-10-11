@@ -9824,7 +9824,14 @@ def daemon_loop(no_action: bool = False) -> int:
         signal.signal(signal.SIGTERM, handle_signal)
         signal.signal(signal.SIGINT, handle_signal)
 
-        conn = init_db()
+        try:
+            conn = init_db()
+        except Exception as exc:
+            # The store cannot safely persist its own failure. Keep the original
+            # bytes for controlled recovery and emit only a journal classification.
+            log_line(f"startup_blocked stage=state-store errorClass={type(exc).__name__} "
+                     "actionReadiness=unknown automaticRecovery=false")
+            return 1
         _inspection_cache_enabled = True
         log_line(f"daemon started interval={INTERVAL_SECONDS}s no_action={no_action}")
         while not stopping["value"]:
