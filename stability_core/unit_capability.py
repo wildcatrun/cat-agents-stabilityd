@@ -1,0 +1,108 @@
+"""Bound actual systemd properties and owned unit files; no service mutations."""
+import hashlib
+import os
+from pathlib import Path
+import re
+import shlex
+import stat
+
+from .adapter_contract import sha256_file
+from .effect_capability import FileBinding, SchemaBinding, UnitBinding, UnitEffectiveConfiguration
+
+
+UNIT_ROOTS = (Path('/etc/systemd/system'), Path('/usr/lib/systemd/system'))
+PROPERTIES = ('Id', 'LoadState', 'FragmentPath', 'DropInPaths', 'ExecStart')
+
+
+def parse_unit_properties(text, unit):
+    if type(text) is not str or len(text.encode()) > 32768:
+        raise ValueError('unit-properties-budget')
+    values = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition('=')
+        if not separator or key not in PROPERTIES or key in values:
+            raise ValueError('unit-properties-invalid')
+        values[key] = value
+    if set(values) != set(PROPERTIES) or values['Id'] != unit or values['LoadState'] != 'loaded':
+        raise ValueError('unit-properties-incomplete')
+    # systemctl's native property serialization. Reject expansion/escaped or
+    # multiple command records rather than interpreting them as shell input.
+    commands = re.findall(r'argv\[\]=(.*?)\s*;', values['ExecStart'])
+    if len(commands) != 1 or values['ExecStart'].count('{') != 1 or values['ExecStart'].count('}') != 1:
+        raise ValueError('unit-execstart-unsupported')
+    command = commands[0].strip()
+    if any(char in command for char in ('\\', '$', '%', '\n', '\r')):
+        raise ValueError('unit-execstart-expansion')
+    argv = tuple(shlex.split(command))
+    if not argv or len(argv) > 128 or not Path(argv[0]).is_absolute():
+        raise ValueError('unit-execstart-invalid')
+    executable_paths = re.findall(r'\bpath=(.*?)\s*;', values['ExecStart'])
+    if executable_paths != [argv[0]]:
+        raise ValueError('unit-effective-executable-conflict')
+    paths = values['DropInPaths'].split()
+    if len(paths) > 16 or len(set(paths)) != len(paths) or any('\\' in p for p in paths):
+        raise ValueError('unit-dropins-invalid')
+    fragment = Path(values['FragmentPath'])
+    drops = tuple(Path(p) for p in paths)
+    if not fragment.is_absolute() or any(not p.is_absolute() for p in drops):
+        raise ValueError('unit-file-path-invalid')
+    return fragment, drops, argv
+
+
+def _file_binding(path, request, owner):
+    if any(p.is_symlink() for p in (path, *path.parents)):
+        raise ValueError('unit-file-symlink')
+    root = next((r for r in UNIT_ROOTS if r.is_absolute() and r in path.parents), None)
+    if root is None:
+        raise ValueError('unit-file-owner-root')
+    root_info = root.stat()
+    if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid not in {0, os.getuid()}
+            or root_info.st_mode & 0o022):
+        raise ValueError('unit-root-owner-mode')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 65536
+                or before.st_uid not in {0, os.getuid()} or before.st_mode & 0o022):
+            raise ValueError('unit-file-owner-mode')
+        raw = bytearray()
+        while len(raw) <= 65536:
+            part = os.read(fd, min(8192, 65537 - len(raw)))
+            if not part: break
+            raw.extend(part)
+        identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        after = os.fstat(fd)
+        final = path.lstat()
+        if len(raw) > 65536 or identity(before) != identity(after) or identity(after) != identity(final):
+            raise ValueError('unit-file-read-drift')
+        return FileBinding(request, root, path, (before.st_dev, before.st_ino),
+                           hashlib.sha256(raw).hexdigest(), SchemaBinding('systemd-unit-v1', request.target, owner))
+    finally:
+        os.close(fd)
+
+
+def read_unit_binding(request, *, unit, read_properties, clock_ms):
+    if not re.fullmatch(r'[A-Za-z0-9_.@-]+\.service', unit):
+        raise ValueError('unit-name-invalid')
+    fragment, drops, argv = parse_unit_properties(read_properties(unit), unit)
+    owner = 'runtime-unit://' + unit
+    file = _file_binding(fragment, request, owner)
+    drop_files = tuple(_file_binding(p, request, owner) for p in drops)
+    executable = Path(argv[0])
+    if any(p.is_symlink() for p in (executable, *executable.parents)):
+        raise ValueError('unit-executable-symlink')
+    executable_info = executable.stat()
+    if (not stat.S_ISREG(executable_info.st_mode) or executable_info.st_uid not in {0, os.getuid()}
+            or executable_info.st_mode & 0o022 or not os.access(executable, os.X_OK)):
+        raise ValueError('unit-executable-owner-mode')
+    return UnitBinding(request, unit, file, executable, sha256_file(str(executable)), owner,
+                       drop_files, UnitEffectiveConfiguration(fragment, drops, argv, request.node_id,
+                       request.generation, clock_ms(), 'complete'))
+
+
+def binding_identity(binding):
+    """Exclude observation time; pin configuration and artifact across claims."""
+    return (binding.unit, binding.fragment, binding.dropin_files, binding.executable,
+            binding.executable_sha256, binding.runtime_owner_ref, binding.effective_config.fragment_path,
+            binding.effective_config.dropin_paths, binding.effective_config.execstart_argv,
+            binding.effective_config.node_id, binding.effective_config.generation)

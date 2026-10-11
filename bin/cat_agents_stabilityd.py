@@ -7714,6 +7714,37 @@ def execute_governed_effect(
         return executor.execute(spec)
 
 
+def read_gateway_unit_properties(unit: str) -> str:
+    if unit != "openclaw-gateway.service":
+        raise ValueError("gateway-unit-target-invalid")
+    from stability_core.unit_capability import PROPERTIES
+    result = run_cmd(["systemctl", "show", unit, "--property=" + ",".join(PROPERTIES)], timeout=8)
+    if result.returncode != 0:
+        raise ValueError("gateway-unit-properties-unavailable")
+    return result.stdout
+
+
+def gateway_effect_capability_provider(generation: str):
+    from stability_core.effect_capability import EffectCapabilityProvider, EffectRequest, EffectOperation
+    from stability_core.unit_capability import read_unit_binding, binding_identity
+    request = EffectRequest("openclaw.gateway.restart", EffectOperation.SYSTEMD_UNIT,
+                            "openclaw-gateway:dev-server", platform.node(), generation)
+    pinned = {"identity": None}
+    def reader(current):
+        if current != request:
+            raise ValueError("gateway-unit-request-drift")
+        binding = read_unit_binding(current, unit="openclaw-gateway.service",
+                                    read_properties=read_gateway_unit_properties, clock_ms=now_ms)
+        identity = binding_identity(binding)
+        if pinned["identity"] is None:
+            pinned["identity"] = identity
+        elif pinned["identity"] != identity:
+            raise ValueError("gateway-unit-binding-drift")
+        return binding
+    return EffectCapabilityProvider(clock_ms=now_ms,
+        node_reader=lambda: (platform.node(), current_host_generation()), unit_reader=reader), request
+
+
 def gateway_restart(
     conn: sqlite3.Connection,
     reason: str,
@@ -7807,6 +7838,8 @@ def gateway_restart(
         metadata={"actor": "cat-agents-stabilityd", "request_source": "stabilityd-daemon"},
     )
     latest_scope = {"value": current_scope}
+    unit_provider, unit_request = gateway_effect_capability_provider(str(decision_generation))
+    unit_evidence = {"value": {"status": "unknown", "reason": "not-assessed", "actionAuthorized": False}}
 
     def evidence(spec_: ActionSpec, loaded_policy: Dict[str, Any], now_ms: int) -> tuple[str, ...]:
         if (
@@ -7840,7 +7873,12 @@ def gateway_restart(
             or scope.status == "protected" and allow_protected_impact is not True
         ):
             return BoundaryCheck("rejected", "evidence://gateway-impact/unknown")
-        return BoundaryCheck("approved", scope_reference(scope))
+        capability = unit_provider.assess(unit_request)
+        unit_evidence["value"] = capability.evidence()
+        if not unit_provider.accepts(capability, unit_request):
+            return BoundaryCheck("rejected", "evidence://gateway-mechanism/unknown")
+        combined = hashlib.sha256((scope_reference(scope) + str(capability.evidence_ref)).encode()).hexdigest()
+        return BoundaryCheck("approved", "evidence://gateway-precheck/sha256/" + combined)
 
     operation_meta: dict[str, Any] = {}
 
@@ -7900,6 +7938,7 @@ def gateway_restart(
         "exitCode": operation_meta.get("exitCode"), "durationMs": operation_meta.get("durationMs"),
         "stderrOmitted": True, "stderrByteCount": operation_meta.get("stderrByteCount", 0),
         "blockedReason": "durable-authority-or-precheck-denied" if state == "blocked" else None,
+        "capabilityEvidence": unit_evidence["value"],
         "protectionScope": {
             "status": getattr(scope, "status", "unknown"),
             "reason": getattr(scope, "reason", "unknown"),

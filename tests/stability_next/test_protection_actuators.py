@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from stability_core.protected_scope import ProtectionDecision
+from stability_core import unit_capability
 
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / "bin" / "cat_agents_stabilityd.py"
@@ -18,6 +19,23 @@ SPEC.loader.exec_module(stabilityd)
 
 
 class ProtectionActuatorTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name).resolve()
+        binary = root / 'fixture-runtime'
+        binary.write_bytes(b'synthetic-runtime-executable')
+        binary.chmod(0o700)
+        unit = root / 'openclaw-gateway.service'
+        unit.write_text('[Service]\nExecStart=' + str(binary) + ' --fixture\n')
+        properties = ('Id=openclaw-gateway.service\nLoadState=loaded\nFragmentPath=' + str(unit)
+                      + '\nDropInPaths=\nExecStart={ path=' + str(binary) + ' ; argv[]='
+                      + str(binary) + ' --fixture ; ignore_errors=no ; }\n')
+        for patch in (mock.patch.object(unit_capability, 'UNIT_ROOTS', (root,)),
+                      mock.patch.object(stabilityd, 'read_gateway_unit_properties', return_value=properties)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
     def test_hermes_process_reap_fails_closed_when_owner_scope_unknown(self):
         process = {
             "pid": "42", "ppid": "99", "cmd": "python /home/flashcat/.hermes/profiles/catnose/lsp/server/pyright-langserver --stdio",
