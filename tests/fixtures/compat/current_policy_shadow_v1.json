@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "baselineCommit": "3f742b490fc4fa67d15727668d5c720b6034631d",
-  "candidateCommit": "d28b7f187a4dc5f1fedf74c128f5a5210c54fb44",
+  "candidateCommit": "b6dbbaceaf60f94e4e98e30657850b27b782ad8f",
   "boundary": "selected hash-pinned pure policy functions; synthetic configuration, time, histories and recovery; no collector/actuator/module body",
   "pins": {
     "baseline": {
@@ -18,7 +18,7 @@
       }
     },
     "candidate": {
-      "sourceSha256": "5f3889d2ba0da8cd377d4a47717299926f5f433abe8309e0c754fbef6825857d",
+      "sourceSha256": "5e5accd7719ce3d837e01d905c0d0a57d00c0828a73a409a3c4990f483f3b3b2",
       "functions": {
         "max_severity": "888d3f29e901da76e93cab0e3288b526385b6635c69af0560e159fb90c3377cb",
         "resource_pressure_active": "7b273e61dc2a698846e31126cc9d95433b4078ecce551573a81bace2319baca7",
