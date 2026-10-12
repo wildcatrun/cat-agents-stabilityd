@@ -27,7 +27,7 @@ class SessionActuatorTests(unittest.TestCase):
             params = json.loads(argv[argv.index('--params') + 1])
             self.assertEqual(params['key'], key)
             if argv[3] == 'sessions.describe':
-                response = {'key': key, 'agentId': 'cat_voice', 'sessionId': session_id, 'hasActiveRun': False}
+                response = {'session': {'key': key, 'agentId': 'cat_voice', 'sessionId': session_id, 'hasActiveRun': False}}
             elif argv[3] == 'sessions.reset':
                 self.assertEqual(params['expectedSessionId'], session_id)
                 effects.append(params)
@@ -67,6 +67,36 @@ class SessionActuatorTests(unittest.TestCase):
                 self.assertEqual(status, 'ok')
                 self.assertEqual(result, {'sessionId': 'reset-id'})
                 self.assertNotIn('SYNTHETIC_PRIVATE_SESSION', str(result))
+
+    def test_describe_partial_activity_or_wrong_agent_never_becomes_reset_eligible(self):
+        key = 'agent:cat_voice:fixture'
+        registry = self._registry()
+        registry['records'][0].update(agent_id='cat_voice', endpoint_ref='openclaw-agent:cat_voice')
+        base = dict(key=key, agentId='cat_voice', sessionId='fixture-id')
+        cases = [(base, 'gateway-active-run-state-unavailable')]
+        cases.extend(({**base, 'hasActiveRun': value}, 'gateway-active-run-state-unavailable')
+                     for value in (None, 0, 'false'))
+        cases.append(({**base, 'agentId': 'different', 'hasActiveRun': False}, 'gateway-session-agent-mismatch'))
+        cases.append((None, 'gateway-session-id-unavailable'))
+        for row, expected in cases:
+            with self.subTest(row=row), tempfile.TemporaryDirectory() as directory, \
+                 mock.patch.object(stabilityd, 'STATE_DB', Path(directory) / 'ledger.db'), \
+                 mock.patch.object(stabilityd, 'current_host_generation', return_value='fixture-node:boot'), \
+                 mock.patch.object(stabilityd, 'workflow_runtime_registry_records', return_value=registry), \
+                 mock.patch.object(stabilityd, 'run_cmd', return_value=SimpleNamespace(
+                     returncode=0, stdout=json.dumps({'session': row}), stderr='')) as command, \
+                 mock.patch.object(stabilityd, 'analyze_session_activity') as analyze, \
+                 mock.patch.object(stabilityd, 'reset_session') as reset:
+                context = stabilityd.current_session_context(key)
+                self.assertIsNone(context[0])
+                self.assertEqual(context[2], expected)
+                result = stabilityd.governed_reset_session(mock.Mock(), key, 'repeated_failures',
+                    {'canResetSession': True}, 'fixture-generation', 'fixture-id')
+                self.assertEqual(result['result'], 'blocked')
+                self.assertEqual(result['blockedReason'], expected)
+                self.assertFalse((Path(directory) / 'ledger.db').exists())
+                analyze.assert_not_called(); reset.assert_not_called()
+                self.assertEqual(command.call_args.args[0][3], 'sessions.describe')
 
     def test_entry_receipt_wrong_target_missing_identity_or_unknown_schema_is_rejected(self):
         key = 'agent:cat_voice:fixture'

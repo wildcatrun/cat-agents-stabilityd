@@ -7518,6 +7518,8 @@ def current_session_context(session_key: str) -> Tuple[Optional[Dict[str, Any]],
         return None, {}, "gateway-session-read-unavailable"
     if str(row.get("key") or row.get("sessionKey") or session_key) != session_key:
         return None, {}, "gateway-session-key-mismatch"
+    if "agentId" in row and row["agentId"] != agent_id:
+        return None, {}, "gateway-session-agent-mismatch"
     session_id = row.get("sessionId")
     if not isinstance(session_id, str) or not session_id.strip():
         return None, {}, "gateway-session-id-unavailable"
