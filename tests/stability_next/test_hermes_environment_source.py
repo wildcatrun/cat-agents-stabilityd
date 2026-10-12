@@ -143,3 +143,56 @@ class EnvironmentSourceTests(unittest.TestCase):
             return result
         with mock.patch.object(module,'read_environment_source',side_effect=read):
             with self.assertRaises(ValueError):module.read_environment_sources([(path,True)],owner_uid=os.getuid())
+
+class EnvironmentProjectionFenceTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(dir=Path.home())
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.path = self.root / '.env'
+        self.path.write_bytes(b'HERMES_HOME=/fixture\nSECRET=private-fixture\n')
+        self.path.chmod(0o600)
+
+    def project(self, parser, **kw):
+        from stability_core.hermes_environment_source import _read_environment_source_projection
+        return _read_environment_source_projection(self.path, owner_uid=os.getuid(), projector=parser, **kw)
+
+    def test_projection_and_digest_share_actual_fd_bytes(self):
+        evidence, projection = self.project(lambda data: hashlib.sha256(data).hexdigest())
+        self.assertEqual(evidence.sha256, projection)
+        self.assertFalse(evidence.action_authorized)
+        self.assertNotIn('private-fixture', repr(evidence))
+
+    def test_parser_replacement_cannot_publish_projection(self):
+        def parser(data):
+            replacement = self.root / 'replacement'
+            replacement.write_bytes(data)
+            replacement.chmod(0o600)
+            os.replace(replacement, self.path)
+            return 'would-have-passed'
+        with self.assertRaisesRegex(ValueError, 'projection drift'):
+            self.project(parser)
+
+    def test_parser_exception_redacted_and_fd_closed(self):
+        closed = []
+        original = os.close
+        def close(fd):
+            closed.append(fd)
+            return original(fd)
+        def parser(data):
+            raise RuntimeError(data.decode())
+        with mock.patch('os.close', side_effect=close):
+            with self.assertRaises(ValueError) as caught:
+                self.project(parser)
+        self.assertEqual(str(caught.exception), 'environment source projection refused')
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertEqual(len(closed), 1)
+
+    def test_absent_source_never_invokes_parser(self):
+        self.path.unlink()
+        parser = mock.Mock(side_effect=RuntimeError('must not parse absence'))
+        evidence, projection = self.project(parser, optional=True)
+        self.assertFalse(evidence.present)
+        self.assertIsNone(projection)
+        parser.assert_not_called()
