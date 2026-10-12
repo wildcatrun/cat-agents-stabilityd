@@ -896,6 +896,21 @@ def run_hermes_profile_gateway_cmd(profile: str, command: str, timeout: int = 60
     return run_user_cmd(cmd, timeout=timeout)
 
 
+def hermes_gateway_operation_unconfirmed(proc: subprocess.CompletedProcess[str]) -> bool:
+    """A successful CLI exit can acknowledge intent without confirming the effect.
+
+    Host-multiplexer lifecycle commands print these negative receipts while
+    returning zero. Never persist their raw output or let a liveness postcheck
+    turn such a pending operation into a confirmed repair.
+    """
+    for output in (proc.stdout, proc.stderr):
+        if isinstance(output, str) and re.search(
+                r"\b(?:not\s+confirmed|still\s+pending|did\s+not\s+answer)\b",
+                output, re.IGNORECASE):
+            return True
+    return False
+
+
 def command_probe(cmd: List[str], timeout: int = 5, max_chars: int = 16_000) -> Dict[str, Any]:
     started = time.time()
     try:
@@ -8132,6 +8147,8 @@ def hermers_gateway_restart(
                               stderrByteCount=len(proc.stderr or ""))
         if proc.returncode != 0:
             return OperationResult("partial", f"outcome://hermes-gateway-restart/exit-{proc.returncode}")
+        if hermes_gateway_operation_unconfirmed(proc):
+            return OperationResult("partial", "outcome://hermes-gateway-restart/unconfirmed")
         db_set(conn, last_key, epoch())
         record_hermers_gateway_restart_time(conn, profile)
         return OperationResult("complete", f"outcome://hermes-gateway-restart/{record.action_id}")
@@ -8516,6 +8533,8 @@ def execute_hermers_profile_lifecycle(
                               stderrByteCount=len(proc.stderr or ""))
         if proc.returncode != 0:
             return OperationResult("partial", f"outcome://hermes-profile-{action}/exit-{proc.returncode}")
+        if hermes_gateway_operation_unconfirmed(proc):
+            return OperationResult("partial", f"outcome://hermes-profile-{action}/unconfirmed")
         db_set(conn, action_key, epoch())
         if target_mode == "hibernate":
             db_set(conn, f"hermers_profile_mode:planned:{profile}",

@@ -204,6 +204,44 @@ class ProtectionActuatorTests(unittest.TestCase):
         state_write.assert_called_once()
         history_write.assert_called_once()
 
+    def test_hermes_gateway_restart_pending_receipt_stays_uncertain_despite_healthy_status(self):
+        registry = {"source": "db", "writeEligible": True, "records": [{
+            "agent_id": "cat_body", "runtime": "hermes_acp", "platform": "hermes",
+            "execution_adapter": "hermes_acp", "endpoint_ref": "hermes-profile:catbody",
+            "status": "active",
+        }]}
+        profile = "catbody"
+        unit = f"hermes-gateway-{profile}.service"
+        reason = "hermers-gateway-service-down"
+        policy = {"canRestartHermersGateway": True, "hermersGatewayRestartReason": reason,
+                  "hermersGatewayRestartProfiles": [{"profile": profile, "unit": unit}],
+                  "updatedAtEpoch": stabilityd.epoch() - 1,
+                  "validUntilEpoch": stabilityd.epoch() + 60}
+        command_ok = SimpleNamespace(returncode=0, stdout="Gateway active and running", stderr="")
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             mock.patch.object(stabilityd, "STATE_DB", Path(tmpdir) / "state.db"), \
+             mock.patch.object(stabilityd, "db_get", return_value=0), \
+             mock.patch.object(stabilityd, "db_set") as state_write, \
+             mock.patch.object(stabilityd, "record_hermers_gateway_restart_time") as history_write, \
+             mock.patch.object(stabilityd, "workflow_runtime_registry_records", return_value=registry), \
+             mock.patch.object(stabilityd, "current_host_generation", return_value="boot:fixture"), \
+             mock.patch.object(stabilityd, "systemctl_user_show", return_value={"ActiveState": "inactive", "SubState": "dead"}), \
+             mock.patch.object(stabilityd, "run_hermes_profile_gateway_cmd", side_effect=[SimpleNamespace(returncode=0, stdout="Profile restart was not confirmed: host operation is still pending FIXTURE_SECRET", stderr=""), command_ok]) as run_cmd:
+            first = stabilityd.hermers_gateway_restart(
+                mock.Mock(), profile, unit, reason, policy=policy, snapshot_generation="fixture-gen",
+            )
+            second = stabilityd.hermers_gateway_restart(
+                mock.Mock(), profile, unit, reason, policy=policy, snapshot_generation="fixture-gen",
+            )
+        self.assertEqual(first["ledgerState"], "uncertain")
+        self.assertEqual(first["result"], "uncertain")
+        self.assertEqual(second["ledgerDisposition"], "existing")
+        self.assertEqual(run_cmd.call_count, 2)  # one restart plus its status postcheck
+        state_write.assert_not_called()
+        history_write.assert_not_called()
+
+        self.assertNotIn("FIXTURE_SECRET", str(first))
+
     def test_hermes_gateway_restart_blocks_profile_owner_change_at_final_fence(self):
         def registry(owner):
             return {"source": "db", "writeEligible": True, "records": [{
@@ -358,6 +396,49 @@ class ProtectionActuatorTests(unittest.TestCase):
         self.assertEqual(second["ledgerDisposition"], "existing")
         run_cmd.assert_called_once()
         self.assertEqual(state_write.call_count, 2)
+
+    def test_hermes_profile_stop_pending_receipt_stays_uncertain_despite_inactive_unit(self):
+        profile = "catbody"
+        item = {"profile": profile, "agentIds": ["cat_body"], "managed": True,
+                "activeWork": False, "active": True, "targetMode": "hibernate",
+                "safeToHibernate": True, "unit": f"hermes-gateway-{profile}.service",
+                "reason": "idle-threshold"}
+        registry = {"source": "db", "writeEligible": True, "records": [{
+            "agent_id": "cat_body", "runtime": "hermes_acp", "platform": "hermes",
+            "execution_adapter": "hermes_acp", "endpoint_ref": "hermes-profile:catbody",
+            "status": "active", "can_receive_dispatch": 1,
+        }]}
+        policy = {"hermersProfileModeActuateEnabled": True,
+                  "updatedAtEpoch": stabilityd.epoch() - 1,
+                  "validUntilEpoch": stabilityd.epoch() + 60}
+        active_service = {"ActiveState": "active", "SubState": "running"}
+        stopped_service = {"ActiveState": "inactive", "SubState": "dead"}
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             mock.patch.object(stabilityd, "STATE_DB", Path(tmpdir) / "state.db"), \
+             mock.patch.object(stabilityd, "HERMERS_PROFILE_LIFECYCLE_ALLOWLIST", {profile}), \
+             mock.patch.object(stabilityd, "workflow_runtime_registry_records", return_value=registry), \
+             mock.patch.object(stabilityd, "current_host_generation", return_value="boot:fixture"), \
+             mock.patch.object(stabilityd, "hermers_profile_workflow_activity", return_value={profile: {
+                 "probeOk": True, "activeRuntimeCount": 0, "activeDispatchCount": 0,
+             }}), \
+             mock.patch.object(stabilityd, "systemctl_user_show", side_effect=[active_service] * 4 + [stopped_service]), \
+             mock.patch.object(stabilityd, "run_hermes_profile_gateway_cmd",
+                               return_value=SimpleNamespace(returncode=0, stdout="Profile parked, but immediate stop was not confirmed: host control socket did not answer FIXTURE_SECRET", stderr="")) as run_cmd, \
+             mock.patch.object(stabilityd, "db_get", return_value=0), \
+             mock.patch.object(stabilityd, "db_set") as state_write:
+            first = stabilityd.execute_hermers_profile_lifecycle(
+                mock.Mock(), profile, item, "hibernate", policy, "fixture-generation",
+            )
+            second = stabilityd.execute_hermers_profile_lifecycle(
+                mock.Mock(), profile, item, "hibernate", policy, "fixture-generation",
+            )
+        self.assertEqual(first["ledgerState"], "uncertain")
+        self.assertEqual(first["result"], "uncertain")
+        self.assertEqual(second["ledgerDisposition"], "existing")
+        run_cmd.assert_called_once()
+        state_write.assert_not_called()
+
+        self.assertNotIn("FIXTURE_SECRET", str(first))
 
     def test_hermes_profile_lifecycle_blocks_protected_profile(self):
         profile = "catheart"
