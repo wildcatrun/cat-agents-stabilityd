@@ -6,7 +6,8 @@ import re
 import shlex
 
 PROPERTIES = frozenset({'Environment', 'EnvironmentFiles', 'PassEnvironment', 'UnsetEnvironment'})
-GOVERNANCE_KEYS = frozenset({'HERMES_HOME', 'GATEWAY_MULTIPLEX_PROFILES', 'PYTHONPATH'})
+GOVERNANCE_KEYS = frozenset({'HERMES_HOME', 'GATEWAY_MULTIPLEX_PROFILES', 'PYTHONPATH',
+                             'HERMES_MANAGED_DIR', 'PYTEST_CURRENT_TEST', 'HERMES_UPDATE_POST_SWAP'})
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,16 @@ def project_environment_properties(text):
             if name in GOVERNANCE_KEYS:
                 if name == 'HERMES_HOME' and (not Path(value).is_absolute() or '..' in Path(value).parts):
                     raise ValueError('noncanonical runtime home')
+                if name == 'HERMES_MANAGED_DIR':
+                    value = value.strip()
+                    if not value:
+                        value = 'default-scope'
+                    elif not Path(value).is_absolute() or '..' in Path(value).parts:
+                        raise ValueError('noncanonical managed scope')
+                if name == 'PYTEST_CURRENT_TEST':
+                    value = 'present'  # Installed resolver tests membership, even for empty value.
+                if name == 'HERMES_UPDATE_POST_SWAP':
+                    value = 'true' if value == '1' else 'false'
                 if name == 'GATEWAY_MULTIPLEX_PROFILES':
                     normalized = value.strip().lower()
                     value = ('true' if normalized in {'1', 'true', 'yes', 'on'} else
@@ -63,3 +74,34 @@ def project_environment_properties(text):
                                  tuple(sorted(unset & GOVERNANCE_KEYS)),
                                  bool(properties['EnvironmentFiles'].strip()),
                                  bool(properties['PassEnvironment'].strip()))
+
+def resolve_environment_file_sources(text):
+    """Closed observed systemctl representation; not full launch environment.
+
+    Trusted caller must obtain properties from the bound unit, and bind each
+    returned path using the environment-source reader before consuming it.
+    """
+    project_environment_properties(text)
+    value = next(line.partition('=')[2] for line in text.splitlines()
+                 if line.partition('=')[0] == 'EnvironmentFiles')
+    try:
+        if "\\" in value:
+            raise ValueError("escaped file representation unknown")
+        tokens = shlex.split(value)
+        if len(tokens) > 64 or len(tokens) % 2:
+            raise ValueError('file source budget')
+        result = []
+        seen = set()
+        for index in range(0, len(tokens), 2):
+            raw, marker = tokens[index:index+2]
+            path = Path(raw)
+            if (not path.is_absolute() or '..' in path.parts or str(path) != raw
+                    or len(raw) > 4096 or any(ord(c) < 32 for c in raw)
+                    or any(c in raw for c in '*?[%') or path in seen
+                    or marker not in {'(ignore_errors=yes)', '(ignore_errors=no)'}):
+                raise ValueError('file source representation unknown')
+            seen.add(path)
+            result.append((path, marker == '(ignore_errors=yes)'))
+        return tuple(result)
+    except Exception:
+        raise ValueError('environment file sources unresolved') from None
