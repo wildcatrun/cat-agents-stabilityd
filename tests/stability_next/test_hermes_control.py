@@ -63,7 +63,9 @@ class ProfileResidencyTests(unittest.TestCase):
     def pair(self, names=None):
         identity = {'status': 'known', 'pid': 42, 'starttime': 7, 'uid': 1000, 'euid': 1000,
                     'bootId': 'boot', 'cmdlineDigest': 'cmd', 'cgroupDigest': 'group'}
-        payload = {'hermes_home': '/synthetic/home', 'served_profiles': names or ['default', 'catbody']}
+        payload = {'hermes_home': '/synthetic/home', 'kind': 'hermes-gateway',
+                   'gateway_state': 'running', 'profile': 'catbody',
+                   'served_profiles': names or ['default', 'catbody']}
         return (ControlObservation('identify', 42, 1000, dict(payload), process_identity=dict(identity), received_monotonic=10),
                 ControlObservation('status', 42, 1000, dict(payload), process_identity=dict(identity), received_monotonic=11))
 
@@ -101,6 +103,29 @@ class ProfileResidencyTests(unittest.TestCase):
         first, second = self.pair()
         with self.assertRaises(ValueError):
             self.assess((replace(first, process_identity={}), second))
+
+    def test_launch_owner_without_multiplex_metadata_proves_only_self(self):
+        pair = tuple(replace(o, payload={k: v for k, v in o.payload.items() if k != 'served_profiles'})
+                     for o in self.pair())
+        result = self.assess(pair)
+        self.assertEqual(result['topology'], 'launch-owned')
+        self.assertEqual(result['residency'], 'served')
+        self.assertEqual(result['channelReadiness'], 'unknown')
+        self.assertFalse(result['actionAuthorized'])
+        with self.assertRaises(ValueError):
+            profile_residency(*pair, expected_home=Path('/synthetic/home'), profile='catnose', now_monotonic=11)
+
+    def test_running_state_and_gateway_kind_required(self):
+        for changes in ({'kind': 'other'}, {'gateway_state': 'starting'}, {'gateway_state': 'stopped'}):
+            first, second = self.pair()
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.assess((first, replace(second, payload=dict(second.payload, **changes))))
+
+    def test_one_missing_multiplex_projection_does_not_become_launch_owner(self):
+        first, second = self.pair()
+        with self.assertRaises(ValueError):
+            self.assess((first, replace(second, payload={k: v for k, v in second.payload.items()
+                                                       if k != 'served_profiles'})))
 
 
 @unittest.skipUnless(hasattr(socket, 'SO_PEERCRED') and os.environ.get('TEST_SOCKET_ROOT'),

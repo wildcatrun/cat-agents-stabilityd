@@ -156,6 +156,17 @@ def profile_residency(identify: ControlObservation, status: ControlObservation,
             raise ValueError('observation freshness or home refused')
     if status.received_monotonic < identify.received_monotonic:
         raise ValueError('observation sequence refused')
+    if (identify.payload.get('kind') != 'hermes-gateway'
+            or status.payload.get('kind') != 'hermes-gateway'
+            or status.payload.get('gateway_state') != 'running'):
+        raise ValueError('gateway identity or running state unavailable')
+    if 'served_profiles' not in identify.payload and 'served_profiles' not in status.payload:
+        # A launch-home owner can prove its own presence without multiplex
+        # bookkeeping. It cannot prove any other profile's absence.
+        if identify.payload.get('profile') != profile:
+            raise ValueError('launch profile does not own target')
+        return {'profile': profile, 'residency': 'served', 'topology': 'launch-owned',
+                'peerPid': status.peer_pid, 'channelReadiness': 'unknown', 'actionAuthorized': False}
     memberships = []
     for observed in (identify, status):
         names = observed.payload.get('served_profiles')
@@ -167,4 +178,5 @@ def profile_residency(identify: ControlObservation, status: ControlObservation,
     if memberships[0] != memberships[1]:
         raise ValueError('served profile scope changed')
     return {'profile': profile, 'residency': 'served' if profile in memberships[1] else 'unserved',
-            'peerPid': status.peer_pid, 'channelReadiness': 'unknown', 'actionAuthorized': False}
+            'topology': 'multiplex-membership', 'peerPid': status.peer_pid,
+            'channelReadiness': 'unknown', 'actionAuthorized': False}
