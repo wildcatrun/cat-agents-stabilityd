@@ -29,6 +29,9 @@ class AdapterContract:
     supported_capabilities: tuple[str, ...]
     verified_capabilities: tuple[str, ...]
     allowed_artifacts: tuple[tuple[str, str], ...]  # (producer commit, binary SHA-256)
+    # Independently qualified content identity, never a measured-hash approval.
+    # Runtime-owned readers must derive this from actual producer code/manifest.
+    allowed_content_artifacts: tuple[tuple[str, str], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -48,6 +51,8 @@ class AdapterDescriptor:
     resolved_binary_sha256: str
     active_binary_sha256: str
     status: str = "ready"
+    artifact_kind: str = "git-commit"
+    artifact_digest: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -60,6 +65,8 @@ class CapabilityDecision:
     runtime: str | None = None
     generation: str | None = None
     binary_sha256: str | None = None
+    artifact_kind: str | None = None
+    producer_identity: str | None = None
 
     def __post_init__(self) -> None:
         if self.action_authorized is not False:
@@ -95,6 +102,13 @@ def sha256_file(path: str) -> str:
         with os.fdopen(fd, "rb", closefd=False) as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
+        after = os.fstat(fd)
+        final = target.lstat()
+        identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns,
+                                 item.st_ctime_ns, item.st_nlink)
+        if (not stat.S_ISREG(final.st_mode) or final.st_nlink != 1
+                or identity(info) != identity(after) or identity(after) != identity(final)):
+            raise ValueError("binary identity changed during measurement")
     finally:
         os.close(fd)
     return digest.hexdigest()
@@ -159,9 +173,21 @@ def negotiate_capability(
         return CapabilityDecision("unknown", capability, "adapter-api-version-unparseable", False, contract.adapter_id, runtime)
     if not minimum <= version <= maximum or not api_minimum <= api_version <= api_maximum or api_version[0] != contract.api_major:
         return CapabilityDecision("unsupported", capability, "adapter-or-api-version-unsupported", False, contract.adapter_id, runtime)
-    commit = str(raw.get("commit") or "")
-    if not COMMIT_RE.fullmatch(commit):
-        return CapabilityDecision("observation_only", capability, "adapter-commit-unverified", False, contract.adapter_id, runtime)
+    commit = raw.get("commit")
+    if not isinstance(commit, str):
+        return CapabilityDecision("observation_only", capability, "artifact-identity-unverified", False, contract.adapter_id, runtime)
+    artifact_kind = raw.get("artifact_kind", "git-commit")
+    artifact_digest = raw.get("artifact_digest", "")
+    if artifact_kind == "git-commit":
+        if artifact_digest != "":
+            return CapabilityDecision("observation_only", capability, "artifact-identity-conflicting", False, contract.adapter_id, runtime)
+        if not COMMIT_RE.fullmatch(commit):
+            return CapabilityDecision("observation_only", capability, "adapter-commit-unverified", False, contract.adapter_id, runtime)
+    elif artifact_kind == "content-manifest":
+        if commit or not isinstance(artifact_digest, str) or not SHA256_RE.fullmatch(artifact_digest):
+            return CapabilityDecision("observation_only", capability, "content-artifact-identity-unverified", False, contract.adapter_id, runtime)
+    else:
+        return CapabilityDecision("observation_only", capability, "artifact-identity-kind-unknown", False, contract.adapter_id, runtime)
     if raw.get("binary_source") not in {"runtime-owned", "embedded", "global"}:
         return CapabilityDecision("observation_only", capability, "binary-source-unknown", False, contract.adapter_id, runtime)
     if (
@@ -182,8 +208,11 @@ def negotiate_capability(
         return CapabilityDecision("observation_only", capability, "binary-measurement-failed", False, contract.adapter_id, runtime)
     if measured_resolved != resolved_digest or measured_active != active_digest:
         return CapabilityDecision("observation_only", capability, "binary-digest-does-not-match-measurement", False, contract.adapter_id, runtime)
-    if (commit, resolved_digest) not in contract.allowed_artifacts:
-        return CapabilityDecision("observation_only", capability, "commit-binary-pair-not-allowlisted", False, contract.adapter_id, runtime)
+    if artifact_kind == "git-commit":
+        if (commit, resolved_digest) not in contract.allowed_artifacts:
+            return CapabilityDecision("observation_only", capability, "commit-binary-pair-not-allowlisted", False, contract.adapter_id, runtime)
+    elif (artifact_digest, resolved_digest) not in contract.allowed_content_artifacts:
+        return CapabilityDecision("observation_only", capability, "content-binary-pair-not-allowlisted", False, contract.adapter_id, runtime)
     advertised = raw.get("advertised_capabilities")
     if not isinstance(advertised, (list, tuple)):
         return CapabilityDecision("unknown", capability, "capability-list-invalid", False, contract.adapter_id, runtime)
@@ -196,4 +225,5 @@ def negotiate_capability(
     return CapabilityDecision(
         "verified", capability, "verified", False, contract.adapter_id, runtime,
         str(raw["generation"]), active_digest,
+        artifact_kind, commit if artifact_kind == "git-commit" else artifact_digest,
     )

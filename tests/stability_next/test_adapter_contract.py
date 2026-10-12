@@ -3,6 +3,8 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+from stability_core import adapter_contract
 
 from stability_core.adapter_contract import (
     AdapterContract, AdapterDescriptor, CapabilityDecision, negotiate_capability, sha256_file,
@@ -10,6 +12,63 @@ from stability_core.adapter_contract import (
 
 
 class AdapterContractTests(unittest.TestCase):
+    def test_binary_path_replacement_during_measurement_cannot_verify_old_bytes(self):
+        replacement = self.binary_path.parent / 'replacement'
+        replacement.write_bytes(b'unreviewed-new-binary')
+        actual = hashlib.sha256
+        target = self.binary_path
+        class Digest:
+            def __init__(self): self.inner = actual(); self.changed = False
+            def update(self, chunk):
+                self.inner.update(chunk)
+                if not self.changed:
+                    self.changed = True
+                    replacement.replace(target)
+            def hexdigest(self): return self.inner.hexdigest()
+        with mock.patch.object(adapter_contract.hashlib, 'sha256', side_effect=Digest):
+            with self.assertRaisesRegex(ValueError, 'identity changed'):
+                sha256_file(str(self.binary_path))
+
+    def test_explicit_content_identity_needs_independent_pair_and_never_grants_authority(self):
+        content = hashlib.sha256(b'independently-reviewed-fixture-manifest').hexdigest()
+        descriptor = dataclasses.replace(self.descriptor, commit='', artifact_kind='content-manifest',
+                                         artifact_digest=content)
+        unapproved = self.negotiate(descriptor)
+        self.assertEqual(unapproved.reason, 'content-binary-pair-not-allowlisted')
+        contract = dataclasses.replace(self.contract, allowed_content_artifacts=((content, self.binary_digest),))
+        result = negotiate_capability(descriptor, contract, 'profile.restart', expected_node_id='dev-node',
+                                      expected_generation='boot-7', now_ms=1_010_000)
+        self.assertEqual(result.status, 'verified')
+        self.assertFalse(result.action_authorized)
+        self.assertEqual(result.artifact_kind, 'content-manifest')
+        self.assertEqual(result.producer_identity, content)
+        self.assertNotEqual(self.negotiate(dataclasses.replace(descriptor, commit='a' * 40)).status, 'verified')
+
+    def test_content_identity_cannot_alias_git_or_bypass_binary_version_and_capability_checks(self):
+        content = 'b' * 64
+        contract = dataclasses.replace(self.contract, allowed_content_artifacts=((content, self.binary_digest),))
+        descriptor = dataclasses.replace(self.descriptor, commit='', artifact_kind='content-manifest', artifact_digest=content)
+        for changed in (dataclasses.replace(descriptor, artifact_digest=''),
+                        dataclasses.replace(descriptor, commit=None),
+                        dataclasses.replace(descriptor, artifact_kind='package-name'),
+                        dataclasses.replace(descriptor, artifact_kind='git-commit', commit='a' * 40),
+                        dataclasses.replace(descriptor, adapter_version='2.0.0'),
+                        dataclasses.replace(descriptor, active_binary_sha256='c' * 64),
+                        dataclasses.replace(descriptor, advertised_capabilities=())):
+            with self.subTest(changed=changed):
+                result = negotiate_capability(changed, contract, 'profile.restart', expected_node_id='dev-node',
+                                              expected_generation='boot-7', now_ms=1_010_000)
+                self.assertNotEqual(result.status, 'verified')
+                self.assertFalse(result.action_authorized)
+
+    def test_malformed_identity_types_do_not_become_legacy_defaults(self):
+        for changed in (dataclasses.replace(self.descriptor, artifact_digest=None),
+                        dataclasses.replace(self.descriptor, artifact_digest=False),
+                        dataclasses.replace(self.descriptor, commit=123),
+                        dataclasses.replace(self.descriptor, artifact_kind=None)):
+            with self.subTest(changed=changed):
+                self.assertNotEqual(self.negotiate(changed).status, 'verified')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -45,6 +104,8 @@ class AdapterContractTests(unittest.TestCase):
         self.assertEqual(result.status, "verified")
         self.assertFalse(result.action_authorized)
         self.assertEqual(result.binary_sha256, self.binary_digest)
+        self.assertEqual(result.artifact_kind, 'git-commit')
+        self.assertEqual(result.producer_identity, 'a' * 40)
         self.assertEqual(self.negotiate(capability="unlisted.write").status, "unsupported")
 
     def test_compatible_but_unverified_or_unknown_runtime_remains_observation_only(self):
