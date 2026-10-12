@@ -217,3 +217,52 @@ def read_user_manager_environment(*, owner_uid):
         return ManagerEnvironmentSources(owner_uid, projection)
     except Exception:
         raise ValueError('manager environment observation refused') from None
+
+@dataclass(frozen=True)
+class UserLaunchSourceWindow:
+    unit: UnitEnvironmentSources
+    manager: ManagerEnvironmentSources
+    elapsed_ms: int
+    effective_coverage: str = 'incomplete'
+    action_authorized: bool = False
+
+    def __post_init__(self):
+        if self.effective_coverage != 'incomplete' or self.action_authorized is not False:
+            raise ValueError('launch source window is not authority')
+
+
+def read_user_launch_source_window(unit, *, owner_uid):
+    """Bracket unit/file observations with manager reobservation.
+
+    Thirty seconds is a cooperative evidence-age fence, not an OS deadline.
+    Each command retains its independent hard transport bound. Remaining runtime
+    code/home/dotenv resolvers and registry/node identity must still be supplied.
+    """
+    import os, time
+    if (type(owner_uid) is not int or owner_uid < 0 or os.geteuid() != owner_uid
+            or type(unit) is not str
+            or not re.fullmatch(r'hermes-gateway-[a-z][a-z0-9_-]{0,63}\.service', unit)):
+        raise ValueError('launch source window owner or target refused')
+    started = time.monotonic()
+    previous = started
+    def budget():
+        nonlocal previous
+        now = time.monotonic()
+        elapsed = now - started
+        if not previous <= now or not 0 <= elapsed <= 30:
+            raise ValueError('launch source window age refused')
+        previous = now
+        return elapsed
+    manager_before = read_user_manager_environment(owner_uid=owner_uid); budget()
+    unit_before = read_user_unit_environment_sources(unit, owner_uid=owner_uid); budget()
+    unit_after = read_user_unit_environment_sources(unit, owner_uid=owner_uid); budget()
+    manager_after = read_user_manager_environment(owner_uid=owner_uid); elapsed = budget()
+    if (type(manager_before) is not ManagerEnvironmentSources
+            or type(manager_after) is not ManagerEnvironmentSources
+            or type(unit_after) is not UnitEnvironmentSources
+            or type(unit_before) is not UnitEnvironmentSources
+            or manager_before != manager_after or unit_before != unit_after
+            or manager_before.owner_uid != owner_uid or unit_before.owner_uid != owner_uid
+            or unit_before.unit != unit):
+        raise ValueError('launch source window drift')
+    return UserLaunchSourceWindow(unit_after, manager_after, int(elapsed * 1000))

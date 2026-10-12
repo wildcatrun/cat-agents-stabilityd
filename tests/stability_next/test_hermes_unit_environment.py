@@ -212,3 +212,53 @@ class EnvironmentProjectionTests(unittest.TestCase):
     def test_manager_evidence_cannot_claim_complete(self):
         from stability_core.hermes_unit_environment import ManagerEnvironmentSources,project_manager_environment
         with self.assertRaises(ValueError):ManagerEnvironmentSources(0,project_manager_environment(''),effective_coverage='complete')
+    def test_joint_window_preserves_scope_and_refuses_manager_drift(self):
+        import os
+        from unittest import mock
+        from stability_core import hermes_unit_environment as module
+        uid=os.geteuid();unit='hermes-gateway-fixture.service'
+        manager=module.ManagerEnvironmentSources(uid,module.project_manager_environment('HOME=/fixture/user'))
+        changed=module.ManagerEnvironmentSources(uid,module.project_manager_environment('HOME=/fixture/other'))
+        source=module.UnitEnvironmentSources(unit,uid,module.project_environment_properties(self.text()),())
+        with mock.patch.object(module,'read_user_manager_environment',return_value=manager),mock.patch.object(module,'read_user_unit_environment_sources',return_value=source):
+            result=module.read_user_launch_source_window(unit,owner_uid=uid)
+        self.assertEqual(result.effective_coverage,'incomplete')
+        self.assertEqual(result.unit,source)
+        with mock.patch.object(module,'read_user_manager_environment',side_effect=[manager,changed]),mock.patch.object(module,'read_user_unit_environment_sources',return_value=source):
+            with self.assertRaises(ValueError):module.read_user_launch_source_window(unit,owner_uid=uid)
+    def test_joint_window_age_stops_before_further_reads(self):
+        import os
+        from unittest import mock
+        from stability_core import hermes_unit_environment as module
+        uid=os.geteuid();manager=module.ManagerEnvironmentSources(uid,module.project_manager_environment(''))
+        with mock.patch('time.monotonic',side_effect=[0,31]),mock.patch.object(module,'read_user_manager_environment',return_value=manager),mock.patch.object(module,'read_user_unit_environment_sources') as read_unit:
+            with self.assertRaises(ValueError):module.read_user_launch_source_window('hermes-gateway-fixture.service',owner_uid=uid)
+        read_unit.assert_not_called()
+
+    def test_joint_window_rejects_other_unit_or_owner(self):
+        import os
+        from unittest import mock
+        from stability_core import hermes_unit_environment as module
+        uid=os.geteuid();unit='hermes-gateway-fixture.service'
+        projection=module.project_environment_properties(self.text())
+        manager=module.ManagerEnvironmentSources(uid,module.project_manager_environment(''))
+        for source in (module.UnitEnvironmentSources('hermes-gateway-other.service',uid,projection,()),module.UnitEnvironmentSources(unit,uid+1,projection,())):
+            with mock.patch.object(module,'read_user_manager_environment',return_value=manager),mock.patch.object(module,'read_user_unit_environment_sources',return_value=source):
+                with self.assertRaises(ValueError):module.read_user_launch_source_window(unit,owner_uid=uid)
+    def test_joint_window_rejects_clock_reverse_and_nonfinite(self):
+        import os
+        from unittest import mock
+        from stability_core import hermes_unit_environment as module
+        uid=os.geteuid();unit='hermes-gateway-fixture.service'
+        manager=module.ManagerEnvironmentSources(uid,module.project_manager_environment(''))
+        source=module.UnitEnvironmentSources(unit,uid,module.project_environment_properties(self.text()),())
+        for clock in ([0,5,4],[0,float('nan')],[0,float('inf')]):
+            with mock.patch('time.monotonic',side_effect=clock),mock.patch.object(module,'read_user_manager_environment',return_value=manager),mock.patch.object(module,'read_user_unit_environment_sources',return_value=source):
+                with self.assertRaises(ValueError):module.read_user_launch_source_window(unit,owner_uid=uid)
+    def test_joint_window_wrong_owner_stops_before_any_observation(self):
+        import os
+        from unittest import mock
+        from stability_core import hermes_unit_environment as module
+        with mock.patch.object(module,'read_user_manager_environment') as reader:
+            with self.assertRaises(ValueError):module.read_user_launch_source_window('hermes-gateway-fixture.service',owner_uid=os.geteuid()+1)
+        reader.assert_not_called()
