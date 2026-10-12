@@ -105,3 +105,54 @@ def resolve_environment_file_sources(text):
         return tuple(result)
     except Exception:
         raise ValueError('environment file sources unresolved') from None
+
+@dataclass(frozen=True)
+class UnitEnvironmentSources:
+    unit: str
+    owner_uid: int
+    projection: EnvironmentProjection
+    files: tuple
+    effective_coverage: str = 'incomplete'
+    action_authorized: bool = False
+
+    def __post_init__(self):
+        if self.effective_coverage != 'incomplete' or self.action_authorized is not False:
+            raise ValueError('unit environment source is not authority')
+
+
+def read_user_unit_environment_sources(unit, *, owner_uid):
+    """Actual closed readonly command and owned file observations.
+
+    Caller still must bind registry, unit identity, manager environment, launch
+    resolver and source freshness. No root impersonation or guessed UID fallback.
+    """
+    import os
+    from .node_transport_contract import _bounded_ssh
+    from .hermes_environment_source import read_environment_sources
+    if (type(owner_uid) is not int or owner_uid < 0 or os.geteuid() != owner_uid
+            or type(unit) is not str
+            or not re.fullmatch(r'hermes-gateway-[a-z][a-z0-9_-]{0,63}\.service', unit)):
+        raise ValueError('unit environment owner or target refused')
+    command = ['/usr/bin/env', f'XDG_RUNTIME_DIR=/run/user/{owner_uid}',
+               f'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{owner_uid}/bus',
+               '/usr/bin/systemctl', '--user', 'show', unit,
+               '--property=' + ','.join(sorted(PROPERTIES))]
+    try:
+        result = _bounded_ssh(command)
+        if result.failure is not None or result.returncode != 0:
+            raise ValueError('readonly command incomplete')
+        text = result.stdout.decode('utf-8')
+        projection = project_environment_properties(text)
+        sources = resolve_environment_file_sources(text)
+        files = read_environment_sources(sources, owner_uid=owner_uid) if sources else ()
+        # Reobserve the exact property bytes after file observation. Drift stays
+        # unknown; the source set is never inferred from successful CLI exit.
+        final = _bounded_ssh(command)
+        if final.failure is not None or final.returncode != 0 or final.stdout != result.stdout:
+            raise ValueError('unit properties changed')
+        observed_files = read_environment_sources(sources, owner_uid=owner_uid) if sources else ()
+        if observed_files != files:
+            raise ValueError('unit environment files changed')
+        return UnitEnvironmentSources(unit, owner_uid, projection, observed_files)
+    except Exception:
+        raise ValueError('unit environment source observation refused') from None

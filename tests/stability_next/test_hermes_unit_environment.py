@@ -101,3 +101,55 @@ class EnvironmentProjectionTests(unittest.TestCase):
         from stability_core.hermes_unit_environment import resolve_environment_file_sources
         text=' '.join(f'/fixture/file-{i} (ignore_errors=yes)' for i in range(33))
         with self.assertRaises(ValueError):resolve_environment_file_sources(self.text(files=text))
+    def test_actual_unit_source_reader_closed_command_and_drift(self):
+        import os
+        from unittest import mock
+        from stability_core.hermes_unit_environment import read_user_unit_environment_sources
+        from stability_core.node_transport_contract import _CommandResult
+        raw=self.text().encode();uid=os.geteuid()
+        result=_CommandResult(0,raw)
+        with mock.patch('stability_core.node_transport_contract._bounded_ssh',return_value=result) as runner:
+            evidence=read_user_unit_environment_sources('hermes-gateway-fixture.service',owner_uid=uid)
+        self.assertEqual(evidence.files,())
+        self.assertEqual(evidence.effective_coverage,'incomplete')
+        self.assertEqual(runner.call_count,2)
+        self.assertIn('/usr/bin/systemctl',runner.call_args.args[0])
+        self.assertNotIn('FIXTURE_SECRET',repr(evidence))
+        with mock.patch('stability_core.node_transport_contract._bounded_ssh',side_effect=[result,_CommandResult(0,self.text(env='API_KEY=CHANGED').encode())]):
+            with self.assertRaises(ValueError):read_user_unit_environment_sources('hermes-gateway-fixture.service',owner_uid=uid)
+    def test_unit_reader_refuses_owner_and_redacts_command_failures(self):
+        import os
+        from unittest import mock
+        from stability_core.hermes_unit_environment import read_user_unit_environment_sources
+        with mock.patch('stability_core.node_transport_contract._bounded_ssh') as runner:
+            with self.assertRaises(ValueError):read_user_unit_environment_sources('hermes-gateway-fixture.service',owner_uid=os.geteuid()+1)
+            runner.assert_not_called()
+        with mock.patch('stability_core.node_transport_contract._bounded_ssh',side_effect=RuntimeError('PRIVATE_VALUE')):
+            with self.assertRaises(ValueError) as caught:read_user_unit_environment_sources('hermes-gateway-fixture.service',owner_uid=os.geteuid())
+        self.assertNotIn('PRIVATE_VALUE',str(caught.exception))
+
+    def test_unit_reader_detects_file_change_during_second_property_read(self):
+        import os,tempfile
+        from pathlib import Path
+        from unittest import mock
+        from stability_core.hermes_unit_environment import read_user_unit_environment_sources
+        from stability_core.node_transport_contract import _CommandResult
+        with tempfile.TemporaryDirectory(dir=Path.home()) as tmp:
+            path=Path(tmp)/'.env';path.write_text('KEY=before');path.chmod(0o600)
+            raw=self.text(files=f'{path} (ignore_errors=no)').encode();calls=0
+            def runner(command):
+                nonlocal calls
+                calls+=1
+                if calls==2:path.write_text('KEY=changed-longer')
+                return _CommandResult(0,raw)
+            with mock.patch('stability_core.node_transport_contract._bounded_ssh',side_effect=runner):
+                with self.assertRaises(ValueError):read_user_unit_environment_sources('hermes-gateway-fixture.service',owner_uid=os.geteuid())
+    def test_reader_refuses_partial_bounded_command_and_malformed_bytes(self):
+        import os
+        from unittest import mock
+        from stability_core.hermes_unit_environment import read_user_unit_environment_sources
+        from stability_core.node_transport_contract import _CommandResult
+        for result in (_CommandResult(0,self.text().encode(),'transport-output-limit'),_CommandResult(1,self.text().encode()),_CommandResult(0,b'\xffPRIVATE_VALUE')):
+            with mock.patch('stability_core.node_transport_contract._bounded_ssh',return_value=result):
+                with self.assertRaises(ValueError) as caught:read_user_unit_environment_sources('hermes-gateway-fixture.service',owner_uid=os.geteuid())
+            self.assertNotIn('PRIVATE_VALUE',str(caught.exception))
