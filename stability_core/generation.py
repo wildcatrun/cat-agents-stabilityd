@@ -91,8 +91,9 @@ def _atomic_replace(path: Path, writer, *, directory_identity=None, sync_directo
 
 def write_json_atomic(path: Path, payload: Any, *, directory_identity=None, _sync_directory=True, _parent_fence=None, _return_metadata=True) -> Dict[str, Any]:
     def write(handle) -> None:
-        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=False)
-        handle.write("\n")
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+        if handle.write(encoded) != len(encoded):
+            raise OSError("publication JSON short write")
     return _atomic_replace(path, write, directory_identity=directory_identity, sync_directory=_sync_directory, parent_fence=_parent_fence, return_metadata=_return_metadata)
 
 

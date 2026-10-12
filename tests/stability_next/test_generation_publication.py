@@ -1,5 +1,6 @@
 import importlib.util
 import hashlib
+import io
 import json
 import os
 import stat
@@ -21,6 +22,53 @@ SPEC.loader.exec_module(stabilityd)
 
 
 class GenerationPublicationTests(unittest.TestCase):
+    def test_json_encoding_failure_preserves_old_pointer_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'latest.json'
+            path.write_text('{"generationId":"old"}\n')
+            with self.assertRaises(TypeError):
+                generation.write_json_atomic(path, {'generationId': 'new', 'unsupported': object()})
+            self.assertEqual(json.loads(path.read_text())['generationId'], 'old')
+            self.assertEqual(list(Path(tmp).glob('*.tmp')), [])
+
+    def test_single_json_write_preserves_original_bytes(self):
+        payload = {'中文': ['line\nquote"', None, True, 1, 1.25], 'nested': {'z': 1, 'a': 2}}
+        baseline = io.StringIO()
+        json.dump(payload, baseline, ensure_ascii=False, indent=2, sort_keys=False)
+        baseline.write('\n')
+        writes = []
+        original = generation._atomic_replace
+        def replace(path, writer, **kwargs):
+            def recorded(handle):
+                class Proxy:
+                    def write(self, value):
+                        writes.append(value)
+                        return handle.write(value)
+                writer(Proxy())
+            return original(path, recorded, **kwargs)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(generation, '_atomic_replace', side_effect=replace):
+            path = Path(tmp) / 'payload.json'
+            generation.write_json_atomic(path, payload)
+            self.assertEqual(path.read_bytes(), baseline.getvalue().encode())
+            self.assertEqual(writes, [baseline.getvalue()])
+
+    def test_json_short_write_preserves_old_pointer_and_cleans_temp(self):
+        original = os.fdopen
+        class ShortWriter:
+            def __init__(self, handle): self.handle = handle
+            def __enter__(self): self.handle.__enter__(); return self
+            def __exit__(self, *args): return self.handle.__exit__(*args)
+            def write(self, value): return self.handle.write(value[:-1])
+            def __getattr__(self, name): return getattr(self.handle, name)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'latest.json'
+            path.write_text('{"generationId":"old"}\n')
+            with mock.patch.object(generation.os, 'fdopen', side_effect=lambda *a, **kw: ShortWriter(original(*a, **kw))):
+                with self.assertRaisesRegex(OSError, 'short write'):
+                    generation.write_json_atomic(path, {'generationId': 'new'})
+            self.assertEqual(json.loads(path.read_text())['generationId'], 'old')
+            self.assertEqual(list(Path(tmp).glob('*.tmp')), [])
+
     def test_latest_commit_pointer_does_not_reread_unused_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -206,13 +254,13 @@ class GenerationPublicationTests(unittest.TestCase):
             workspace = Path(tmp); root = workspace / 'active'; root.mkdir()
             latest = root / 'latest.json'; sidecar = root / 'policy.json'
             latest.write_text('{"generationId":"old"}\n')
-            original = generation.json.dump
-            def encode(payload, handle, **kwargs):
+            original = generation.json.dumps
+            def encode(payload, **kwargs):
                 if 'generationManifest' in payload:
                     root.rename(workspace / 'retired')
                     root.mkdir()
-                return original(payload, handle, **kwargs)
-            with mock.patch.object(generation.json, 'dump', side_effect=encode):
+                return original(payload, **kwargs)
+            with mock.patch.object(generation.json, 'dumps', side_effect=encode):
                 with self.assertRaises(OSError):
                     generation.publish_generation({'generationId':'new'}, [(sidecar, {'generationId':'new'})], latest)
             self.assertFalse(latest.exists())
