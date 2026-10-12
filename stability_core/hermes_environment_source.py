@@ -14,6 +14,7 @@ class EnvironmentSourceIdentity:
     identity: tuple | None
     ancestors: tuple
     action_authorized: bool = False
+    missing_ancestor: Path | None = None
 
     def __post_init__(self):
         if self.action_authorized is not False:
@@ -38,8 +39,15 @@ def read_environment_source(path, *, owner_uid, optional=False):
     fd = None
     try:
         ancestors = []
-        for parent in path.parents:
-            info = parent.lstat()
+        missing_ancestor = None
+        for parent in reversed(path.parents):
+            try:
+                info = parent.lstat()
+            except FileNotFoundError:
+                if not optional:
+                    raise ValueError('environment source parent missing')
+                missing_ancestor = parent
+                break
             if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, owner_uid}
                     or info.st_mode & 0o022):
                 raise ValueError('environment source ancestor refused')
@@ -47,6 +55,14 @@ def read_environment_source(path, *, owner_uid, optional=False):
         def fence():
             if any(_identity(parent.lstat()) != identity for parent, identity in ancestors):
                 raise ValueError('environment source scope drift')
+        if missing_ancestor is not None:
+            fence()
+            try: missing_ancestor.lstat()
+            except FileNotFoundError: pass
+            else: raise ValueError('environment source parent absence drift')
+            fence()
+            return EnvironmentSourceIdentity(path, False, None, None, tuple(ancestors),
+                                             missing_ancestor=missing_ancestor)
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:

@@ -101,3 +101,45 @@ class EnvironmentSourceTests(unittest.TestCase):
         from stability_core.hermes_environment_source import read_environment_sources
         for sources in ([],[(self.path,True)]*33,[(self.path,True),(self.path,False)],[(self.path,1)],['secret']):
             with self.assertRaises(ValueError):read_environment_sources(sources,owner_uid=os.getuid())
+
+    def test_optional_missing_parent_has_trusted_absence_anchor(self):
+        path=self.root/'missing-parent'/'nested'/'.env'
+        evidence=read_environment_source(path,owner_uid=os.getuid(),optional=True)
+        self.assertFalse(evidence.present)
+        self.assertEqual(evidence.missing_ancestor,self.root/'missing-parent')
+        self.assertTrue(evidence.ancestors)
+        with self.assertRaises(ValueError):read_environment_source(path,owner_uid=os.getuid())
+    def test_missing_parent_symlink_is_not_absence(self):
+        parent=self.root/'missing-parent';parent.symlink_to(self.root/'does-not-exist')
+        with self.assertRaises(ValueError):read_environment_source(parent/'.env',owner_uid=os.getuid(),optional=True)
+    def test_parent_created_during_absence_observation_refused(self):
+        parent=self.root/'missing-parent';original=Path.lstat;calls=0
+        def lstat(path,*args,**kwargs):
+            nonlocal calls
+            if path==parent:
+                calls+=1
+                if calls==2:parent.mkdir()
+            return original(path,*args,**kwargs)
+        with mock.patch.object(Path,'lstat',lstat):
+            with self.assertRaises(ValueError):read_environment_source(parent/'.env',owner_uid=os.getuid(),optional=True)
+    def test_optional_permission_failure_is_not_absence(self):
+        parent=self.root/'missing-parent';original=Path.lstat
+        def lstat(path,*args,**kwargs):
+            if path==parent:raise PermissionError('PRIVATE_VALUE')
+            return original(path,*args,**kwargs)
+        with mock.patch.object(Path,'lstat',lstat):
+            with self.assertRaises(ValueError) as caught:read_environment_source(parent/'.env',owner_uid=os.getuid(),optional=True)
+        self.assertNotIn('PRIVATE_VALUE',str(caught.exception))
+    def test_optional_parent_file_is_not_directory_absence(self):
+        parent=self.root/'parent-file';parent.write_text('fixture')
+        with self.assertRaises(ValueError):read_environment_source(parent/'.env',owner_uid=os.getuid(),optional=True)
+    def test_bundle_detects_missing_parent_becoming_present(self):
+        from stability_core import hermes_environment_source as module
+        parent=self.root/'new-parent';path=parent/'.env';original=module.read_environment_source;count=0
+        def read(*args,**kwargs):
+            nonlocal count
+            result=original(*args,**kwargs);count+=1
+            if count==1:parent.mkdir()
+            return result
+        with mock.patch.object(module,'read_environment_source',side_effect=read):
+            with self.assertRaises(ValueError):module.read_environment_sources([(path,True)],owner_uid=os.getuid())
