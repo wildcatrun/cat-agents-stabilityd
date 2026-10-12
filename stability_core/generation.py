@@ -89,9 +89,12 @@ def _atomic_replace(path: Path, writer, *, directory_identity=None, sync_directo
             raise
 
 
-def write_json_atomic(path: Path, payload: Any, *, directory_identity=None, _sync_directory=True, _parent_fence=None, _return_metadata=True) -> Dict[str, Any]:
+def write_json_atomic(path: Path, payload: Any, *, directory_identity=None, _sync_directory=True, _parent_fence=None, _return_metadata=True, compact=False) -> Dict[str, Any]:
+    if type(compact) is not bool:
+        raise ValueError("publication JSON format must be boolean")
     def write(handle) -> None:
-        encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+        options = {"separators": (",", ":")} if compact else {"indent": 2}
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=False, **options) + "\n"
         if handle.write(encoded) != len(encoded):
             raise OSError("publication JSON short write")
     return _atomic_replace(path, write, directory_identity=directory_identity, sync_directory=_sync_directory, parent_fence=_parent_fence, return_metadata=_return_metadata)
@@ -145,5 +148,5 @@ def publish_generation(
         }
         # Latest is the commit pointer, not a self-listed artifact. Its returned
         # metadata was unused; retain both durability barriers without rereading it.
-        write_json_atomic(latest_path, snapshot, directory_identity=identities[latest_path.parent], _parent_fence=fences[latest_path.parent], _return_metadata=False)
+        write_json_atomic(latest_path, snapshot, directory_identity=identities[latest_path.parent], _parent_fence=fences[latest_path.parent], _return_metadata=False, compact=True)
     return snapshot

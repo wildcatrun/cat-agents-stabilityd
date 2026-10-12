@@ -52,6 +52,67 @@ class GenerationPublicationTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), baseline.getvalue().encode())
             self.assertEqual(writes, [baseline.getvalue()])
 
+    def test_explicit_compact_json_preserves_fields_and_actual_byte_metadata(self):
+        payload = {'中文': ['line\nquote"', None, True, 1, 1.25], 'nested': {'z': 1, 'a': 2}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'compact.json'
+            meta = generation.write_json_atomic(path, payload, compact=True)
+            raw = path.read_bytes()
+            expected = (json.dumps(payload, ensure_ascii=False, sort_keys=False, separators=(',', ':')) + '\n').encode()
+            self.assertEqual(raw, expected)
+            self.assertEqual(json.loads(raw), payload)
+            self.assertEqual(meta['bytes'], len(raw))
+            self.assertEqual(meta['sha256'], hashlib.sha256(raw).hexdigest())
+            self.assertEqual(list(Path(tmp).glob('*.tmp')), [])
+
+    def test_generation_compacts_only_latest_and_retains_sidecar_format(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            latest, sidecar = root / 'latest.json', root / 'policy.json'
+            policy = {'generationId': 'format-test', 'lanes': {'cron': {'available': True}}}
+            snapshot = {'generationId': 'format-test', 'policy': policy}
+            result = generation.publish_generation(snapshot, [(sidecar, policy)], latest)
+            self.assertEqual(json.loads(latest.read_bytes()), result)
+            self.assertEqual(latest.read_bytes(), (json.dumps(result, ensure_ascii=False, sort_keys=False, separators=(',', ':')) + '\n').encode())
+            self.assertEqual(sidecar.read_bytes(), (json.dumps(policy, ensure_ascii=False, indent=2, sort_keys=False) + '\n').encode())
+            self.assertEqual(result['generationManifest']['artifacts'][0]['sha256'], hashlib.sha256(sidecar.read_bytes()).hexdigest())
+
+    def test_compact_encoding_failure_keeps_old_latest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'latest.json'
+            old = b'{"generationId":"old"}\n'
+            path.write_bytes(old)
+            with self.assertRaises(TypeError):
+                generation.write_json_atomic(path, {'invalid': object()}, compact=True)
+            self.assertEqual(path.read_bytes(), old)
+            self.assertEqual(list(Path(tmp).glob('*.tmp')), [])
+
+    def test_compact_short_write_keeps_old_latest(self):
+        original = generation._atomic_replace
+        def replace(path, writer, **kwargs):
+            def short(handle):
+                class Proxy:
+                    def write(self, value): return handle.write(value[:-1])
+                writer(Proxy())
+            return original(path, short, **kwargs)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'latest.json'
+            old = b'{"generationId":"old"}\n'
+            path.write_bytes(old)
+            with mock.patch.object(generation, '_atomic_replace', side_effect=replace):
+                with self.assertRaisesRegex(OSError, 'short write'):
+                    generation.write_json_atomic(path, {'generationId': 'new'}, compact=True)
+            self.assertEqual(path.read_bytes(), old)
+            self.assertEqual(list(Path(tmp).glob('*.tmp')), [])
+
+    def test_invalid_format_refused_before_filesystem_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'new' / 'latest.json'
+            for value in (None, 0, 1, 'compact', {}):
+                with self.assertRaises(ValueError):
+                    generation.write_json_atomic(path, {}, compact=value)
+            self.assertFalse(path.parent.exists())
+
     def test_json_short_write_preserves_old_pointer_and_cleans_temp(self):
         original = os.fdopen
         class ShortWriter:
