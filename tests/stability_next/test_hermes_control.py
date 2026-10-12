@@ -1,4 +1,9 @@
 import json
+import os
+import socket
+import tempfile
+import threading
+import time
 from pathlib import Path
 import unittest
 from stability_core.hermes_control import ControlObservation, decode_response, query_readonly
@@ -50,3 +55,64 @@ class HermesControlTests(unittest.TestCase):
     def test_observation_cannot_grant_effect_authority(self):
         with self.assertRaises(ValueError):
             ControlObservation('identify', 42, 1000, {}, True)
+
+
+@unittest.skipUnless(hasattr(socket, 'SO_PEERCRED') and os.environ.get('TEST_SOCKET_ROOT'),
+                     'requires isolated Linux owned socket root')
+class HermesSocketTransportTests(unittest.TestCase):
+    def fixture(self, mode, verb='identify'):
+        with tempfile.TemporaryDirectory(dir=os.environ['TEST_SOCKET_ROOT']) as directory:
+            path = Path(directory) / 'gateway.sock'
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(path))
+            path.chmod(0o600)
+            listener.listen(1)
+            listener.settimeout(2)
+            failures = []
+            def serve():
+                try:
+                    with listener.accept()[0] as connection:
+                        request = json.loads(connection.recv(4096))
+                        self.assertEqual(request['verb'], verb)
+                        self.assertEqual(set(request), {'verb', 'id', 'protocol'})
+                        if mode == 'timeout':
+                            time.sleep(0.15)
+                            return
+                        result = {'protocol': 1, 'pid': os.getpid()} if verb == 'identify' else {
+                            'protocol': 1, 'answering_pid': os.getpid(), 'answered_at': time.time()}
+                        if mode == 'wrong-pid': result['pid'] += 1
+                        if mode == 'oversize': result['padding'] = 'x' * (512 * 1024)
+                        if mode == 'replace':
+                            path.unlink()
+                            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as replacement:
+                                replacement.bind(str(path))
+                                path.chmod(0o600)
+                        answer = json.dumps({'ok': True, 'protocol': 1, 'id': request['id'], 'result': result}).encode() + b'\n'
+                        try: connection.sendall(answer)
+                        except BrokenPipeError:
+                            if mode != 'oversize': raise
+                except Exception as exc:
+                    failures.append(exc)
+            worker = threading.Thread(target=serve)
+            worker.start()
+            try:
+                if mode == 'ok':
+                    observed = query_readonly(path, verb, expected_uid=os.getuid())
+                    self.assertEqual(observed.peer_pid, os.getpid())
+                    self.assertFalse(observed.action_authorized)
+                else:
+                    with self.assertRaises((ValueError, TimeoutError)):
+                        query_readonly(path, verb, expected_uid=os.getuid(),
+                                       timeout=0.05 if mode == 'timeout' else 2)
+            finally:
+                worker.join(3)
+                listener.close()
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(failures, [])
+
+    def test_actual_identify(self): self.fixture('ok')
+    def test_actual_status(self): self.fixture('ok', 'status')
+    def test_actual_timeout(self): self.fixture('timeout')
+    def test_actual_oversize(self): self.fixture('oversize')
+    def test_actual_peer_mismatch(self): self.fixture('wrong-pid')
+    def test_actual_socket_replacement(self): self.fixture('replace')
