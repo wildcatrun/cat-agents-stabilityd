@@ -44,6 +44,15 @@ class UserUnitTrustTests(unittest.TestCase):
         binary = self.root / 'fixture-runtime'
         binary.write_bytes(b'synthetic-executable')
         binary.chmod(0o700)
+        # These placeholder bytes test ownership/route binding, never execution.
+        # Linux QA HOME is on /run (noexec). Model executable access for this
+        # one synthetic file; retain a separate denied-access counterexample.
+        real_access = os.access
+        patch = mock.patch('stability_core.unit_capability.os.access',
+                           side_effect=lambda path, mode: True if Path(path) == binary and mode == os.X_OK
+                           else real_access(path, mode))
+        patch.start()
+        self.addCleanup(patch.stop)
         return binary
 
     def test_explicit_executable_owner_independent_of_daemon_uid(self):
@@ -85,3 +94,9 @@ class UserUnitTrustTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _file_binding(nested / '..' / self.file.name, self.request, 'runtime-unit://fixture',
                           unit_roots=(self.root,), owner_uid=os.getuid())
+
+    def test_denied_executable_access_still_refused(self):
+        binary = self.executable()
+        with mock.patch('stability_core.unit_capability.os.access', return_value=False):
+            with self.assertRaisesRegex(ValueError, 'unit-executable-owner-mode'):
+                resolve_unit_executable(binary, owner_uid=os.getuid())
