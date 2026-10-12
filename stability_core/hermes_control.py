@@ -8,6 +8,7 @@ import stat
 import struct
 import time
 import uuid
+from .process_identity import read_process_identity, identities_match
 
 MAX_RESPONSE = 512 * 1024
 READ_VERBS = frozenset({'identify', 'status'})
@@ -57,7 +58,7 @@ def decode_response(raw, verb, request_id, peer_pid, peer_uid):
 def query_readonly(socket_path: Path, verb: str, *, expected_uid: int, timeout: float = 2.0):
     """Query an explicitly resolved trusted socket; unsupported peer PID => refuse.
 
-    Caller still owns process-generation, owning-home, artifact and freshness
+    Caller still owns node, owning-home, artifact and cached-observation freshness
     checks. No pointer resolution, profile discovery, fallback or mutation verbs.
     """
     if verb not in READ_VERBS: raise ValueError('effect verb refused')
@@ -84,6 +85,8 @@ def query_readonly(socket_path: Path, verb: str, *, expected_uid: int, timeout: 
         return (identity(path.lstat()) == identity(before)
                 and all(identity(parent.lstat()) == expected for parent, expected in ancestors))
     deadline = time.monotonic() + timeout
+    wall_started = time.time()
+    mono_started = time.monotonic()
     request_id = uuid.uuid4().hex
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(max(0.001, deadline - time.monotonic()))
@@ -91,6 +94,10 @@ def query_readonly(socket_path: Path, verb: str, *, expected_uid: int, timeout: 
         pid, uid, _gid = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         if uid != expected_uid or pid <= 0 or not unchanged():
             raise ValueError('socket peer refused')
+        process_before = read_process_identity(pid)
+        if (process_before.get('status') != 'known' or process_before.get('uid') != uid
+                or process_before.get('euid') != uid):
+            raise ValueError('control process identity unavailable')
         connection.sendall(json.dumps({'verb': verb, 'id': request_id, 'protocol': 1}).encode() + b'\n')
         raw = bytearray()
         while b'\n' not in raw:
@@ -103,4 +110,15 @@ def query_readonly(socket_path: Path, verb: str, *, expected_uid: int, timeout: 
             if len(raw) > MAX_RESPONSE: raise ValueError('control response budget')
         if not unchanged() or time.monotonic() > deadline:
             raise ValueError('control identity or deadline drift')
-        return decode_response(bytes(raw), verb, request_id, pid, uid)
+        observed = decode_response(bytes(raw), verb, request_id, pid, uid)
+        process_after = read_process_identity(pid)
+        if not identities_match(process_before, process_after)[0]:
+            raise ValueError('control process instance drift')
+        wall_finished = time.time()
+        mono_finished = time.monotonic()
+        if (mono_finished > deadline or wall_finished < wall_started
+                or abs((wall_finished - wall_started) - (mono_finished - mono_started)) > 0.25):
+            raise ValueError('control observation clock drift')
+        if verb == 'status' and not wall_started <= observed.payload['answered_at'] <= wall_finished:
+            raise ValueError('control response outside observation window')
+        return observed

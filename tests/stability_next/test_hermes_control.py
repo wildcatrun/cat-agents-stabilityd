@@ -4,6 +4,7 @@ import socket
 import tempfile
 import threading
 import time
+from unittest import mock
 from pathlib import Path
 import unittest
 from stability_core.hermes_control import ControlObservation, decode_response, query_readonly
@@ -81,6 +82,8 @@ class HermesSocketTransportTests(unittest.TestCase):
                         result = {'protocol': 1, 'pid': os.getpid()} if verb == 'identify' else {
                             'protocol': 1, 'answering_pid': os.getpid(), 'answered_at': time.time()}
                         if mode == 'wrong-pid': result['pid'] += 1
+                        if mode == 'old-status': result['answered_at'] -= 60
+                        if mode == 'future-status': result['answered_at'] += 60
                         if mode == 'oversize': result['padding'] = 'x' * (512 * 1024)
                         if mode == 'replace':
                             path.unlink()
@@ -116,3 +119,17 @@ class HermesSocketTransportTests(unittest.TestCase):
     def test_actual_oversize(self): self.fixture('oversize')
     def test_actual_peer_mismatch(self): self.fixture('wrong-pid')
     def test_actual_socket_replacement(self): self.fixture('replace')
+    def test_actual_stale_status(self): self.fixture('old-status', 'status')
+    def test_actual_future_status(self): self.fixture('future-status', 'status')
+    def test_actual_process_instance_drift(self):
+        from stability_core import hermes_control
+        reader = hermes_control.read_process_identity
+        count = 0
+        def drift(pid):
+            nonlocal count
+            identity = reader(pid)
+            count += 1
+            if count == 2: identity['starttime'] += 1
+            return identity
+        with mock.patch.object(hermes_control, 'read_process_identity', side_effect=drift):
+            self.fixture('process-drift')
