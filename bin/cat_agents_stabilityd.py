@@ -9745,7 +9745,8 @@ def stabilityd_progress_evidence(now_epoch: Optional[int] = None) -> Dict[str, A
 def run_once(conn: sqlite3.Connection, no_action: bool = False) -> Dict[str, Any]:
     # no_action disables actuators, but this entrypoint still publishes evidence/KV.
     # Both writer modes share this lock; pure status readers never acquire it.
-    ensure_dirs()
+    # ActuationLock prepares its own parent. Initialize evidence directories
+    # once, inside the locked/budgeted body, including direct body callers.
     with contextlib.ExitStack() as stack:
         try:
             stack.enter_context(ActuationLock(ACTUATION_LOCK_PATH))

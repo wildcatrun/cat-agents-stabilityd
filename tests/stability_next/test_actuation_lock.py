@@ -65,12 +65,37 @@ class ActuationLockTest(unittest.TestCase):
             path = Path(tmp) / "lock"
             with mock.patch.object(module, "ACTUATION_LOCK_PATH", path), mock.patch.object(
                 module, "ensure_dirs"
-            ), mock.patch.object(module, "_run_once_body") as body, ActuationLock(path):
+            ) as directories, mock.patch.object(module, "_run_once_body") as body, ActuationLock(path):
                 for no_action in (False, True):
                     result = module.run_once(None, no_action=no_action)
                     self.assertEqual(result["status"], "busy")
                     self.assertFalse(result["statePublished"])
                 body.assert_not_called()
+                directories.assert_not_called()
+
+    def test_missing_lock_parent_is_prepared_and_body_initializes_once(self):
+        spec = importlib.util.spec_from_file_location(
+            'stability_lock_initialization_test', Path(__file__).resolve().parents[2] / 'bin/cat_agents_stabilityd.py')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        for direct in (False, True):
+            with self.subTest(direct=direct), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = root / 'missing-parent' / 'writer.lock'
+                def initialize():
+                    if not direct: self.assertTrue(path.exists())
+                    (root / 'initialized').mkdir()
+                with mock.patch.object(module, 'ACTUATION_LOCK_PATH', path), \
+                     mock.patch.object(module, 'ensure_dirs', side_effect=initialize) as directories, \
+                     mock.patch.object(module, 'drain_event_exports'), \
+                     mock.patch.object(module, 'collect_snapshot', side_effect=RuntimeError('fixture-collection-stop')):
+                    with self.assertRaisesRegex(RuntimeError, 'fixture-collection-stop'):
+                        (module._run_once_body if direct else module.run_once)(mock.Mock(), no_action=True)
+                directories.assert_called_once()
+                self.assertTrue((root / 'initialized').exists())
+                if not direct:
+                    with ActuationLock(path): pass  # failed body released lock
 
     def test_body_error_is_not_misreported_as_lock_contention(self):
         spec = importlib.util.spec_from_file_location(
