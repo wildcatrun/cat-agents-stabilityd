@@ -521,12 +521,14 @@ class ProtectionActuatorTests(unittest.TestCase):
              mock.patch.object(stabilityd, "run_hermes_profile_gateway_cmd",
                                return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
              mock.patch.object(stabilityd, "db_get", return_value=0), \
-             mock.patch.object(stabilityd, "db_set"):
+             mock.patch.object(stabilityd, "db_set") as state_write:
             action = stabilityd.execute_hermers_profile_lifecycle(
                 mock.Mock(), profile, item, "hibernate", policy, "fixture-generation",
             )
         self.assertEqual(action["ledgerState"], "failed")
         self.assertEqual(action["result"], "failed")
+        self.assertEqual(state_write.call_count, 1)  # attempt cooldown only
+        self.assertFalse(any('planned:' in str(call.args[1]) for call in state_write.call_args_list))
 
 
 if __name__ == "__main__":

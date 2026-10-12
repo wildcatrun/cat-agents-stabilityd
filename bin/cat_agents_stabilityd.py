@@ -8535,12 +8535,8 @@ def execute_hermers_profile_lifecycle(
             return OperationResult("partial", f"outcome://hermes-profile-{action}/exit-{proc.returncode}")
         if hermes_gateway_operation_unconfirmed(proc):
             return OperationResult("partial", f"outcome://hermes-profile-{action}/unconfirmed")
+        # This cooldown bounds attempts; it does not confirm target residency.
         db_set(conn, action_key, epoch())
-        if target_mode == "hibernate":
-            db_set(conn, f"hermers_profile_mode:planned:{profile}",
-                   {"profile": profile, "targetMode": target_mode, "unit": unit,
-                    "reason": reason_code, "setAt": ts(),
-                    "setAtEpoch": epoch(), "source": "cat-agents-stabilityd"})
         return OperationResult("complete", f"outcome://hermes-profile-{action}/{record.action_id}")
 
     def postcheck(_spec: ActionSpec, _record: Any, _result: OperationResult) -> PostcheckResult:
@@ -8562,6 +8558,11 @@ def execute_hermers_profile_lifecycle(
                 json.dumps({"active": active, "activeState": service.get("ActiveState"),
                             "subState": service.get("SubState")}, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
+            if state == "verified" and _result.status == "complete" and target_mode == "hibernate":
+                db_set(conn, f"hermers_profile_mode:planned:{profile}",
+                       {"profile": profile, "targetMode": target_mode, "unit": unit,
+                        "reason": reason_code, "setAt": ts(), "setAtEpoch": epoch(),
+                        "source": "cat-agents-stabilityd"})
             return PostcheckResult(state, ref)
         except Exception:
             return PostcheckResult("unknown", "evidence://hermes-profile-postcheck/unknown")
