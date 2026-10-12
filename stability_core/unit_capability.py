@@ -49,21 +49,31 @@ def parse_unit_properties(text, unit):
     return fragment, drops, argv
 
 
-def _file_binding(path, request, owner):
+def _file_binding(path, request, owner, *, unit_roots=None, owner_uid=None):
+    roots = UNIT_ROOTS if unit_roots is None else unit_roots
+    uid = os.getuid() if owner_uid is None else owner_uid
+    if type(uid) is not int or uid < 0 or not isinstance(roots, tuple) or not roots:
+        raise ValueError('unit-trust-scope-invalid')
     if any(p.is_symlink() for p in (path, *path.parents)):
         raise ValueError('unit-file-symlink')
-    root = next((r for r in UNIT_ROOTS if r.is_absolute() and r in path.parents), None)
+    root = next((r for r in roots if isinstance(r, Path) and r.is_absolute() and r in path.parents), None)
     if root is None:
         raise ValueError('unit-file-owner-root')
     root_info = root.stat()
-    if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid not in {0, os.getuid()}
+    if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid not in {0, uid}
             or root_info.st_mode & 0o022):
         raise ValueError('unit-root-owner-mode')
+    if unit_roots is not None:
+        for ancestor in path.parents:
+            info = ancestor.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, uid}
+                    or info.st_mode & 0o022):
+                raise ValueError('unit-ancestor-owner-mode')
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         before = os.fstat(fd)
         if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 65536
-                or before.st_uid not in {0, os.getuid()} or before.st_mode & 0o022):
+                or before.st_uid not in {0, uid} or before.st_mode & 0o022):
             raise ValueError('unit-file-owner-mode')
         raw = bytearray()
         while len(raw) <= 65536:
@@ -113,13 +123,13 @@ def resolve_unit_executable(entry):
     raise ValueError('unit-executable-link-budget')
 
 
-def read_unit_binding(request, *, unit, read_properties, clock_ms):
+def read_unit_binding(request, *, unit, read_properties, clock_ms, unit_roots=None, owner_uid=None):
     if not re.fullmatch(r'[A-Za-z0-9_.@-]+\.service', unit):
         raise ValueError('unit-name-invalid')
     fragment, drops, argv = parse_unit_properties(read_properties(unit), unit)
     owner = 'runtime-unit://' + unit
-    file = _file_binding(fragment, request, owner)
-    drop_files = tuple(_file_binding(p, request, owner) for p in drops)
+    file = _file_binding(fragment, request, owner, unit_roots=unit_roots, owner_uid=owner_uid)
+    drop_files = tuple(_file_binding(p, request, owner, unit_roots=unit_roots, owner_uid=owner_uid) for p in drops)
     entry = Path(argv[0])
     executable, route = resolve_unit_executable(entry)
     digest = sha256_file(str(executable))
