@@ -9,6 +9,7 @@ from unittest import mock
 
 from stability_core.hermes_dotenv_projection import (
     ParserSource, TrustedDotenvParser, CONTROL_KEYS, read_dotenv_governance,
+    DotenvLayer, read_dotenv_governance_layers,
 )
 
 
@@ -60,6 +61,102 @@ class DotenvProjectionTests(unittest.TestCase):
 
     def values(self, **changes):
         return dict(self.read(**changes).governance_values)
+
+    def layers(self, texts, overrides=None, **changes):
+        paths = []
+        for index, text in enumerate(texts):
+            path = self.root / ('layer-' + str(index))
+            if text is not None:
+                path.write_bytes(text)
+                path.chmod(0o600)
+            paths.append(DotenvLayer(path, optional=text is None,
+                         override=True if overrides is None else overrides[index]))
+        kwargs = dict(owner_uid=os.getuid(), parser=self.parser, parent_values={}, known_absent=CONTROL_KEYS)
+        kwargs.update(changes)
+        return read_dotenv_governance_layers(tuple(paths), **kwargs)
+
+    def test_ordered_layers_see_previous_raw_values_and_override_policy(self):
+        result = self.layers([b'HERMES_HOME=/first\n', b'HERMES_HOME=${HERMES_HOME}/second\n'])
+        self.assertEqual(dict(result.governance_values)['HERMES_HOME'], '/first/second')
+        # Reuse existing files, avoiding artificial directory mutations in fences.
+        layers = tuple(DotenvLayer(self.root / ('layer-' + str(i)), override=flag)
+                       for i, flag in enumerate((True, False)))
+        result = read_dotenv_governance_layers(layers, owner_uid=os.getuid(), parser=self.parser,
+                                               parent_values={}, known_absent=CONTROL_KEYS)
+        self.assertEqual(dict(result.governance_values)['HERMES_HOME'], '/first')
+        self.assertEqual([entry[2] for entry in result.layer_sources], [True, False])
+
+    def test_ordered_raw_pythonpath_never_interpolates_redaction_digest(self):
+        result = self.layers([b'PYTHONPATH=/fixture/code\n', b'HERMES_HOME=${PYTHONPATH}/profile\n'])
+        values = dict(result.governance_values)
+        self.assertEqual(values['HERMES_HOME'], '/fixture/code/profile')
+        self.assertTrue(values['PYTHONPATH'].startswith('sha256:'))
+        self.assertNotIn(values['PYTHONPATH'], values['HERMES_HOME'])
+        self.assertIn('PYTHONPATH', result.unresolved_governance_keys)
+
+    def test_ordered_missing_empty_and_bare_layers_preserve_publication(self):
+        result = self.layers([b'HERMES_HOME=/first\n', None, b'HERMES_HOME\n'])
+        self.assertEqual(dict(result.governance_values)['HERMES_HOME'], '/first')
+        self.assertFalse(result.layer_sources[1][0].present)
+        result = self.layers([b'HERMES_HOME=/first\n', b'HERMES_HOME=\n', b'HOME=${HERMES_HOME:-/fallback}\n'])
+        self.assertEqual(dict(result.governance_values)['HOME'], '')
+
+    def test_ordered_known_absent_default_and_unknown_remain_distinct(self):
+        text = [None, b'HERMES_HOME=${HOME:-/fallback}\n']
+        self.assertEqual(dict(self.layers(text).governance_values)['HERMES_HOME'], '/fallback')
+        result = self.layers(text, known_absent=CONTROL_KEYS - {'HOME'},
+                             unknown_dependencies=frozenset({'HOME'}))
+        self.assertNotIn('HERMES_HOME', dict(result.governance_values))
+        self.assertIn('HERMES_HOME', result.unresolved_governance_keys)
+
+    def test_ordered_secret_dependencies_never_escape_between_layers(self):
+        result = self.layers([b'SECRET=PRIVATE_FIXTURE\n',
+                             b'HERMES_HOME=${SECRET:-/fallback}\nLD_PRELOAD=PRIVATE_FIXTURE\n'])
+        self.assertNotIn('PRIVATE_FIXTURE', repr(result))
+        self.assertNotIn('HERMES_HOME', dict(result.governance_values))
+        self.assertEqual(result.layer_import_influence_digests[0][:2], (1, 'LD_PRELOAD'))
+        self.assertFalse(result.artifact_approved)
+        with self.assertRaises(ValueError): replace(result, effective_coverage='complete')
+
+    def test_earlier_layer_mutation_during_later_parse_refused(self):
+        first, second = self.root / 'first', self.root / 'second'
+        first.write_bytes(b'HERMES_HOME=/first\n'); first.chmod(0o600)
+        second.write_bytes(b'HOME=/second\n'); second.chmod(0o600)
+        globals_ = self.parser.tokenize.__globals__
+        original = globals_['Reader']
+        count = 0
+        def reader(stream):
+            nonlocal count
+            count += 1
+            if count == 2: first.write_bytes(b'HERMES_HOME=/drift\n')
+            return original(stream)
+        with mock.patch.dict(globals_, Reader=reader):
+            with self.assertRaisesRegex(ValueError, 'ordered source drift'):
+                read_dotenv_governance_layers((DotenvLayer(first), DotenvLayer(second)),
+                    owner_uid=os.getuid(), parser=self.parser, parent_values={}, known_absent=CONTROL_KEYS)
+
+    def test_optional_earlier_source_appearing_during_later_parse_refused(self):
+        missing, second = self.root / 'missing', self.root / 'second'
+        second.write_bytes(b'HOME=/second\n'); second.chmod(0o600)
+        globals_ = self.parser.tokenize.__globals__
+        original = globals_['Reader']
+        def reader(stream):
+            missing.touch(mode=0o600)
+            return original(stream)
+        with mock.patch.dict(globals_, Reader=reader):
+            with self.assertRaises(ValueError):
+                read_dotenv_governance_layers((DotenvLayer(missing, optional=True), DotenvLayer(second)),
+                    owner_uid=os.getuid(), parser=self.parser, parent_values={}, known_absent=CONTROL_KEYS)
+
+    def test_ordered_bounds_duplicates_types_and_context(self):
+        kwargs = dict(owner_uid=os.getuid(), parser=self.parser, parent_values={}, known_absent=CONTROL_KEYS)
+        for layers in ((), [DotenvLayer(self.path)], (DotenvLayer(self.path),) * 33,
+                       (DotenvLayer(self.path), DotenvLayer(self.path, override=False)),
+                       (DotenvLayer(self.path, optional=1),), (DotenvLayer(self.path, override=None),)):
+            with self.subTest(layers=layers), self.assertRaises(ValueError):
+                read_dotenv_governance_layers(layers, **kwargs)
+        with self.assertRaises(ValueError):
+            read_dotenv_governance_layers((DotenvLayer(self.path),), context='reload', **kwargs)
 
     def test_actual_server_parser_identity_and_non_authority(self):
         result = self.read()
