@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 from stability_core.hermes_profile_config import read_profile_config
 
 
@@ -69,3 +70,43 @@ class ProfileConfigTests(unittest.TestCase):
             self.assertTrue(self.read('gateway:\n  multiplex_profiles: '+value+'\n').multiplex_false_retired)
         self.assertTrue(self.read('multiplex_profiles: null\ngateway:\n  multiplex_profiles: false\n').multiplex_false_retired)
         self.assertFalse(self.read('gateway: {}\n').multiplex_false_retired)
+
+    def test_replacement_during_read_refused(self):
+        original = os.read
+        changed = False
+        def replace_during_read(fd, size):
+            nonlocal changed
+            raw = original(fd, size)
+            if not changed:
+                changed = True
+                replacement = self.home / 'replacement.yaml'
+                replacement.write_text('gateway: {standalone: false}\n')
+                replacement.replace(self.path)
+            return raw
+        with mock.patch('stability_core.hermes_profile_config.os.read', side_effect=replace_during_read):
+            with self.assertRaises(ValueError): self.read('gateway: {standalone: true}\n')
+
+    def test_change_during_parsing_refused(self):
+        import yaml
+        original = yaml.load
+        def changed(raw, **kwargs):
+            result = original(raw, **kwargs)
+            self.path.write_text('gateway: {standalone: false}\n')
+            return result
+        with mock.patch.object(yaml, 'load', side_effect=changed):
+            with self.assertRaises(ValueError): self.read('gateway: {standalone: true}\n')
+
+    def test_event_budget_refused_below_byte_budget(self):
+        text = 'gateway: {standalone: true}\n' + ''.join('key'+str(n)+': value\n' for n in range(2200))
+        self.assertLess(len(text.encode()), 65536)
+        with self.assertRaises(ValueError): self.read(text)
+
+    def test_missing_parser_dependency_refused(self):
+        import builtins
+        original = builtins.__import__
+        def missing(name, *args, **kwargs):
+            if name == 'yaml': raise ImportError('synthetic dependency absent')
+            return original(name, *args, **kwargs)
+        with mock.patch.object(builtins, '__import__', side_effect=missing):
+            with self.assertRaisesRegex(ValueError, '^profile config interpretation refused$'):
+                self.read('gateway: {standalone: true}\n')
