@@ -7,7 +7,8 @@ import shlex
 
 PROPERTIES = frozenset({'Environment', 'EnvironmentFiles', 'PassEnvironment', 'UnsetEnvironment'})
 GOVERNANCE_KEYS = frozenset({'HERMES_HOME', 'GATEWAY_MULTIPLEX_PROFILES', 'PYTHONPATH',
-                             'HERMES_MANAGED_DIR', 'PYTEST_CURRENT_TEST', 'HERMES_UPDATE_POST_SWAP'})
+                             'HERMES_MANAGED_DIR', 'PYTEST_CURRENT_TEST', 'HERMES_UPDATE_POST_SWAP',
+                             'HOME', 'PYTHONHOME', 'LD_PRELOAD', 'LD_LIBRARY_PATH'})
 
 
 @dataclass(frozen=True)
@@ -48,7 +49,7 @@ def project_environment_properties(text):
                 raise ValueError('ambiguous environment variable')
             names.add(name)
             if name in GOVERNANCE_KEYS:
-                if name == 'HERMES_HOME' and (not Path(value).is_absolute() or '..' in Path(value).parts):
+                if name in {'HERMES_HOME', 'HOME'} and (not Path(value).is_absolute() or '..' in Path(value).parts):
                     raise ValueError('noncanonical runtime home')
                 if name == 'HERMES_MANAGED_DIR':
                     value = value.strip()
@@ -64,7 +65,7 @@ def project_environment_properties(text):
                     normalized = value.strip().lower()
                     value = ('true' if normalized in {'1', 'true', 'yes', 'on'} else
                              'false' if normalized in {'0', 'false', 'no', 'off'} else 'unknown')
-                if name == 'PYTHONPATH':
+                if name in {'PYTHONPATH', 'PYTHONHOME', 'LD_PRELOAD', 'LD_LIBRARY_PATH'}:
                     value = 'sha256:' + hashlib.sha256(value.encode()).hexdigest()
                 values[name] = value
         unset = {token.partition('=')[0] for token in shlex.split(properties['UnsetEnvironment'])}
@@ -156,3 +157,63 @@ def read_user_unit_environment_sources(unit, *, owner_uid):
         return UnitEnvironmentSources(unit, owner_uid, projection, observed_files)
     except Exception:
         raise ValueError('unit environment source observation refused') from None
+
+@dataclass(frozen=True)
+class ManagerEnvironmentSources:
+    owner_uid: int
+    projection: EnvironmentProjection
+    effective_coverage: str = 'incomplete'
+    action_authorized: bool = False
+
+    def __post_init__(self):
+        if self.effective_coverage != 'incomplete' or self.action_authorized is not False:
+            raise ValueError('manager environment source is not authority')
+
+
+def project_manager_environment(text):
+    """Parse closed show-environment assignments; never return unknown values."""
+    if type(text) is not str or len(text.encode()) > 32768:
+        raise ValueError('manager environment budget refused')
+    try:
+        assignments = []
+        names = set()
+        for line in text.splitlines():
+            if not line: continue
+            if "\\" in line and line.partition("=")[0] in GOVERNANCE_KEYS:
+                raise ValueError("manager control escape unresolved")
+            tokens = shlex.split(line)
+            if len(tokens) != 1:
+                raise ValueError('ambiguous manager assignment')
+            name, sep, value = tokens[0].partition('=')
+            if (not sep or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name)
+                    or name in names or len(tokens[0]) > 4096 or len(names) >= 256):
+                raise ValueError('manager assignment refused')
+            names.add(name); assignments.append(tokens[0])
+        synthetic = 'Environment=' + shlex.join(assignments) + '\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=\n'
+        projected = project_environment_properties(synthetic)
+        return EnvironmentProjection(hashlib.sha256(text.encode()).hexdigest(),
+                                     projected.governance_values, (), False, False)
+    except Exception:
+        raise ValueError('manager environment interpretation refused') from None
+
+
+def read_user_manager_environment(*, owner_uid):
+    """Bound current user's manager, without sudo/identity fallback or authority."""
+    import os
+    from .node_transport_contract import _bounded_ssh
+    if type(owner_uid) is not int or owner_uid < 0 or os.geteuid() != owner_uid:
+        raise ValueError('manager environment owner refused')
+    command = ['/usr/bin/env', f'XDG_RUNTIME_DIR=/run/user/{owner_uid}',
+               f'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{owner_uid}/bus',
+               '/usr/bin/systemctl', '--user', 'show-environment']
+    try:
+        first = _bounded_ssh(command)
+        if first.failure is not None or first.returncode != 0:
+            raise ValueError('manager source unavailable')
+        projection = project_manager_environment(first.stdout.decode('utf-8'))
+        second = _bounded_ssh(command)
+        if second.failure is not None or second.returncode != 0 or second.stdout != first.stdout:
+            raise ValueError('manager source drift')
+        return ManagerEnvironmentSources(owner_uid, projection)
+    except Exception:
+        raise ValueError('manager environment observation refused') from None

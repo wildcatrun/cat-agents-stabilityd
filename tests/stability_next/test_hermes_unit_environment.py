@@ -153,3 +153,62 @@ class EnvironmentProjectionTests(unittest.TestCase):
             with mock.patch('stability_core.node_transport_contract._bounded_ssh',return_value=result):
                 with self.assertRaises(ValueError) as caught:read_user_unit_environment_sources('hermes-gateway-fixture.service',owner_uid=os.geteuid())
             self.assertNotIn('PRIVATE_VALUE',str(caught.exception))
+    def test_manager_environment_redacted_and_home_observed(self):
+        from stability_core.hermes_unit_environment import project_manager_environment
+        raw='HOME=/fixture/user\nHERMES_MANAGED_DIR=/fixture/managed\nAPI_KEY=PRIVATE_VALUE\nLD_PRELOAD=PRIVATE_VALUE\n'
+        evidence=project_manager_environment(raw)
+        values=dict(evidence.governance_values)
+        self.assertEqual(values['HOME'],'/fixture/user')
+        self.assertTrue(values['LD_PRELOAD'].startswith('sha256:'))
+        self.assertNotIn('PRIVATE_VALUE',repr(evidence))
+        self.assertEqual(evidence.effective_coverage,'incomplete')
+    def test_manager_ambiguous_and_duplicate_assignments_refused(self):
+        from stability_core.hermes_unit_environment import project_manager_environment
+        for text in ('A=one\nA=two\n','A=PRIVATE_VALUE other','A="PRIVATE_VALUE','HOME=relative','x'*32769):
+            with self.assertRaises(ValueError) as caught:project_manager_environment(text)
+            self.assertNotIn('PRIVATE_VALUE',str(caught.exception))
+    def test_manager_reader_closed_command_and_drift(self):
+        import os
+        from unittest import mock
+        from stability_core.hermes_unit_environment import read_user_manager_environment
+        from stability_core.node_transport_contract import _CommandResult
+        result=_CommandResult(0,b'HOME=/fixture/user\nAPI_KEY=PRIVATE_VALUE\n')
+        with mock.patch('stability_core.node_transport_contract._bounded_ssh',return_value=result) as runner:
+            evidence=read_user_manager_environment(owner_uid=os.geteuid())
+        self.assertEqual(runner.call_count,2)
+        self.assertEqual(runner.call_args.args[0][-1],'show-environment')
+        self.assertNotIn('PRIVATE_VALUE',repr(evidence))
+        with mock.patch('stability_core.node_transport_contract._bounded_ssh',side_effect=[result,_CommandResult(0,b'HOME=/fixture/changed\n')]):
+            with self.assertRaises(ValueError):read_user_manager_environment(owner_uid=os.geteuid())
+    def test_manager_reader_wrong_owner_never_runs_command(self):
+        import os
+        from unittest import mock
+        from stability_core.hermes_unit_environment import read_user_manager_environment
+        with mock.patch('stability_core.node_transport_contract._bounded_ssh') as runner:
+            with self.assertRaises(ValueError):read_user_manager_environment(owner_uid=os.geteuid()+1)
+            runner.assert_not_called()
+
+    def test_manager_control_escape_is_not_reinterpreted(self):
+        from stability_core.hermes_unit_environment import project_manager_environment
+        for raw in (r'HOME=/fixture/with\x20space',r'HERMES_HOME=/fixture/back\slash',r'PYTHONPATH=/fixture/back\slash'):
+            with self.assertRaises(ValueError):project_manager_environment(raw)
+    def test_manager_original_digest_empty_and_quoted_values(self):
+        import hashlib
+        from stability_core.hermes_unit_environment import project_manager_environment
+        text='HOME="/fixture/with space"\nAPI_KEY="PRIVATE VALUE"\n'
+        evidence=project_manager_environment(text)
+        self.assertEqual(evidence.source_sha256,hashlib.sha256(text.encode()).hexdigest())
+        self.assertEqual(dict(evidence.governance_values)['HOME'],'/fixture/with space')
+        self.assertEqual(project_manager_environment('').governance_values,())
+    def test_manager_partial_and_invalid_commands_refused(self):
+        import os
+        from unittest import mock
+        from stability_core.hermes_unit_environment import read_user_manager_environment
+        from stability_core.node_transport_contract import _CommandResult
+        for result in (_CommandResult(0,b'HOME=/fixture/user','transport-output-limit'),_CommandResult(1,b'PRIVATE_VALUE'),_CommandResult(0,b'\xffPRIVATE_VALUE')):
+            with mock.patch('stability_core.node_transport_contract._bounded_ssh',return_value=result):
+                with self.assertRaises(ValueError) as caught:read_user_manager_environment(owner_uid=os.geteuid())
+            self.assertNotIn('PRIVATE_VALUE',str(caught.exception))
+    def test_manager_evidence_cannot_claim_complete(self):
+        from stability_core.hermes_unit_environment import ManagerEnvironmentSources,project_manager_environment
+        with self.assertRaises(ValueError):ManagerEnvironmentSources(0,project_manager_environment(''),effective_coverage='complete')
