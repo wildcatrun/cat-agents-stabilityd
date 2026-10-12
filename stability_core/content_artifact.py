@@ -56,7 +56,7 @@ def measure_content_artifact(spec, *, budget_ms=1000):
             or root_stat.st_mode & 0o022):
         raise ValueError('content-root-owner-invalid')
     deadline = time.monotonic() + budget_ms / 1000
-    records, identities, total, package = [], {}, 0, None
+    records, identities, directories, total, package = [], {}, {}, 0, None
     for relative in sorted(spec.files):
         if (type(relative) is not str or len(relative) > 4096 or '\\' in relative
                 or str(PurePosixPath(relative)) != relative or PurePosixPath(relative).is_absolute()
@@ -66,6 +66,15 @@ def measure_content_artifact(spec, *, budget_ms=1000):
         path = root / relative
         if any(p.is_symlink() for p in (path, *path.parents)):
             raise ValueError('content-file-symlink')
+        for parent in path.parents:
+            if parent == root: break
+            info = parent.stat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, os.getuid()}
+                    or info.st_mode & 0o022):
+                raise ValueError('content-parent-owner-invalid')
+            if parent in directories and directories[parent] != _identity(info):
+                raise ValueError('content-parent-drift')
+            directories[parent] = _identity(info)
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
             before = os.fstat(descriptor)
@@ -97,8 +106,12 @@ def measure_content_artifact(spec, *, budget_ms=1000):
         raise ValueError('content-root-drift')
     for path, identity in identities.items():
         if time.monotonic() > deadline: raise ValueError('content-time-budget')
-        if path.is_symlink() or _identity(path.lstat()) != identity:
+        if any(p.is_symlink() for p in (path, *path.parents)) or _identity(path.lstat()) != identity:
             raise ValueError('content-manifest-drift')
+    for directory, identity in directories.items():
+        if time.monotonic() > deadline: raise ValueError('content-time-budget')
+        if directory.is_symlink() or _identity(directory.lstat()) != identity:
+            raise ValueError('content-parent-drift')
     payload = dict(schemaVersion=1, packageName=spec.package_name, packageVersion=spec.package_version,
                    files=records)
     canonical = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()

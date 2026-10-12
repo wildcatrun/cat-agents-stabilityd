@@ -7,9 +7,57 @@ import unittest
 from unittest import mock
 
 from stability_core import content_artifact as c
+from stability_core.adapter_contract import AdapterContract, AdapterDescriptor, sha256_file
+from stability_core.effect_capability import EffectCapabilityProvider, EffectRequest, EffectOperation
 
 
 class ContentArtifactTests(unittest.TestCase):
+    def test_actual_measurement_reader_cannot_reuse_approval_after_code_change(self):
+        measured = c.measure_content_artifact(self.spec)
+        binary = self.root / 'module.mjs'
+        binary_digest = sha256_file(str(binary))
+        request = EffectRequest('openclaw.session.reset', EffectOperation.OPENCLAW_RPC,
+                                'fixture-session', 'fixture-node', 'fixture-generation')
+        contract = AdapterContract('fixture-api', 1, '1.0.0', '1.0.0', '1.2.3', '1.2.3',
+            ('openclaw',), ('sessions.reset',), ('sessions.reset',), (),
+            ((measured.digest, binary_digest),))
+        def read(current):
+            self.assertEqual(current, request)
+            content = c.measure_content_artifact(self.spec)
+            digest = sha256_file(str(binary))
+            return AdapterDescriptor('openclaw', 'fixture-api', '1.2.3', '1.0.0', '',
+                request.node_id, request.generation, 1000, ('sessions.reset',), 'runtime-owned',
+                str(binary), str(binary), digest, digest, artifact_kind='content-manifest',
+                artifact_digest=content.digest)
+        provider = EffectCapabilityProvider(clock_ms=lambda: 1000,
+            node_reader=lambda: (request.node_id, request.generation), api_reader=read, api_contract=contract)
+        first = provider.assess(request)
+        self.assertEqual(first.status, 'verified')
+        self.assertFalse(first.action_authorized)
+        self.assertTrue(provider.accepts(first, request))
+        binary.write_text('export const fixture = false;')
+        changed = provider.assess(request)
+        self.assertEqual(changed.status, 'observation_only')
+        self.assertFalse(provider.accepts(changed, request))
+
+    def test_deep_parent_replaced_by_symlink_after_read_is_rejected(self):
+        parent = self.root / 'a' / 'b'
+        parent.mkdir(parents=True)
+        module = parent / 'module.mjs'; module.write_text('export const fixture = true;')
+        spec = dataclasses.replace(self.spec, files=('package.json', 'a/b/module.mjs'))
+        actual = c.os.read
+        changed = False
+        def read(fd, size):
+            nonlocal changed
+            result = actual(fd, size)
+            if result.startswith(b'{') and not changed:
+                changed = True
+                retained = parent.parent / 'retained'
+                parent.rename(retained); parent.symlink_to(retained.name)
+            return result
+        with mock.patch.object(c.os, 'read', side_effect=read):
+            with self.assertRaisesRegex(ValueError, 'manifest-drift'): c.measure_content_artifact(spec)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
