@@ -106,6 +106,7 @@ class UnitBinding:
     effective_config: UnitEffectiveConfiguration | None = None
     executable_entry: Path | None = None
     executable_route: tuple = ()
+    owner_uid: int | None = None  # Trusted runtime-user scope, not action metadata.
 
 
 @dataclass(frozen=True)
@@ -356,6 +357,8 @@ class EffectCapabilityProvider:
                         or not re.fullmatch(r'[A-Za-z0-9_.@-]+\.service',binding.unit)
                         or binding.fragment.path.name != binding.unit):
                     raise ValueError('unit-target-owner-binding')
+                if binding.owner_uid is not None and (type(binding.owner_uid) is not int or binding.owner_uid < 0):
+                    raise ValueError('unit-owner-scope-invalid')
                 config = binding.effective_config
                 if (type(config) is not UnitEffectiveConfiguration or config.coverage != "complete"
                         or config.node_id != request.node_id or config.generation != request.generation
@@ -380,7 +383,7 @@ class EffectCapabilityProvider:
                     raise ValueError("unit-effective-execstart-conflict")
                 if binding.executable_entry is not None:
                     from .unit_capability import resolve_unit_executable
-                    resolved, route = resolve_unit_executable(binding.executable_entry)
+                    resolved, route = resolve_unit_executable(binding.executable_entry, owner_uid=binding.owner_uid)
                     if resolved != binding.executable or route != binding.executable_route:
                         raise ValueError('unit-executable-route-drift')
                 if (type(binding.executable_sha256) is not str
@@ -388,11 +391,11 @@ class EffectCapabilityProvider:
                         or sha256_file(str(binding.executable)) != binding.executable_sha256):
                     raise ValueError('unit-executable-drift')
                 if binding.executable_entry is not None:
-                    if resolve_unit_executable(binding.executable_entry) != (binding.executable, binding.executable_route):
+                    if resolve_unit_executable(binding.executable_entry, owner_uid=binding.owner_uid) != (binding.executable, binding.executable_route):
                         raise ValueError('unit-executable-route-drift')
                 evidence = (binding.unit,tuple(file.sha256 for file in (binding.fragment,*binding.dropin_files)),
                             argv,binding.executable_sha256,binding.runtime_owner_ref,
-                            binding.executable_entry,binding.executable_route)
+                            binding.executable_entry,binding.executable_route,binding.owner_uid)
             else:
                 if not callable(self.process_reader) or not callable(self.process_owner_reader):
                     return issue('unknown','process-provider-unavailable',requirement)
