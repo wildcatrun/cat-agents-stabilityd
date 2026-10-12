@@ -1,7 +1,8 @@
 """Read-only Hermes control-socket observation; never grants effect authority."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 import json
 import math
+import re
 from pathlib import Path
 import socket
 import stat
@@ -20,6 +21,8 @@ class ControlObservation:
     peer_uid: int
     payload: dict
     action_authorized: bool = False
+    process_identity: dict = field(default_factory=dict)
+    received_monotonic: float = 0.0
 
     def __post_init__(self):
         if self.action_authorized is not False:
@@ -121,4 +124,47 @@ def query_readonly(socket_path: Path, verb: str, *, expected_uid: int, timeout: 
             raise ValueError('control observation clock drift')
         if verb == 'status' and not wall_started <= observed.payload['answered_at'] <= wall_finished:
             raise ValueError('control response outside observation window')
-        return observed
+        return replace(observed, process_identity=dict(process_after), received_monotonic=mono_finished)
+
+
+def profile_residency(identify: ControlObservation, status: ControlObservation,
+                      *, expected_home: Path, profile: str, now_monotonic: float):
+    """Compose fresh peer-bound observations; membership is not channel readiness.
+
+    No absence inference from missing metadata or unreachable sockets. Callers
+    derive home/profile from runtime registry routing, never local enumeration.
+    """
+    if not isinstance(profile, str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', profile):
+        raise ValueError('profile scope refused')
+    home = Path(expected_home)
+    if not home.is_absolute() or '..' in home.parts:
+        raise ValueError('home scope refused')
+    if identify.verb != 'identify' or status.verb != 'status':
+        raise ValueError('observation roles refused')
+    if (identify.peer_pid != status.peer_pid or identify.peer_uid != status.peer_uid
+            or not identities_match(identify.process_identity, status.process_identity)[0]):
+        raise ValueError('observation process drift')
+    if type(now_monotonic) not in (int, float) or not math.isfinite(now_monotonic):
+        raise ValueError('observation clock refused')
+    for observed in (identify, status):
+        if (not 0 < observed.received_monotonic <= now_monotonic
+                or now_monotonic - observed.received_monotonic > 2
+                or observed.process_identity.get('pid') != observed.peer_pid
+                or observed.process_identity.get('uid') != observed.peer_uid
+                or observed.process_identity.get('euid') != observed.peer_uid
+                or observed.payload.get('hermes_home') != str(home)):
+            raise ValueError('observation freshness or home refused')
+    if status.received_monotonic < identify.received_monotonic:
+        raise ValueError('observation sequence refused')
+    memberships = []
+    for observed in (identify, status):
+        names = observed.payload.get('served_profiles')
+        if (not isinstance(names, list) or not names or len(names) > 1024
+                or any(not isinstance(n, str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', n) for n in names)
+                or len(set(names)) != len(names)):
+            raise ValueError('explicit served profile scope unavailable')
+        memberships.append(set(names))
+    if memberships[0] != memberships[1]:
+        raise ValueError('served profile scope changed')
+    return {'profile': profile, 'residency': 'served' if profile in memberships[1] else 'unserved',
+            'peerPid': status.peer_pid, 'channelReadiness': 'unknown', 'actionAuthorized': False}

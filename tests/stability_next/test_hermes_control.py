@@ -5,9 +5,10 @@ import tempfile
 import threading
 import time
 from unittest import mock
+from dataclasses import replace
 from pathlib import Path
 import unittest
-from stability_core.hermes_control import ControlObservation, decode_response, query_readonly
+from stability_core.hermes_control import ControlObservation, decode_response, query_readonly, profile_residency
 
 
 class HermesControlTests(unittest.TestCase):
@@ -56,6 +57,50 @@ class HermesControlTests(unittest.TestCase):
     def test_observation_cannot_grant_effect_authority(self):
         with self.assertRaises(ValueError):
             ControlObservation('identify', 42, 1000, {}, True)
+
+
+class ProfileResidencyTests(unittest.TestCase):
+    def pair(self, names=None):
+        identity = {'status': 'known', 'pid': 42, 'starttime': 7, 'uid': 1000, 'euid': 1000,
+                    'bootId': 'boot', 'cmdlineDigest': 'cmd', 'cgroupDigest': 'group'}
+        payload = {'hermes_home': '/synthetic/home', 'served_profiles': names or ['default', 'catbody']}
+        return (ControlObservation('identify', 42, 1000, dict(payload), process_identity=dict(identity), received_monotonic=10),
+                ControlObservation('status', 42, 1000, dict(payload), process_identity=dict(identity), received_monotonic=11))
+
+    def assess(self, pair, now=11):
+        return profile_residency(*pair, expected_home=Path('/synthetic/home'), profile='catbody', now_monotonic=now)
+
+    def test_present_and_absent_are_membership_only(self):
+        for names, expected in ((['default', 'catbody'], 'served'), (['default'], 'unserved')):
+            result = self.assess(self.pair(names))
+            self.assertEqual(result['residency'], expected)
+            self.assertEqual(result['channelReadiness'], 'unknown')
+            self.assertFalse(result['actionAuthorized'])
+
+    def test_stale_or_reversed_clock_refused(self):
+        for now in (9, 13, float('nan')):
+            with self.assertRaises(ValueError): self.assess(self.pair(), now)
+
+    def test_changed_process_refused(self):
+        first, second = self.pair()
+        with self.assertRaises(ValueError):
+            self.assess((first, replace(second, process_identity=dict(second.process_identity, starttime=8))))
+
+    def test_wrong_home_refused(self):
+        first, second = self.pair()
+        with self.assertRaises(ValueError):
+            self.assess((first, replace(second, payload=dict(second.payload, hermes_home='/other'))))
+
+    def test_missing_empty_duplicate_and_drifting_scope_refused(self):
+        for names in (None, [], ['default', 'default'], ['default']):
+            first, second = self.pair()
+            with self.subTest(names=names), self.assertRaises(ValueError):
+                self.assess((first, replace(second, payload=dict(second.payload, served_profiles=names))))
+
+    def test_decode_only_identity_not_accepted_as_verified_observation(self):
+        first, second = self.pair()
+        with self.assertRaises(ValueError):
+            self.assess((replace(first, process_identity={}), second))
 
 
 @unittest.skipUnless(hasattr(socket, 'SO_PEERCRED') and os.environ.get('TEST_SOCKET_ROOT'),
