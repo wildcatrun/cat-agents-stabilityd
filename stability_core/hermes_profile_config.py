@@ -7,6 +7,20 @@ import re
 import stat
 
 
+def standalone_value(value):
+    # Installed profiles._standalone_truthy: strings use the shared token
+    # parser, all other safely parsed YAML values use bool(value).
+    return value.strip().lower() in {'1', 'true', 'yes', 'on'} if isinstance(value, str) else bool(value)
+
+
+def retired_multiplex_value(value):
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {'0', 'false', 'no', 'off'}
+    return not bool(value)
+
+
 @dataclass(frozen=True)
 class ProfileConfigEvidence:
     home: Path
@@ -79,8 +93,11 @@ def read_profile_config(home: Path, *, profile: str, runtime_root: Path, owner_u
         if not isinstance(config, dict): raise ValueError('config mapping required')
         gateway = config.get('gateway', {})
         if not isinstance(gateway, dict): raise ValueError('gateway mapping required')
-        standalone = gateway.get('standalone') is True
-        retired = config.get('multiplex_profiles', gateway.get('multiplex_profiles')) is False
+        standalone = standalone_value(gateway.get('standalone'))
+        multiplex = config.get('multiplex_profiles')
+        if multiplex is None:
+            multiplex = gateway.get('multiplex_profiles')
+        retired = retired_multiplex_value(multiplex)
     except Exception:
         raise ValueError('profile config interpretation refused') from None
     if (identity(path.lstat()) != identity(before)

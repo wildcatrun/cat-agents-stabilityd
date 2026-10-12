@@ -20,8 +20,10 @@ class ProfileConfigTests(unittest.TestCase):
         self.path.chmod(0o600)
         return read_profile_config(self.home, profile='fixture', runtime_root=self.root, owner_uid=os.getuid())
 
-    def test_only_explicit_standalone_is_positive_evidence(self):
-        for value, expected in (('true', True), ('false', False), ('null', False), ('"true"', False)):
+    def test_standalone_matches_installed_boolean_tokens(self):
+        for value, expected in (('true', True), ('false', False), ('null', False), ('"true"', True),
+                                ('" ON "', True), ('"yes"', True), ('1', True), ('0', False),
+                                ('"off"', False), ('"unknown"', False)):
             with self.subTest(value=value):
                 self.assertEqual(self.read('gateway:\n  standalone: '+value+'\n').standalone, expected)
 
@@ -61,3 +63,9 @@ class ProfileConfigTests(unittest.TestCase):
         first = self.read('gateway: {standalone: true}\n')
         second = self.read('gateway: {standalone: false}\n')
         self.assertNotEqual(first.sha256, second.sha256)
+
+    def test_retired_tokens_and_null_top_level_fallback(self):
+        for value in ('false', '0', '"off"', '"no"'):
+            self.assertTrue(self.read('gateway:\n  multiplex_profiles: '+value+'\n').multiplex_false_retired)
+        self.assertTrue(self.read('multiplex_profiles: null\ngateway:\n  multiplex_profiles: false\n').multiplex_false_retired)
+        self.assertFalse(self.read('gateway: {}\n').multiplex_false_retired)
