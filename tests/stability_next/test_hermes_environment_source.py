@@ -78,3 +78,26 @@ class EnvironmentSourceTests(unittest.TestCase):
         from stability_core.hermes_environment_source import EnvironmentSourceIdentity
         with self.assertRaises(ValueError):
             EnvironmentSourceIdentity(self.path,False,None,None,(),action_authorized=True)
+    def test_bundle_preserves_order_and_absence(self):
+        from stability_core.hermes_environment_source import read_environment_sources
+        self.path.write_text('fixture');self.path.chmod(0o600)
+        missing=self.root/'missing'
+        evidence=read_environment_sources([(self.path,False),(missing,True)],owner_uid=os.getuid())
+        self.assertEqual([item.path for item in evidence],[self.path,missing])
+        self.assertEqual([item.present for item in evidence],[True,False])
+    def test_bundle_detects_change_between_sweeps(self):
+        from stability_core import hermes_environment_source as module
+        self.path.write_text('before');self.path.chmod(0o600)
+        original=module.read_environment_source;calls=0
+        def read(*args,**kwargs):
+            nonlocal calls
+            evidence=original(*args,**kwargs);calls+=1
+            if calls==1:self.path.write_text('changed-longer')
+            return evidence
+        with mock.patch.object(module,'read_environment_source',side_effect=read):
+            with self.assertRaisesRegex(ValueError,'set drift'):
+                module.read_environment_sources([(self.path,False)],owner_uid=os.getuid())
+    def test_bundle_invalid_and_duplicate_sources_refused(self):
+        from stability_core.hermes_environment_source import read_environment_sources
+        for sources in ([],[(self.path,True)]*33,[(self.path,True),(self.path,False)],[(self.path,1)],['secret']):
+            with self.assertRaises(ValueError):read_environment_sources(sources,owner_uid=os.getuid())

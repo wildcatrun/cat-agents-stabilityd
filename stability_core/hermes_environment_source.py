@@ -77,3 +77,31 @@ def read_environment_source(path, *, owner_uid, optional=False):
         raise ValueError('environment source read refused') from None
     finally:
         if fd is not None: os.close(fd)
+
+def read_environment_sources(sources, *, owner_uid):
+    """Double-observe a bounded resolver-owned file set; not effective-env proof.
+
+    The caller must supply every resolved source, including optional missing
+    files. Completeness and loading order remain responsibilities of the qualified
+    runtime resolver, not this identity collector.
+    """
+    if type(sources) not in (list, tuple) or not 1 <= len(sources) <= 32:
+        raise ValueError('environment source set budget')
+    sources = tuple(sources)
+    paths = []
+    for item in sources:
+        if type(item) is not tuple or len(item) != 2 or type(item[1]) is not bool:
+            raise ValueError('environment source set refused')
+        if not isinstance(item[0], (str, Path)):
+            raise ValueError('environment source set refused')
+        path = Path(item[0])
+        if path in paths:
+            raise ValueError('environment source duplicate')
+        paths.append(path)
+    first = tuple(read_environment_source(path, owner_uid=owner_uid, optional=optional)
+                  for path, optional in sources)
+    second = tuple(read_environment_source(path, owner_uid=owner_uid, optional=optional)
+                   for path, optional in sources)
+    if first != second:
+        raise ValueError('environment source set drift')
+    return second
