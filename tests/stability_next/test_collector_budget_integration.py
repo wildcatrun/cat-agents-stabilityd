@@ -163,9 +163,10 @@ class CollectorBudgetIntegrationTests(unittest.TestCase):
 
     def test_expired_publication_publishes_partial_without_return_mutation(self):
         original = m.publish_generation
-        def publication(snapshot, artifacts, latest, extra):
+        def publication(snapshot, artifacts, latest, extra, *, compact_sidecars=False):
+            self.assertTrue(compact_sidecars)
             self.clock.advance(600000)
-            return original(snapshot, artifacts, latest, extra)
+            return original(snapshot, artifacts, latest, extra, compact_sidecars=compact_sidecars)
         with mock.patch.object(m, 'publish_generation', side_effect=publication), \
              mock.patch.object(m, 'log_line') as logger:
             result, actuator = self.run_body()

@@ -112,8 +112,11 @@ def artifact_metadata(path: Path) -> Dict[str, Any]:
 def publish_generation(
     snapshot: Dict[str, Any], artifacts: Iterable[Tuple[Path, Any]], latest_path: Path,
     extra_metadata: Iterable[Dict[str, Any]] = (),
+    *, compact_sidecars: bool = False,
 ) -> Dict[str, Any]:
     """Write generation sidecars, then atomically publish latest as commit pointer."""
+    if type(compact_sidecars) is not bool:
+        raise ValueError("publication sidecar JSON format must be boolean")
     artifacts = list(artifacts)
     parents = dict.fromkeys([path.parent for path, _ in artifacts] + [latest_path.parent])
     with ExitStack() as stack:
@@ -130,7 +133,7 @@ def publish_generation(
         for path, payload in artifacts:
             for check in checks:
                 check()
-            artifact_metas.append(write_json_atomic(path, payload, directory_identity=identities[path.parent], _sync_directory=False, _parent_fence=fences[path.parent]))
+            artifact_metas.append(write_json_atomic(path, payload, directory_identity=identities[path.parent], _sync_directory=False, _parent_fence=fences[path.parent], compact=compact_sidecars))
         for check in checks:
             check()
         # All sidecar files are synced; commit each distinct rename directory

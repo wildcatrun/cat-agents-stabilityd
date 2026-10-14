@@ -1,4 +1,6 @@
 import importlib.util
+import ast
+import time
 import hashlib
 import io
 import json
@@ -11,6 +13,36 @@ from pathlib import Path
 from unittest import mock
 
 from stability_core import generation
+
+class CompactSidecarCompatibilityTests(unittest.TestCase):
+    def test_actual_wrapper_reads_compact_policy_and_manifest_hashes_actual_bytes(self):
+        source = Path(__file__).resolve().parents[2] / 'remote-scripts/openclaw_cron_run_wrapper.py'
+        tree = ast.parse(source.read_text())
+        selected = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name in {'load_json', 'load_lane_policy'}]
+        self.assertEqual(len(selected), 2)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sidecar = root / 'lane-policy.json'
+            policy = {'validUntilEpoch': int(time.time()) + 3600, 'cron': {'admission': '猫'},
+                      'generationId': 'fixture'}
+            result = generation.publish_generation({'generationId': 'fixture'},
+                       [(sidecar, policy)], root / 'latest.json', compact_sidecars=True)
+            scope = {'json': json, 'Path': Path, 'time': time, 'LANE_POLICY_PATH': sidecar}
+            exec(compile(ast.Module(body=selected, type_ignores=[]), str(source), 'exec'), scope)
+            self.assertEqual(scope['load_lane_policy'](), policy)
+            self.assertEqual(sidecar.read_bytes(),
+                             (json.dumps(policy, ensure_ascii=False, separators=(',', ':')) + '\n').encode())
+            self.assertEqual(result['generationManifest']['artifacts'][0]['sha256'],
+                             hashlib.sha256(sidecar.read_bytes()).hexdigest())
+
+    def test_invalid_sidecar_format_refused_before_directory_creation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'missing' / 'latest.json'
+            for value in (None, 1, 'compact'):
+                with self.assertRaises(ValueError):
+                    generation.publish_generation({}, [], path, compact_sidecars=value)
+            self.assertFalse(path.parent.exists())
 
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / "bin" / "cat_agents_stabilityd.py"

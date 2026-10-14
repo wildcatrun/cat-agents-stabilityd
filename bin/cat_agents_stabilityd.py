@@ -7484,7 +7484,7 @@ def openclaw_gateway_call(method: str, params: Dict[str, Any], timeout_seconds: 
     if rpc_launcher is not None and type(rpc_launcher) is not SessionRpcLauncher:
         return None, "gateway-rpc-launcher-scope-invalid"
     command_prefix = list(rpc_launcher.argv) if rpc_launcher is not None else ["openclaw"]
-    endpoint_args = ["--url", rpc_launcher.endpoint_url] if rpc_launcher is not None else []
+    endpoint_args = ["--expect-url", rpc_launcher.endpoint_url] if rpc_launcher is not None else []
     try:
         proc = run_cmd([
             *command_prefix, "gateway", "call", method,
@@ -9891,7 +9891,7 @@ def _run_once_body(conn: sqlite3.Connection, no_action: bool = False) -> Dict[st
             artifact_metadata(Path(snapshot["workflowEvidence"]["jsonPath"])),
             artifact_metadata(Path(snapshot["workflowEvidence"]["markdownPath"])),
         ])
-    published = publish_generation(snapshot, artifacts, LATEST_PATH, artifacts_meta_extra)
+    published = publish_generation(snapshot, artifacts, LATEST_PATH, artifacts_meta_extra, compact_sidecars=True)
     # This check occurs AFTER latest publication, so it is an independent receipt.
     # Never mutate published snapshot and make returned/latest evidence diverge.
     completion = {"scope": "post-publication-cooperative-budget", "generationId": generation_id,

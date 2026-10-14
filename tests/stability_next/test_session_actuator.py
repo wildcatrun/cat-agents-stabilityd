@@ -30,7 +30,7 @@ class SessionActuatorTests(unittest.TestCase):
             self.assertEqual(argv[index - 2:index], ['gateway', 'call'])
             if argv[index] == 'sessions.reset':
                 self.assertEqual(argv[:2], [str(fixture.node), str(fixture.cli)])
-                self.assertEqual(argv[-2:], ['--url', 'ws://127.0.0.1:18789'])
+                self.assertEqual(argv[-2:], ['--expect-url', 'ws://127.0.0.1:18789'])
             params = json.loads(argv[argv.index('--params') + 1])
             self.assertEqual(params['key'], key)
             if argv[index] == 'sessions.describe':

@@ -117,11 +117,11 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
                 if argv[method_index] == 'sessions.describe':
                     if method_index == 4:
                         self.assertEqual(argv[:2], [str(fixture.node), str(fixture.cli)])
-                        self.assertEqual(argv[-2:], ['--url', 'ws://127.0.0.1:18789'])
+                        self.assertEqual(argv[-2:], ['--expect-url', 'ws://127.0.0.1:18789'])
                     if mutation is not None: mutation(fixture, len(rpc))
                     return SimpleNamespace(returncode=0, stdout=json.dumps({'session': row}), stderr='')
                 self.assertEqual(argv[:2], [str(fixture.node), str(fixture.cli)])
-                self.assertEqual(argv[-2:], ['--url', 'ws://127.0.0.1:18789'])
+                self.assertEqual(argv[-2:], ['--expect-url', 'ws://127.0.0.1:18789'])
                 effects.append(argv)
                 return SimpleNamespace(returncode=1 if nonzero else 0,
                     stdout=json.dumps({'ok': True, 'key': self.key, 'entry': {'sessionId': self.session}}),
