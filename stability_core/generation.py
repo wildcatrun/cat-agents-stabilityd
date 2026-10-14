@@ -54,18 +54,20 @@ def _fsync_directory(path: Path, *, _fence=None) -> None:
 
 
 def _atomic_replace(path: Path, writer, *, directory_identity=None, sync_directory=True, parent_fence=None, return_metadata=True) -> Dict[str, Any]:
+    parent = path.parent
+    filename = path.name
     if parent_fence is not None:
-        if parent_fence.path != path.parent:
+        if parent_fence.path != parent:
             raise OSError("publication directory fence scope changed")
         parent_fence()
     else:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    with (nullcontext(parent_fence) if parent_fence is not None else _directory_fence(path.parent)) as check:
+        parent.mkdir(parents=True, exist_ok=True)
+    with (nullcontext(parent_fence) if parent_fence is not None else _directory_fence(parent)) as check:
         check()
         if directory_identity is not None and check.identity != directory_identity:
             raise OSError("publication directory identity changed")
         fd = check.fd
-        tmp_name = f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        tmp_name = f"{filename}.{os.getpid()}.{time.time_ns()}.tmp"
         try:
             if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) != check.identity:
                 raise OSError("publication directory identity changed")
@@ -76,9 +78,9 @@ def _atomic_replace(path: Path, writer, *, directory_identity=None, sync_directo
                 handle.flush()
                 os.fsync(handle.fileno())
             check()
-            os.replace(tmp_name, path.name, src_dir_fd=fd, dst_dir_fd=fd)
+            os.replace(tmp_name, filename, src_dir_fd=fd, dst_dir_fd=fd)
             if sync_directory:
-                _fsync_directory(path.parent, _fence=check)
+                _fsync_directory(parent, _fence=check)
             check()
             return artifact_metadata(path) if return_metadata else {}
         except Exception:
@@ -117,8 +119,9 @@ def publish_generation(
     """Write generation sidecars, then atomically publish latest as commit pointer."""
     if type(compact_sidecars) is not bool:
         raise ValueError("publication sidecar JSON format must be boolean")
-    artifacts = list(artifacts)
-    parents = dict.fromkeys([path.parent for path, _ in artifacts] + [latest_path.parent])
+    artifacts = [(path, payload, path.parent) for path, payload in artifacts]
+    latest_parent = latest_path.parent
+    parents = dict.fromkeys([parent for _, _, parent in artifacts] + [latest_parent])
     with ExitStack() as stack:
         checks = []
         identities = {}
@@ -130,15 +133,15 @@ def publish_generation(
             identities[parent] = check.identity
             fences[parent] = check
         artifact_metas = []
-        for path, payload in artifacts:
+        for path, payload, parent in artifacts:
             for check in checks:
                 check()
-            artifact_metas.append(write_json_atomic(path, payload, directory_identity=identities[path.parent], _sync_directory=False, _parent_fence=fences[path.parent], compact=compact_sidecars))
+            artifact_metas.append(write_json_atomic(path, payload, directory_identity=identities[parent], _sync_directory=False, _parent_fence=fences[parent], compact=compact_sidecars))
         for check in checks:
             check()
         # All sidecar files are synced; commit each distinct rename directory
         # before the independent latest-pointer file/directory barrier.
-        for parent in dict.fromkeys(path.parent for path, _ in artifacts):
+        for parent in dict.fromkeys(parent for _, _, parent in artifacts):
             _fsync_directory(parent, _fence=fences[parent])
         for check in checks:
             check()
@@ -151,5 +154,5 @@ def publish_generation(
         }
         # Latest is the commit pointer, not a self-listed artifact. Its returned
         # metadata was unused; retain both durability barriers without rereading it.
-        write_json_atomic(latest_path, snapshot, directory_identity=identities[latest_path.parent], _parent_fence=fences[latest_path.parent], _return_metadata=False, compact=True)
+        write_json_atomic(latest_path, snapshot, directory_identity=identities[latest_parent], _parent_fence=fences[latest_parent], _return_metadata=False, compact=True)
     return snapshot
