@@ -54,6 +54,7 @@ def qualified_session_fixture(stabilityd):
         (process / 'status').write_text('Uid:\t' + '\t'.join([str(os.getuid())] * 4) + '\n')
         (process / 'cmdline').write_bytes(b'\x00'.join(a.encode() for a in argv) + b'\x00')
         (process / 'cgroup').write_text('0::/system.slice/openclaw-gateway.service\n')
+        (process / 'exe').symlink_to(node)
         (proc / 'net').mkdir()
         (proc / 'net/tcp').write_text('header\n0: 0100007F:4965 00000000:0000 0A 0:0 0:0 0 '
                                     + str(os.getuid()) + ' 0 12345\n')
@@ -185,6 +186,62 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
         def mutate(fixture, calls):
             if calls == 3: fixture.node.write_text('#!/bin/sh\nexit 7\n')
         first, _second, effects = self.invoke(mutation=mutate)
+        self.assertEqual(first['ledgerState'], 'blocked')
+        self.assertEqual(effects, [])
+
+    def test_kernel_executable_other_or_deleted_route_sends_no_reset(self):
+        for deleted in (False, True):
+            def mutate(fixture, calls):
+                if calls == 1:
+                    link = fixture.process / 'exe'
+                    link.unlink()
+                    if deleted:
+                        link.symlink_to(str(fixture.node) + ' (deleted)')
+                    else:
+                        other = fixture.node.parent / 'old-node'
+                        other.write_bytes(fixture.node.read_bytes()); other.chmod(0o700)
+                        link.symlink_to(other)
+            with self.subTest(deleted=deleted):
+                first, _second, effects = self.invoke(mutation=mutate)
+                self.assertEqual(first['ledgerState'], 'blocked')
+                self.assertEqual(effects, [])
+
+    def test_old_kernel_inode_cannot_be_replaced_by_same_bytes_current_disk(self):
+        readlink = os.readlink
+        kernel_link = [None]
+        expected_spelling = [None]
+        def mutate(fixture, calls):
+            if calls == 1:
+                old = fixture.node.parent / 'retained-kernel-image'
+                fixture.node.rename(old)
+                fixture.node.write_bytes(old.read_bytes()); fixture.node.chmod(0o700)
+                link = fixture.process / 'exe'; link.unlink(); link.symlink_to(old)
+                kernel_link[0], expected_spelling[0] = link, str(fixture.node)
+        def kernel_readlink(path, *args, **kwargs):
+            # A normal filesystem symlink follows a name, whereas /proc/exe
+            # follows the kernel's retained file object. Model only its spelling
+            # here; fstat/stat still observe the real old and new owned inodes.
+            if kernel_link[0] is not None and Path(path) == kernel_link[0]:
+                return expected_spelling[0]
+            return readlink(path, *args, **kwargs)
+        with mock.patch('os.readlink', side_effect=kernel_readlink):
+            first, _second, effects = self.invoke(mutation=mutate)
+        self.assertEqual(first['ledgerState'], 'blocked')
+        self.assertEqual(effects, [])
+
+    def test_kernel_image_identity_change_inside_observation_refused(self):
+        original = api._kernel_executable_identity
+        changed = [False]
+        def observe(root, pid, executable):
+            result = original(root, pid, executable)
+            if not changed[0]:
+                changed[0] = True
+                link = root / str(pid) / 'exe'
+                link.unlink(); link.symlink_to(executable)
+            return result
+        with mock.patch.object(api, '_kernel_executable_identity', side_effect=observe):
+            first, _second, effects = self.invoke()
+        self.assertTrue(changed[0])
         self.assertEqual(first['ledgerState'], 'blocked')
         self.assertEqual(effects, [])
 

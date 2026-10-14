@@ -10,6 +10,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import stat
 
 from .adapter_contract import AdapterContract, AdapterDescriptor, sha256_file
 from .content_artifact import ContentArtifactSpec, measure_content_artifact
@@ -64,6 +65,39 @@ SESSION_API_QUALIFICATION = None
 def _code_identity(spec):
     fields = lambda s: (s.st_dev, s.st_ino, s.st_uid, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
     return tuple((str(p), fields(p.lstat())) for p in (spec.root, *(spec.root / f for f in sorted(spec.files))))
+
+def _kernel_executable_identity(proc_root, pid, executable):
+    """Follow only the trusted proc PID/exe image, compare its actual inode.
+
+    The kernel image can outlive the pathname replaced during an upgrade.
+    Matching argv, a current disk hash, or the text of readlink is insufficient.
+    Never apply this symlink-following exception to a caller-supplied file path.
+    """
+    link = proc_root / str(pid) / 'exe'
+    identity = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid,
+                          s.st_nlink, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    before_link = link.lstat()
+    target = os.readlink(link)
+    if (not stat.S_ISLNK(before_link.st_mode) or target.endswith(' (deleted)')
+            or target != str(executable)):
+        raise ValueError('session running executable route unknown')
+    # Intentionally follow this kernel-owned exe link to an image descriptor;
+    # O_NOFOLLOW is still required on ordinary program/source paths elsewhere.
+    fd = os.open(link, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        image = os.fstat(fd)
+        disk = executable.lstat()
+        if (not stat.S_ISREG(image.st_mode) or not stat.S_ISREG(disk.st_mode)
+                or image.st_nlink != 1 or identity(image) != identity(disk)):
+            raise ValueError('session running executable image mismatch')
+        if (identity(os.fstat(fd)) != identity(image)
+                or identity(executable.lstat()) != identity(disk)
+                or identity(link.lstat()) != identity(before_link)
+                or os.readlink(link) != target or identity(link.stat()) != identity(image)):
+            raise ValueError('session running executable image drift')
+        return target, identity(before_link), identity(image)
+    finally:
+        os.close(fd)
 
 def _endpoint_identity(proc_root, pid, port, uid):
     # Closed IPv4-loopback listener subset, tied to this PID's kernel sockets.
@@ -131,6 +165,7 @@ def make_session_api_capability(request, *, qualification, clock_ms, node_reader
                 or process.get('euid') != q.runtime_uid
                 or current.generation != current.node_id + ':' + str(process.get('bootId')).lower()):
             raise ValueError('session Gateway owner unknown')
+        kernel_image = _kernel_executable_identity(q.proc_root, pid, unit.executable)
         with (q.proc_root / str(pid) / 'cmdline').open('rb') as handle:
             command = handle.read(32769)
         if len(command) > 32768 or command != b'\x00'.join(a.encode() for a in argv) + b'\x00':
@@ -163,6 +198,7 @@ def make_session_api_capability(request, *, qualification, clock_ms, node_reader
         after = read_process_identity(pid, q.proc_root)
         if (not identities_match(process, after)[0]
                 or gateway_state_reader() != service
+                or _kernel_executable_identity(q.proc_root, pid, unit.executable) != kernel_image
                 or measure_content_artifact(q.code) != measurement
                 or _endpoint_identity(q.proc_root, pid, q.endpoint_port, q.runtime_uid) != endpoint
                 or _code_identity(q.code) != code_identity
@@ -171,7 +207,7 @@ def make_session_api_capability(request, *, qualification, clock_ms, node_reader
                     unit_roots=q.unit_roots, owner_uid=q.runtime_uid)) != binding_identity(unit)
                 or resolve_unit_executable(q.cli_entry, owner_uid=q.runtime_uid) != (cli, route)):
             raise ValueError('session runtime observation drift')
-        identity = (measurement, code_identity, route, binding_identity(unit), binary, endpoint,
+        identity = (measurement, code_identity, route, binding_identity(unit), binary, endpoint, kernel_image,
                     tuple(after.get(field) for field in IDENTITY_FIELDS), q.provenance_ref, protocol_version)
         launcher = SessionRpcLauncher(unit.executable, cli, unit.executable_sha256,
             unit.executable_route, route, f'ws://127.0.0.1:{q.endpoint_port}')
