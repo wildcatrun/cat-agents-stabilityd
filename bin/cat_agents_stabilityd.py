@@ -7456,6 +7456,7 @@ def governed_reap_expired_lease(
 def reset_session(
     session_key: str, reason: str, conn: sqlite3.Connection, *,
     expected_session_id: Optional[str] = None, expected_store_path: Optional[Path] = None,
+    rpc_launcher: Any = None,
 ) -> Dict[str, Any]:
     session_key_digest = hashlib.sha256(str(session_key).encode("utf-8")).hexdigest()
     last_key = f"session_reset:sha256:{session_key_digest}"
@@ -7467,7 +7468,7 @@ def reset_session(
         return {"result": "target-generation-required"}
     current, status = openclaw_gateway_call(
         "sessions.reset", {"key": session_key, "agentId": agent_id,
-                          "expectedSessionId": expected_session_id},
+                          "expectedSessionId": expected_session_id}, rpc_launcher=rpc_launcher,
     )
     if status != "ok" or not isinstance(current, dict):
         return {"result": "gateway-reset-failed", "errorClass": status}
@@ -7475,15 +7476,20 @@ def reset_session(
     return {"result": "reset", "sessionId": current.get("sessionId")}
 
 
-def openclaw_gateway_call(method: str, params: Dict[str, Any], timeout_seconds: int = 20) -> Tuple[Optional[Dict[str, Any]], str]:
+def openclaw_gateway_call(method: str, params: Dict[str, Any], timeout_seconds: int = 20, *, rpc_launcher: Any = None) -> Tuple[Optional[Dict[str, Any]], str]:
     """Call a Gateway RPC through the installed CLI without persisting response text."""
     if method not in {"sessions.describe", "sessions.reset"}:
         return None, "unsupported-gateway-rpc"
+    from stability_core.session_api_capability import SessionRpcLauncher
+    if rpc_launcher is not None and type(rpc_launcher) is not SessionRpcLauncher:
+        return None, "gateway-rpc-launcher-scope-invalid"
+    command_prefix = list(rpc_launcher.argv) if rpc_launcher is not None else ["openclaw"]
+    endpoint_args = ["--url", rpc_launcher.endpoint_url] if rpc_launcher is not None else []
     try:
         proc = run_cmd([
-            "openclaw", "gateway", "call", method,
+            *command_prefix, "gateway", "call", method,
             "--params", json.dumps(params, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-            "--json",
+            "--json", *endpoint_args,
         ], timeout=timeout_seconds)
     except Exception as exc:
         return None, type(exc).__name__
@@ -7516,7 +7522,7 @@ def openclaw_gateway_call(method: str, params: Dict[str, Any], timeout_seconds: 
     return result, "ok"
 
 
-def current_session_context(session_key: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]:
+def current_session_context(session_key: str, *, rpc_launcher: Any = None) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]:
     agent_id = session_key_agent_id(session_key)
     if not agent_id:
         return None, {}, "session-agent-scope-unparseable"
@@ -7528,7 +7534,8 @@ def current_session_context(session_key: str) -> Tuple[Optional[Dict[str, Any]],
     active_agents = active_openclaw_agent_ids_from_registry(registry)
     if agent_id not in active_agents:
         return None, {}, "session-agent-not-active-openclaw-member"
-    row, rpc_status = openclaw_gateway_call("sessions.describe", {"key": session_key, "agentId": agent_id})
+    row, rpc_status = openclaw_gateway_call("sessions.describe", {"key": session_key, "agentId": agent_id},
+                                            rpc_launcher=rpc_launcher)
     if rpc_status != "ok" or not isinstance(row, dict):
         return None, {}, "gateway-session-read-unavailable"
     if str(row.get("key") or row.get("sessionKey") or session_key) != session_key:
@@ -7588,10 +7595,28 @@ def governed_reset_session(
         metadata={"actor": "cat-agents-stabilityd", "request_source": "stabilityd-daemon"},
     )
 
+    from stability_core import session_api_capability
+    from stability_core.effect_capability import EffectRequest, EffectOperation
+    capability_request = EffectRequest(spec.action_type, EffectOperation.OPENCLAW_RPC,
+                                       spec.target, platform.node(), generation)
+    qualification = session_api_capability.SESSION_API_QUALIFICATION
+    capability = session_api_capability.make_session_api_capability(capability_request,
+        qualification=qualification, clock_ms=now_ms,
+        node_reader=lambda: (platform.node(), current_host_generation()),
+        unit_properties_reader=read_gateway_unit_properties, gateway_state_reader=systemctl_show_gateway)
+    initial_supported, initial_receipt, _initial_cli = capability()
+    if initial_supported:
+        from dataclasses import replace
+        spec = replace(spec, evidence_refs=(*spec.evidence_refs[:-2], initial_receipt.evidence_ref,
+                                           *spec.evidence_refs[-2:]))
+
     def live_boundary() -> Tuple[bool, str]:
         if current_host_generation() != generation:
             return False, "host-generation-changed"
-        current_info, current_activity, status = current_session_context(session_key)
+        supported, _receipt, launcher = capability()
+        if not supported or launcher is None:
+            return False, "session-api-unqualified"
+        current_info, current_activity, status = current_session_context(session_key, rpc_launcher=launcher)
         if (status != "session-reset-eligible" or current_info is None
                 or current_info.get("sessionId") != session_id
                 or current_info.get("agentId") != session_info.get("agentId")):
@@ -7602,20 +7627,27 @@ def governed_reset_session(
         if loaded.get("canResetSession") is not True:
             return ()
         eligible, ref = live_boundary()
-        return (f"evidence://snapshot/{snapshot_generation}", ref) if eligible else ()
+        supported, receipt, _cli = capability()
+        return (f"evidence://snapshot/{snapshot_generation}", ref, receipt.evidence_ref) if eligible and supported else ()
 
     def precheck(_spec: ActionSpec, _record: Any) -> BoundaryCheck:
         eligible, ref = live_boundary()
         if not eligible:
             return BoundaryCheck("rejected", "evidence://openclaw-session-scope/changed")
+        supported, receipt, _cli = capability()
+        if not supported:
+            return BoundaryCheck("rejected", "evidence://openclaw-session-api/unqualified")
         last = int(db_get(conn, last_key, 0) or 0)
         if last and epoch() - last < SESSION_RESET_COOLDOWN_SECONDS:
             return BoundaryCheck("rejected", "evidence://openclaw-session-scope/cooldown")
-        return BoundaryCheck("approved", ref)
+        return BoundaryCheck("approved", receipt.evidence_ref)
 
     operation_meta: Dict[str, Any] = {}
     def operation(_spec: ActionSpec, _record: Any) -> OperationResult:
-        result = reset_session(session_key, reason_code, conn, expected_session_id=session_id)
+        supported, _receipt, launcher = capability()
+        if not supported or launcher is None:
+            return OperationResult("partial", "outcome://openclaw-session-reset/capability-drift")
+        result = reset_session(session_key, reason_code, conn, expected_session_id=session_id, rpc_launcher=launcher)
         operation_meta.update(result=result.get("result"), resetSessionId=result.get("sessionId"))
         outcome_digest = hashlib.sha256(json.dumps(
             {"result": operation_meta["result"],
@@ -7627,7 +7659,10 @@ def governed_reset_session(
 
     def postcheck(_spec: ActionSpec, _record: Any, _operation_result: OperationResult) -> PostcheckResult:
         try:
-            current, _activity, status_code = current_session_context(session_key)
+            supported, _receipt, launcher = capability()
+            if not supported or launcher is None:
+                return PostcheckResult("unknown", "evidence://openclaw-session-postcheck/runtime-drift")
+            current, _activity, status_code = current_session_context(session_key, rpc_launcher=launcher)
             if current is None:
                 return PostcheckResult("unknown", "evidence://openclaw-session-postcheck/session-unavailable")
             # OpenClaw allows sessions.reset in place; compare the Gateway
