@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import stat
 from pathlib import Path
 import sys
 import tempfile
@@ -61,7 +62,25 @@ def qualified_session_fixture(stabilityd):
         qualification = api.SessionApiQualification(ContentArtifactSpec(code, 'fixture-openclaw', '1.2.3', tuple(raw_files)),
             contract, cli, 'openclaw.mjs', 'protocol.mjs', os.getuid(),
             'evidence://session-api-qualification/independent-fixture-v1', 18789, (units,), proc)
+        original_access = os.access
+        def fixture_access(path, mode, *args, **kwargs):
+            # Transport is mocked; these exact synthetic program files are not
+            # executed. QA HOME may be /run on a genuinely noexec mount. Model
+            # executable access only after the real metadata guards pass.
+            if mode == os.X_OK and Path(path) in {node, cli}:
+                try:
+                    info = Path(path).lstat()
+                    noexec = getattr(os, 'ST_NOEXEC', 0)
+                    if (noexec and os.statvfs(path).f_flag & noexec
+                            and stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                            and info.st_uid == os.getuid() and not info.st_mode & 0o022
+                            and info.st_mode & stat.S_IXUSR):
+                        return True
+                except OSError:
+                    pass
+            return original_access(path, mode, *args, **kwargs)
         with mock.patch.object(api, 'SESSION_API_QUALIFICATION', qualification), \
+             mock.patch('os.access', side_effect=fixture_access), \
              mock.patch.object(stabilityd.platform, 'node', return_value='fixture-node'), \
              mock.patch.object(stabilityd, 'read_gateway_unit_properties', return_value=props), \
              mock.patch.object(stabilityd, 'systemctl_show_gateway', return_value={
@@ -166,6 +185,18 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
         def mutate(fixture, calls):
             if calls == 3: fixture.node.write_text('#!/bin/sh\nexit 7\n')
         first, _second, effects = self.invoke(mutation=mutate)
+        self.assertEqual(first['ledgerState'], 'blocked')
+        self.assertEqual(effects, [])
+
+    def test_noexec_fixture_emulation_does_not_override_denied_mode(self):
+        def mutate(fixture, calls):
+            if calls == 3: fixture.node.chmod(0o600)
+        original = os.statvfs
+        def noexec(path):
+            info = original(path)
+            return SimpleNamespace(f_flag=info.f_flag | getattr(os, 'ST_NOEXEC', 8))
+        with mock.patch('os.statvfs', side_effect=noexec):
+            first, _second, effects = self.invoke(mutation=mutate)
         self.assertEqual(first['ledgerState'], 'blocked')
         self.assertEqual(effects, [])
 
