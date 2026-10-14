@@ -114,7 +114,7 @@ class EventPipelineBridgeTests(unittest.TestCase):
              mock.patch.object(m, 'actuate_collected_snapshot', return_value=[]), \
              mock.patch.object(m, 'write_workflow_stability_evidence', side_effect=evidence), \
              mock.patch.object(m, 'write_legacy_watchdog_health', return_value={}), \
-             mock.patch.object(m, 'publish_generation', side_effect=lambda value, *_: value), \
+             mock.patch.object(m, 'publish_generation', side_effect=lambda value, *_, **kwargs: value), \
              mock.patch.object(m, 'log_line'):
             result = m._run_once_body(self.conn, no_action=True)
         self.assertEqual(seen, ['receipt-clear'])

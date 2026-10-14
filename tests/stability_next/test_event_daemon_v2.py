@@ -90,7 +90,7 @@ class EventDaemonV2Tests(unittest.TestCase):
             stack.enter_context(mock.patch.object(m, "write_workflow_stability_evidence", return_value={"written": False}))
             stack.enter_context(mock.patch.object(m, "write_legacy_watchdog_health", return_value={}))
             stack.enter_context(mock.patch.object(m, "log_line"))
-            stack.enter_context(mock.patch.object(m, "publish_generation", side_effect=lambda snapshot, *args: snapshot))
+            stack.enter_context(mock.patch.object(m, "publish_generation", side_effect=lambda snapshot, *args, **kwargs: snapshot))
             result = m.run_once(self.conn, no_action=True)
             actuator.assert_called_once()
             self.assertTrue(actuator.call_args.kwargs["no_action"])
