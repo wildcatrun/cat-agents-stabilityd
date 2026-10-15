@@ -19,6 +19,32 @@ from .process_identity import read_process_identity, identities_match, IDENTITY_
 from .unit_capability import read_unit_binding, binding_identity, resolve_unit_executable
 
 
+# Reviewed launch context contains routing/config paths and proxy settings only.
+# Loader injection and credential values are never inherited from the daemon.
+_RPC_ENV_KEYS = frozenset({
+    'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'XDG_CONFIG_HOME',
+    'OPENCLAW_HOME', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_STATE_DIR',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+    'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
+})
+
+
+def _rpc_environment(items):
+    if (type(items) is not tuple or len(items) > 32
+            or any(type(item) is not tuple or len(item) != 2 for item in items)):
+        raise ValueError('session RPC environment scope refused')
+    values = {}
+    for key, value in items:
+        if (type(key) is not str or key not in _RPC_ENV_KEYS or key in values
+                or type(value) is not str or '\x00' in value or len(value) > 4096):
+            raise ValueError('session RPC environment entry refused')
+        values[key] = value
+    home = Path(values.get('HOME', ''))
+    if not home.is_absolute() or '..' in home.parts:
+        raise ValueError('session RPC environment home unavailable')
+    return values
+
+
 @dataclass(frozen=True)
 class SessionApiQualification:
     code: ContentArtifactSpec
@@ -31,6 +57,7 @@ class SessionApiQualification:
     endpoint_port: int
     unit_roots: tuple | None = None
     proc_root: Path = Path('/proc')
+    rpc_environment: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -41,8 +68,10 @@ class SessionRpcLauncher:
     executable_route: tuple
     cli_route: tuple
     endpoint_url: str
+    environment_items: tuple
 
     def __post_init__(self):
+        _rpc_environment(self.environment_items)
         if (not isinstance(self.executable, Path) or not self.executable.is_absolute()
                 or not isinstance(self.cli_entry, Path) or not self.cli_entry.is_absolute()
                 or re.fullmatch(r'[0-9a-f]{64}', self.executable_sha256) is None
@@ -50,6 +79,10 @@ class SessionRpcLauncher:
                 or type(self.cli_route) is not tuple or not self.cli_route
                 or re.fullmatch(r'ws://127\.0\.0\.1:[0-9]{1,5}', self.endpoint_url) is None):
             raise ValueError('session RPC launcher scope refused')
+
+    @property
+    def environment(self):
+        return _rpc_environment(self.environment_items)
 
     @property
     def argv(self):
@@ -142,6 +175,7 @@ def make_session_api_capability(request, *, qualification, clock_ms, node_reader
             raise ValueError('session qualification scope refused')
         if q.gateway_entry_relative not in q.code.files or q.protocol_relative not in q.code.files:
             raise ValueError('session qualification source closure incomplete')
+        _rpc_environment(q.rpc_environment)
         code_identity = _code_identity(q.code)
         measurement = measure_content_artifact(q.code)
         cli, route = resolve_unit_executable(q.cli_entry, owner_uid=q.runtime_uid)
@@ -208,9 +242,9 @@ def make_session_api_capability(request, *, qualification, clock_ms, node_reader
                 or resolve_unit_executable(q.cli_entry, owner_uid=q.runtime_uid) != (cli, route)):
             raise ValueError('session runtime observation drift')
         identity = (measurement, code_identity, route, binding_identity(unit), binary, endpoint, kernel_image,
-                    tuple(after.get(field) for field in IDENTITY_FIELDS), q.provenance_ref, protocol_version)
+                    tuple(after.get(field) for field in IDENTITY_FIELDS), q.provenance_ref, protocol_version, q.rpc_environment)
         launcher = SessionRpcLauncher(unit.executable, cli, unit.executable_sha256,
-            unit.executable_route, route, f'ws://127.0.0.1:{q.endpoint_port}')
+            unit.executable_route, route, f'ws://127.0.0.1:{q.endpoint_port}', q.rpc_environment)
         if pinned['identity'] is None:
             pinned.update(identity=identity, launcher=launcher)
         elif pinned['identity'] != identity:

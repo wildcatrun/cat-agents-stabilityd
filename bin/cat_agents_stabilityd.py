@@ -879,8 +879,8 @@ def cached_openclaw_auth_probe(
     return result
 
 
-def run_cmd(cmd: List[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+def run_cmd(cmd: List[str], timeout: int = 10, *, env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, env=env)
 
 
 def run_user_cmd(cmd: List[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
@@ -7537,7 +7537,7 @@ def openclaw_gateway_call(method: str, params: Dict[str, Any], timeout_seconds: 
             *command_prefix, "gateway", "call", method,
             "--params", json.dumps(params, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
             "--json", *endpoint_args,
-        ], timeout=timeout_seconds)
+        ], timeout=timeout_seconds, **({"env": rpc_launcher.environment} if rpc_launcher is not None else {}))
     except Exception as exc:
         return None, type(exc).__name__
     if proc.returncode != 0:

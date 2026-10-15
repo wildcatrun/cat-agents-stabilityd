@@ -62,7 +62,8 @@ def qualified_session_fixture(stabilityd):
         (process / 'fd/7').symlink_to('socket:[12345]')
         qualification = api.SessionApiQualification(ContentArtifactSpec(code, 'fixture-openclaw', '1.2.3', tuple(raw_files)),
             contract, cli, 'openclaw.mjs', 'protocol.mjs', os.getuid(),
-            'evidence://session-api-qualification/independent-fixture-v1', 18789, (units,), proc)
+            'evidence://session-api-qualification/independent-fixture-v1', 18789, (units,), proc,
+            rpc_environment=(('HOME', str(root)),))
         original_access = os.access
         def fixture_access(path, mode, *args, **kwargs):
             # Transport is mocked; these exact synthetic program files are not
@@ -114,6 +115,12 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
             def command(argv, **kw):
                 method_index = 3 if argv[0] == 'openclaw' else 4
                 rpc.append(argv[method_index])
+                if method_index == 4:
+                    self.assertEqual(kw.get('env'), dict(fixture.qualification.rpc_environment))
+                    self.assertNotIn('NODE_OPTIONS', kw['env'])
+                    self.assertNotIn('LD_PRELOAD', kw['env'])
+                else:
+                    self.assertNotIn('env', kw)
                 if argv[method_index] == 'sessions.describe':
                     if method_index == 4:
                         self.assertEqual(argv[:2], [str(fixture.node), str(fixture.cli)])
@@ -144,6 +151,35 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
                 second = daemon.governed_reset_session(conn, self.key, 'repeated_failures',
                     dict(canResetSession=True, updatedAtEpoch=999, validUntilEpoch=1060), 'snapshot', self.session)
             return first, second, effects
+
+    def test_rpc_environment_is_closed_and_not_ambient_or_mutable(self):
+        approved = (('HOME', '/fixture/home'), ('HTTPS_PROXY', 'http://127.0.0.1:7890'))
+        with mock.patch.dict(os.environ, {'NODE_OPTIONS': '--require=/unapproved/preload.js',
+                                         'LD_PRELOAD': '/unapproved/preload.so'}):
+            launcher = api.SessionRpcLauncher(Path('/node'), Path('/cli'), '0' * 64,
+                ('node-route',), ('cli-route',), 'ws://127.0.0.1:18789', approved)
+            self.assertEqual(launcher.environment, dict(approved))
+            changed = launcher.environment
+            changed['NODE_OPTIONS'] = '--require=/foreign'
+            self.assertEqual(launcher.environment, dict(approved))
+        for items in ((('HOME', '/fixture'), ('NODE_OPTIONS', '--require=/foreign')),
+                      (('HOME', '/fixture'), ('LD_PRELOAD', '/foreign')),
+                      (('HOME', '/fixture'), ('OPENCLAW_GATEWAY_TOKEN', 'synthetic')),
+                      (('HOME', '/fixture'), ('HOME', '/other')), (),
+                      (('HOME', 'relative'),), (('HOME', '/fixture'), ('NO_PROXY', 'x\x00y'))):
+            with self.subTest(keys=[i[0] for i in items]), self.assertRaises(ValueError):
+                api.SessionRpcLauncher(Path('/node'), Path('/cli'), '0' * 64,
+                    ('node-route',), ('cli-route',), 'ws://127.0.0.1:18789', items)
+
+    def test_qualified_rpc_passes_only_fixed_environment_to_process(self):
+        launcher = api.SessionRpcLauncher(Path('/node'), Path('/cli'), '0' * 64,
+            ('node-route',), ('cli-route',), 'ws://127.0.0.1:18789', (('HOME', '/fixture/home'),))
+        reply = SimpleNamespace(returncode=0, stdout='{"sessionId":"fixture"}', stderr='')
+        with mock.patch.dict(os.environ, {'NODE_OPTIONS': '--require=/foreign', 'LD_PRELOAD': '/foreign'}), \
+             mock.patch.object(daemon.subprocess, 'run', return_value=reply) as run:
+            self.assertEqual(daemon.openclaw_gateway_call('sessions.describe', {}, rpc_launcher=launcher)[1], 'ok')
+        self.assertEqual(run.call_args.kwargs['env'], {'HOME': '/fixture/home'})
+        self.assertEqual(run.call_args.args[0][:2], ['/node', '/cli'])
 
     def test_actual_qualified_fixture_resets_exactly_once_and_pins_cli(self):
         first, second, effects = self.invoke()
