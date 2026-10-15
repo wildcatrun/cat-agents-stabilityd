@@ -56,7 +56,9 @@ class ProcessCrashTests(unittest.TestCase):
             original_bytes = effect.read_bytes()
             spec = ActionSpec('crash-effect', 'fixture-repair', 'fixture/node', 'g1', 'stabilityd',
                               {'fixture': True}, 'auth://fixture', 'policy://fixture', ('evidence://fixture',))
+            callback_hits = []
             def forbidden(*_):
+                callback_hits.append(True)
                 self.fail('unreconciled executing action must not invoke callbacks')
             # Two distinct process-independent reopenings exercise recovery and
             # repeated recovery without authorizing a second effect.
@@ -73,6 +75,7 @@ class ProcessCrashTests(unittest.TestCase):
                     versions.append(result.record.version)
                     self.assertEqual(effect.read_bytes(), original_bytes)
             self.assertEqual(versions[0], versions[1])
+            self.assertEqual(callback_hits, [])
 
 
 if __name__ == '__main__':
