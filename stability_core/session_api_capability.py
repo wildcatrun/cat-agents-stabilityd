@@ -7,6 +7,9 @@ blocks only session reset. Schema-only tests are not a qualification.
 from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
+import json
+import subprocess
+import tempfile
 import os
 from pathlib import Path
 import re
@@ -46,6 +49,86 @@ def _rpc_environment(items):
 
 
 @dataclass(frozen=True)
+class SessionSdkQualification:
+    entry_relative: str
+    wrapper_entry: Path
+    wrapper_sha256: str
+    server_version: str
+    server_build_id: str
+    semantics: str = 'v1'
+
+
+def _wrapper_identity(path, owner_uid, expected):
+    if not isinstance(path, Path) or not path.is_absolute() or '..' in path.parts:
+        raise ValueError('session SDK wrapper route refused')
+    parents=[]
+    for parent in path.parents:
+        info=parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0,owner_uid} or info.st_mode & 0o022:
+            raise ValueError('session SDK wrapper parent refused')
+        parents.append((parent,(info.st_dev,info.st_ino,info.st_uid,info.st_mode)))
+    identity=lambda i:(i.st_dev,i.st_ino,i.st_uid,i.st_mode,i.st_nlink,i.st_size,i.st_mtime_ns,i.st_ctime_ns)
+    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        before=os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_uid not in {0,owner_uid} or before.st_nlink!=1 or before.st_mode & 0o022 or before.st_size>2097152:
+            raise ValueError('session SDK wrapper ownership refused')
+        raw=os.read(fd,2097153)
+        if (hashlib.sha256(raw).hexdigest()!=expected or identity(os.fstat(fd))!=identity(before)
+                or identity(path.lstat())!=identity(before)
+                or any((p.lstat().st_dev,p.lstat().st_ino,p.lstat().st_uid,p.lstat().st_mode)!=i for p,i in parents)):
+            raise ValueError('session SDK wrapper drift')
+        return identity(before),tuple(parents)
+    finally: os.close(fd)
+
+
+def validate_sdk_response(text, *, version, build_id, boot_id=None, probe=False):
+    if type(text) is not str or len(text.encode())>65536:
+        raise ValueError('session SDK output budget')
+    def unique(pairs):
+        result={}
+        for key,value in pairs:
+            if key in result: raise ValueError('session SDK duplicate response field')
+            result[key]=value
+        return result
+    value=json.loads(text,object_pairs_hook=unique)
+    if type(value) is not dict or set(value)!={'ok','hello','result'} or value['ok'] is not True:
+        raise ValueError('session SDK response refused')
+    hello=value['hello']
+    if (type(hello) is not dict or set(hello)!={'protocol','version','buildId','bootId','methods'}
+            or type(hello['protocol']) is not int or hello['protocol']!=4
+            or hello['version']!=version or hello['buildId']!=build_id
+            or type(hello['bootId']) is not str or not hello['bootId'] or len(hello['bootId'])>256
+            or re.search(r'[\x00-\x1f\x7f]',hello['bootId']) is not None
+            or (boot_id is not None and hello['bootId']!=boot_id)
+            or type(hello['methods']) is not list or len(hello['methods'])>2
+            or any(type(m) is not str or m not in {'sessions.describe','sessions.reset'} for m in hello['methods'])
+            or len(set(hello['methods']))!=len(hello['methods'])
+            or (value['result'] is not None if probe else type(value['result']) is not dict)):
+        raise ValueError('session SDK hello binding refused')
+    return hello,value['result']
+
+
+def run_sdk_process(argv, *, environment, cwd, timeout):
+    # Spool child output to private files: output cannot allocate unbounded RAM.
+    # Decode only the fixed response budget, never include child diagnostics in
+    # exceptions/evidence. Timeout also bounds a non-responsive SDK process.
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        proc=subprocess.run(list(argv),env=environment,cwd=str(cwd),timeout=timeout,
+                            stdout=output,stderr=errors)
+        if proc.returncode!=0: raise ValueError('session SDK process unavailable')
+        if os.fstat(output.fileno()).st_size>65536 or os.fstat(errors.fileno()).st_size>65536:
+            raise ValueError('session SDK output budget')
+        output.seek(0)
+        return output.read(65537).decode('utf-8')
+
+
+def _run_sdk_probe(argv, *, environment, cwd):
+    # Sole external SDK probe boundary; file/unit/process windows surround it.
+    return run_sdk_process(argv,environment=environment,cwd=cwd,timeout=10)
+
+
+@dataclass(frozen=True)
 class SessionApiQualification:
     code: ContentArtifactSpec
     contract: AdapterContract
@@ -58,6 +141,7 @@ class SessionApiQualification:
     unit_roots: tuple | None = None
     proc_root: Path = Path('/proc')
     rpc_environment: tuple = ()
+    sdk: SessionSdkQualification | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +153,12 @@ class SessionRpcLauncher:
     cli_route: tuple
     endpoint_url: str
     environment_items: tuple
+    sdk_entry: Path | None = None
+    sources: tuple = ()
+    server_version: str = ''
+    server_build_id: str = ''
+    server_boot_id: str = ''
+    cwd: Path | None = None
 
     def __post_init__(self):
         _rpc_environment(self.environment_items)
@@ -79,6 +169,16 @@ class SessionRpcLauncher:
                 or type(self.cli_route) is not tuple or not self.cli_route
                 or re.fullmatch(r'ws://127\.0\.0\.1:[0-9]{1,5}', self.endpoint_url) is None):
             raise ValueError('session RPC launcher scope refused')
+        if (not isinstance(self.sdk_entry, Path) or not self.sdk_entry.is_absolute()
+                or len(str(self.sdk_entry))>512 or re.search(r'[\x00-\x1f\x7f]',str(self.sdk_entry)) is not None
+                or not isinstance(self.cwd, Path) or not self.cwd.is_absolute()
+                or type(self.sources) is not tuple or not 1<=len(self.sources)<=64
+                or any(type(row) is not tuple or len(row)!=2 or type(row[0]) is not str
+                       or not Path(row[0]).is_absolute() or '..' in Path(row[0]).parts or len(row[0])>512
+                       or re.search(r'[\x00-\x1f\x7f]',row[0]) is not None
+                       or type(row[1]) is not str or re.fullmatch(r'[0-9a-f]{64}',row[1]) is None for row in self.sources)
+                or not all(type(v) is str and v and len(v)<=256 and re.search(r'[\x00-\x1f\x7f]',v) is None for v in (self.server_version,self.server_build_id,self.server_boot_id))):
+            raise ValueError('session SDK launcher binding unavailable')
 
     @property
     def environment(self):
@@ -86,8 +186,17 @@ class SessionRpcLauncher:
 
     @property
     def argv(self):
-        # Never execute the JS shebang: /usr/bin/env would consult PATH for node.
         return (str(self.executable), str(self.cli_entry))
+
+    def command(self, method, params):
+        required={'sessions.describe':{'key','agentId'},'sessions.reset':{'key','agentId','expectedSessionId'}}
+        if (method not in required or type(params) is not dict or set(params)!=required[method]
+                or any(type(v) is not str or not v or len(v)>512 or re.search(r'[\x00-\x1f\x7f]',v) is not None for v in params.values())):
+            raise ValueError('session SDK call scope refused')
+        return (*self.argv,json.dumps(dict(schema=1,mode='call',sdkEntry=str(self.sdk_entry),
+            sources=[dict(path=p,sha256=d) for p,d in self.sources],endpoint=self.endpoint_url,
+            server=dict(version=self.server_version,buildId=self.server_build_id,bootId=self.server_boot_id),
+            method=method,params=params),sort_keys=True,separators=(',',':')))
 
 
 # No installed artifact or wire protocol has completed the independent gate.
@@ -173,7 +282,13 @@ def make_session_api_capability(request, *, qualification, clock_ms, node_reader
                 or not q.proc_root.is_absolute() or type(q.endpoint_port) is not int
                 or not 1 <= q.endpoint_port <= 65535):
             raise ValueError('session qualification scope refused')
-        if q.gateway_entry_relative not in q.code.files or q.protocol_relative not in q.code.files:
+        if (type(q.sdk) is not SessionSdkQualification or q.sdk.semantics!='v1'
+                or q.sdk.entry_relative not in q.code.files
+                or not all(type(v) is str and 0<len(v)<=256 and re.search(r'[\x00-\x1f\x7f]',v) is None for v in (q.sdk.server_version,q.sdk.server_build_id))
+                or len(q.code.files)>64
+                or re.fullmatch(r'[0-9a-f]{64}',q.sdk.wrapper_sha256) is None):
+            raise ValueError('session SDK source qualification unavailable')
+        if q.gateway_entry_relative not in q.code.files:
             raise ValueError('session qualification source closure incomplete')
         _rpc_environment(q.rpc_environment)
         code_identity = _code_identity(q.code)
@@ -207,27 +322,16 @@ def make_session_api_capability(request, *, qualification, clock_ms, node_reader
         if hashlib.sha256(command).hexdigest() != process.get('cmdlineDigest'):
             raise ValueError('session Gateway command drift')
         endpoint = _endpoint_identity(q.proc_root, pid, q.endpoint_port, q.runtime_uid)
-        # Closed source declaration subset. This is an observed wire-protocol
-        # integer, mapped into the adapter's semver convention, not guessed from
-        # package version or session payload schema. Other source shapes refuse.
-        protocol_path = q.code.root / q.protocol_relative
-        fd = os.open(protocol_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        try:
-            before = os.fstat(fd)
-            with os.fdopen(fd, 'rb', closefd=False) as handle:
-                protocol_source = handle.read(65537)
-            if (before != os.fstat(fd) or before != protocol_path.lstat()
-                    or hashlib.sha256(protocol_source).hexdigest() !=
-                       next(digest for relative, digest, _size in measurement.records if relative == q.protocol_relative)):
-                raise ValueError('session protocol file drift')
-        finally:
-            os.close(fd)
-        if len(protocol_source) > 65536:
-            raise ValueError('session protocol source budget')
-        protocol = re.fullmatch(rb'\s*export const PROTOCOL_VERSION = ([1-9][0-9]{0,3});\s*', protocol_source)
-        if protocol is None:
-            raise ValueError('session wire protocol unqualified')
-        protocol_version = protocol[1].decode() + '.0.0'
+        wrapper_identity=_wrapper_identity(q.sdk.wrapper_entry,q.runtime_uid,q.sdk.wrapper_sha256)
+        sources=tuple((str(q.code.root/relative),digest) for relative,digest,_size in measurement.records)
+        probe_payload=dict(schema=1,mode='probe',sdkEntry=str(q.code.root/q.sdk.entry_relative),
+            sources=[dict(path=p,sha256=d) for p,d in sources],endpoint=f'ws://127.0.0.1:{q.endpoint_port}',
+            server=dict(version=q.sdk.server_version,buildId=q.sdk.server_build_id,bootId=None),method='health',params={})
+        response=_run_sdk_probe((str(unit.executable),str(q.sdk.wrapper_entry),json.dumps(probe_payload,sort_keys=True,separators=(',',':'))),
+            environment=_rpc_environment(q.rpc_environment),cwd=q.code.root)
+        hello,_=validate_sdk_response(response,version=q.sdk.server_version,build_id=q.sdk.server_build_id,probe=True)
+        protocol_version='4.0.0'
+        capabilities=tuple(c for c in q.contract.supported_capabilities if c in hello['methods'])
         binary = sha256_file(str(cli))
         after = read_process_identity(pid, q.proc_root)
         if (not identities_match(process, after)[0]
@@ -235,6 +339,7 @@ def make_session_api_capability(request, *, qualification, clock_ms, node_reader
                 or _kernel_executable_identity(q.proc_root, pid, unit.executable) != kernel_image
                 or measure_content_artifact(q.code) != measurement
                 or _endpoint_identity(q.proc_root, pid, q.endpoint_port, q.runtime_uid) != endpoint
+                or _wrapper_identity(q.sdk.wrapper_entry,q.runtime_uid,q.sdk.wrapper_sha256)!=wrapper_identity
                 or _code_identity(q.code) != code_identity
                 or binding_identity(read_unit_binding(current, unit='openclaw-gateway.service',
                     read_properties=unit_properties_reader, clock_ms=clock_ms,
@@ -242,16 +347,17 @@ def make_session_api_capability(request, *, qualification, clock_ms, node_reader
                 or resolve_unit_executable(q.cli_entry, owner_uid=q.runtime_uid) != (cli, route)):
             raise ValueError('session runtime observation drift')
         identity = (measurement, code_identity, route, binding_identity(unit), binary, endpoint, kernel_image,
-                    tuple(after.get(field) for field in IDENTITY_FIELDS), q.provenance_ref, protocol_version, q.rpc_environment)
-        launcher = SessionRpcLauncher(unit.executable, cli, unit.executable_sha256,
-            unit.executable_route, route, f'ws://127.0.0.1:{q.endpoint_port}', q.rpc_environment)
+                    tuple(after.get(field) for field in IDENTITY_FIELDS), q.provenance_ref, protocol_version, q.rpc_environment, wrapper_identity, hello['bootId'],tuple(sorted(hello['methods'])))
+        launcher = SessionRpcLauncher(unit.executable, q.sdk.wrapper_entry, unit.executable_sha256,
+            unit.executable_route, wrapper_identity, f'ws://127.0.0.1:{q.endpoint_port}', q.rpc_environment,
+            q.code.root/q.sdk.entry_relative,sources,q.sdk.server_version,q.sdk.server_build_id,hello['bootId'],q.code.root)
         if pinned['identity'] is None:
             pinned.update(identity=identity, launcher=launcher)
         elif pinned['identity'] != identity:
             raise ValueError('session runtime binding drift')
         return AdapterDescriptor('openclaw', q.contract.adapter_id, q.code.package_version,
             protocol_version, '', current.node_id, current.generation, clock_ms(),
-            q.contract.supported_capabilities, 'runtime-owned', str(cli), str(cli), binary, binary,
+            capabilities, 'runtime-owned', str(cli), str(cli), binary, binary,
             artifact_kind='content-manifest', artifact_digest=measurement.digest)
 
     provider = EffectCapabilityProvider(clock_ms=clock_ms, node_reader=node_reader,

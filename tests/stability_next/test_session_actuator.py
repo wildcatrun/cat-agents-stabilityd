@@ -18,31 +18,27 @@ SPEC.loader.exec_module(stabilityd)
 
 class SessionActuatorTests(unittest.TestCase):
     def test_handler_entry_receipt_completes_actual_governed_reset_and_persists_only_digests(self):
-        from test_effect_capability_session_integration import qualified_session_fixture
+        from test_effect_capability_session_integration import qualified_session_fixture, sdk_reply, api
         key, session_id = 'agent:cat_voice:fixture:private-channel', 'private-stable-session-id'
         effects = []
         registry = self._registry()
         registry['records'][0].update(agent_id='cat_voice', endpoint_ref='openclaw-agent:cat_voice')
         def command(argv, **kwargs):
-            index = 3 if argv[0] == 'openclaw' else 4
-            if index == 4:
-                self.assertEqual(argv[:2], [str(fixture.node), str(fixture.cli)])
-            self.assertEqual(argv[index - 2:index], ['gateway', 'call'])
-            if argv[index] == 'sessions.reset':
-                self.assertEqual(argv[:2], [str(fixture.node), str(fixture.cli)])
-                self.assertEqual(argv[-2:], ['--expect-url', 'ws://127.0.0.1:18789'])
-            params = json.loads(argv[argv.index('--params') + 1])
-            self.assertEqual(params['key'], key)
-            if argv[index] == 'sessions.describe':
-                response = {'session': {'key': key, 'agentId': 'cat_voice', 'sessionId': session_id, 'hasActiveRun': False}}
-            elif argv[index] == 'sessions.reset':
-                self.assertEqual(params['expectedSessionId'], session_id)
-                effects.append(params)
-                response = {'ok': True, 'key': key, 'entry': {'sessionId': session_id,
-                            'private': 'SYNTHETIC_PRIVATE_ENTRY'}, 'resolved': {}}
+            qualified=argv[0]!='openclaw'
+            if qualified:
+                self.assertEqual(argv[:2],[str(fixture.node),str(fixture.wrapper)])
+                payload=json.loads(argv[2]);params=payload['params'];method=payload['method']
+                self.assertEqual(kwargs['cwd'],str(fixture.code))
             else:
-                self.fail('unexpected runtime method')
-            return SimpleNamespace(returncode=0, stdout=json.dumps(response), stderr='')
+                method=argv[3];params=json.loads(argv[argv.index('--params')+1])
+            self.assertEqual(params['key'],key)
+            if method=='sessions.describe':
+                response={'session':{'key':key,'agentId':'cat_voice','sessionId':session_id,'hasActiveRun':False}}
+            elif method=='sessions.reset':
+                self.assertEqual(params['expectedSessionId'],session_id);effects.append(params)
+                response={'ok':True,'key':key,'entry':{'sessionId':session_id,'private':'SYNTHETIC_PRIVATE_ENTRY'},'resolved':{}}
+            else: self.fail('unexpected runtime method')
+            return SimpleNamespace(returncode=0,stdout=sdk_reply(response) if qualified else json.dumps(response),stderr='')
         with qualified_session_fixture(stabilityd) as fixture, tempfile.TemporaryDirectory() as directory, stabilityd.init_memory_kv_db() as conn:
             path = Path(directory) / 'ledger.db'
             policy = dict(canResetSession=True, updatedAtEpoch=999, validUntilEpoch=1060)
@@ -52,7 +48,8 @@ class SessionActuatorTests(unittest.TestCase):
                  mock.patch.object(stabilityd, 'current_host_generation', return_value='fixture-node:boot'), \
                  mock.patch.object(stabilityd, 'workflow_runtime_registry_records', return_value=registry), \
                  mock.patch.object(stabilityd, 'analyze_session_activity', return_value={'active': False, 'heavy': False}), \
-                 mock.patch.object(stabilityd, 'run_cmd', side_effect=command):
+                 mock.patch.object(stabilityd, 'run_cmd', side_effect=command), \
+                 mock.patch.object(api, 'run_sdk_process', side_effect=lambda argv,environment,cwd,timeout: command(list(argv),env=environment,cwd=str(cwd)).stdout):
                 first = stabilityd.governed_reset_session(conn, key, 'repeated_failures', policy, 'fixture-generation', session_id)
                 second = stabilityd.governed_reset_session(conn, key, 'repeated_failures', policy, 'fixture-generation', session_id)
             self.assertEqual(first['ledgerState'], 'succeeded')
@@ -157,7 +154,9 @@ class SessionActuatorTests(unittest.TestCase):
             self.assertEqual(result["ledgerState"], "succeeded")
             self.assertEqual(result["result"], "ok")
             self.assertEqual(result["resetSessionIdDigest"], stabilityd.hashlib.sha256(new_session_id.encode()).hexdigest())
-            self.assertEqual(duplicate["result"], "ok")
+            self.assertEqual(duplicate["result"], "existing")
+            self.assertTrue(duplicate["historicalExisting"])
+            self.assertFalse(duplicate["authorizationReused"])
             self.assertEqual(duplicate["ledgerDisposition"], "existing")
             self.assertEqual(gateway_call.call_count, 8)
             self.assertEqual(gateway_call.call_args_list[5].args[0], "sessions.reset")

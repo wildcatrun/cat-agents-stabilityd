@@ -7548,24 +7548,30 @@ def openclaw_gateway_call(method: str, params: Dict[str, Any], timeout_seconds: 
     from stability_core.session_api_capability import SessionRpcLauncher
     if rpc_launcher is not None and type(rpc_launcher) is not SessionRpcLauncher:
         return None, "gateway-rpc-launcher-scope-invalid"
-    command_prefix = list(rpc_launcher.argv) if rpc_launcher is not None else ["openclaw"]
-    endpoint_args = ["--expect-url", rpc_launcher.endpoint_url] if rpc_launcher is not None else []
     try:
-        proc = run_cmd([
-            *command_prefix, "gateway", "call", method,
-            "--params", json.dumps(params, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-            "--json", *endpoint_args,
-        ], timeout=timeout_seconds, **({"env": rpc_launcher.environment} if rpc_launcher is not None else {}))
-    except Exception as exc:
-        return None, type(exc).__name__
-    if proc.returncode != 0:
-        return None, "gateway-rpc-nonzero-exit"
-    payload, _diagnostics, parse_error = extract_json_payload(proc.stdout or "")
-    if parse_error or not isinstance(payload, dict):
+        if rpc_launcher is not None:
+            from stability_core.session_api_capability import validate_sdk_response, run_sdk_process
+            response = run_sdk_process(rpc_launcher.command(method, params),
+                timeout=timeout_seconds, environment=rpc_launcher.environment, cwd=rpc_launcher.cwd)
+            _hello, result = validate_sdk_response(response,
+                version=rpc_launcher.server_version, build_id=rpc_launcher.server_build_id,
+                boot_id=rpc_launcher.server_boot_id)
+            if method not in _hello['methods']:
+                return None, "gateway-rpc-method-unavailable"
+        else:
+            proc = run_cmd(["openclaw", "gateway", "call", method,
+                "--params", json.dumps(params, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                "--json"], timeout=timeout_seconds)
+            if proc.returncode != 0:
+                return None, "gateway-rpc-nonzero-exit"
+            payload, _diagnostics, parse_error = extract_json_payload(proc.stdout or "")
+            if parse_error or not isinstance(payload, dict):
+                return None, "gateway-rpc-invalid-response"
+            if payload.get("ok") is False or payload.get("error"):
+                return None, "gateway-rpc-rejected"
+            result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    except Exception:
         return None, "gateway-rpc-invalid-response"
-    if payload.get("ok") is False or payload.get("error"):
-        return None, "gateway-rpc-rejected"
-    result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
     if method == "sessions.reset":
         if "key" in result and result["key"] != params.get("key"):
             return None, "gateway-reset-target-mismatch"

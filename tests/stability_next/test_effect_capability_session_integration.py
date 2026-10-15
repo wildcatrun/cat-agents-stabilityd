@@ -18,8 +18,20 @@ from stability_core.adapter_contract import AdapterContract
 from stability_core.content_artifact import ContentArtifactSpec
 
 ENTRY = b'#!/usr/bin/env node\n// reviewed synthetic session API fixture\n'
-PROTOCOL = b'export const PROTOCOL_VERSION = 1;\n'
+SDK = b'// independently bounded SDK entry fixture; execution mocked only at external SDK boundary\n'
 PACKAGE = b'{"name":"fixture-openclaw","version":"1.2.3"}\n'
+
+
+def sdk_reply(result, **hello_changes):
+    hello=dict(protocol=4,version='fixture-v1',buildId='fixture-build',bootId='server-boot',methods=['sessions.describe','sessions.reset'])
+    hello.update(hello_changes)
+    return json.dumps(dict(ok=True,hello=hello,result=result))
+
+
+def launcher_fixture(environment):
+    return api.SessionRpcLauncher(Path('/node'),Path('/wrapper'), '0'*64,
+        ('node-route',),('wrapper-route',),'ws://127.0.0.1:18789',environment,
+        Path('/sdk.mjs'),(('/sdk.mjs','0'*64),),'fixture-v1','fixture-build','server-boot',Path('/fixture'))
 
 
 @contextlib.contextmanager
@@ -28,7 +40,7 @@ def qualified_session_fixture(stabilityd):
     with tempfile.TemporaryDirectory(dir=Path.home()) as temp:
         root = Path(temp)
         code = root / 'code'; code.mkdir()
-        raw_files = {'package.json': PACKAGE, 'openclaw.mjs': ENTRY, 'protocol.mjs': PROTOCOL}
+        raw_files = {'package.json': PACKAGE, 'openclaw.mjs': ENTRY, 'sdk.mjs': SDK}
         for name, raw in raw_files.items():
             (code / name).write_bytes(raw); (code / name).chmod(0o700 if name == 'openclaw.mjs' else 0o600)
         # Expected artifact identity derives from the reviewed fixture bytes,
@@ -37,7 +49,7 @@ def qualified_session_fixture(stabilityd):
         digest = hashlib.sha256(json.dumps(dict(schemaVersion=1, packageName='fixture-openclaw',
             packageVersion='1.2.3', files=records), sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
         binary = hashlib.sha256(ENTRY).hexdigest()
-        contract = AdapterContract('fixture-session-api', 1, '1.0.0', '1.0.0', '1.2.3', '1.2.3',
+        contract = AdapterContract('fixture-session-api', 4, '4.0.0', '4.0.0', '1.2.3', '1.2.3',
             ('openclaw',), ('sessions.reset',), ('sessions.reset',), (), ((digest, binary),))
         units = root / 'units'; units.mkdir()
         node = root / 'node'; node.write_text('#!/bin/sh\nexit 0\n'); node.chmod(0o700)
@@ -60,10 +72,12 @@ def qualified_session_fixture(stabilityd):
                                     + str(os.getuid()) + ' 0 12345\n')
         (process / 'fd').mkdir()
         (process / 'fd/7').symlink_to('socket:[12345]')
+        wrapper=root/'session_sdk_bridge.mjs';wrapper.write_bytes(b'// owned SDK bridge fixture; external invocation mocked\n')
         qualification = api.SessionApiQualification(ContentArtifactSpec(code, 'fixture-openclaw', '1.2.3', tuple(raw_files)),
-            contract, cli, 'openclaw.mjs', 'protocol.mjs', os.getuid(),
+            contract, cli, 'openclaw.mjs', 'sdk.mjs', os.getuid(),
             'evidence://session-api-qualification/independent-fixture-v1', 18789, (units,), proc,
-            rpc_environment=(('HOME', str(root)),))
+            rpc_environment=(('HOME', str(root)),),
+            sdk=api.SessionSdkQualification('sdk.mjs',wrapper,hashlib.sha256(wrapper.read_bytes()).hexdigest(),'fixture-v1','fixture-build'))
         original_access = os.access
         def fixture_access(path, mode, *args, **kwargs):
             # Transport is mocked; these exact synthetic program files are not
@@ -81,13 +95,14 @@ def qualified_session_fixture(stabilityd):
                 except OSError:
                     pass
             return original_access(path, mode, *args, **kwargs)
-        with mock.patch.object(api, 'SESSION_API_QUALIFICATION', qualification), \
+        with mock.patch.object(api, '_run_sdk_probe', return_value=sdk_reply(None)) as probe, \
+             mock.patch.object(api, 'SESSION_API_QUALIFICATION', qualification), \
              mock.patch('os.access', side_effect=fixture_access), \
              mock.patch.object(stabilityd.platform, 'node', return_value='fixture-node'), \
              mock.patch.object(stabilityd, 'read_gateway_unit_properties', return_value=props), \
              mock.patch.object(stabilityd, 'systemctl_show_gateway', return_value={
                  'ActiveState': 'active', 'SubState': 'running', 'MainPID': 42}):
-            yield SimpleNamespace(qualification=qualification, code=code, process=process, cli=cli, unit=unit, node=node)
+            yield SimpleNamespace(qualification=qualification, code=code, process=process, cli=cli, unit=unit, node=node, wrapper=wrapper, probe=probe)
 
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / 'bin/cat_agents_stabilityd.py'
@@ -98,7 +113,7 @@ daemon = importlib.util.module_from_spec(SPEC); sys.modules[SPEC.name] = daemon;
 class SessionCapabilityIntegrationTests(unittest.TestCase):
     key, session = 'agent:cat_voice:fixture:PRIVATE_TARGET', 'PRIVATE_SESSION'
 
-    def invoke(self, *, mutation=None, nonzero=False, qualification=True, final_mutation=None):
+    def invoke(self, *, mutation=None, nonzero=False, qualification=True, final_mutation=None, sdk_mutation=None):
         effects, rpc = [], []
         row = dict(key=self.key, agentId='cat_voice', sessionId=self.session, hasActiveRun=False)
         registry = dict(source='db', writeEligible=True, records=[dict(agent_id='cat_voice', runtime='openclaw',
@@ -106,6 +121,7 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
                        status='active', can_receive_dispatch=1)])
         with qualified_session_fixture(daemon) as fixture, tempfile.TemporaryDirectory() as directory, \
              daemon.init_memory_kv_db() as conn:
+            if sdk_mutation is not None: sdk_mutation(fixture)
             from stability_core.action_ledger import ActionLedger
             refresh = ActionLedger.refresh_execution_precheck
             def persisted(ledger, *args, **kw):
@@ -113,26 +129,30 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
                 if final_mutation is not None: final_mutation(fixture)
                 return result
             def command(argv, **kw):
-                method_index = 3 if argv[0] == 'openclaw' else 4
-                rpc.append(argv[method_index])
-                if method_index == 4:
-                    self.assertEqual(kw.get('env'), dict(fixture.qualification.rpc_environment))
-                    self.assertNotIn('NODE_OPTIONS', kw['env'])
-                    self.assertNotIn('LD_PRELOAD', kw['env'])
+                qualified = argv[0] != 'openclaw'
+                if qualified:
+                    payload=json.loads(argv[2]);method=payload['method']
+                    self.assertEqual(argv[:2],[str(fixture.node),str(fixture.wrapper)])
+                    self.assertEqual(kw.get('cwd'),str(fixture.code))
+                    self.assertEqual(kw.get('env'),dict(fixture.qualification.rpc_environment))
+                    self.assertEqual(payload['server']['bootId'],'server-boot')
+                    self.assertEqual(payload['sdkEntry'],str(fixture.code/'sdk.mjs'))
                 else:
-                    self.assertNotIn('env', kw)
-                if argv[method_index] == 'sessions.describe':
-                    if method_index == 4:
-                        self.assertEqual(argv[:2], [str(fixture.node), str(fixture.cli)])
-                        self.assertEqual(argv[-2:], ['--expect-url', 'ws://127.0.0.1:18789'])
-                    if mutation is not None: mutation(fixture, len(rpc))
-                    return SimpleNamespace(returncode=0, stdout=json.dumps({'session': row}), stderr='')
-                self.assertEqual(argv[:2], [str(fixture.node), str(fixture.cli)])
-                self.assertEqual(argv[-2:], ['--expect-url', 'ws://127.0.0.1:18789'])
-                effects.append(argv)
-                return SimpleNamespace(returncode=1 if nonzero else 0,
-                    stdout=json.dumps({'ok': True, 'key': self.key, 'entry': {'sessionId': self.session}}),
-                    stderr='PRIVATE_SECRET')
+                    method=argv[3]
+                    self.assertNotIn('env',kw)
+                rpc.append(method)
+                if method=='sessions.describe':
+                    if mutation is not None: mutation(fixture,len(rpc))
+                    result={'session':row}
+                else:
+                    effects.append(argv)
+                    result={'ok':True,'key':self.key,'entry':{'sessionId':self.session}}
+                return SimpleNamespace(returncode=1 if nonzero and method=='sessions.reset' else 0,
+                    stdout=sdk_reply(result) if qualified else json.dumps(result),stderr='PRIVATE_SECRET')
+            def sdk_call(argv,environment,cwd,timeout):
+                reply=command(list(argv),env=environment,cwd=str(cwd))
+                if reply.returncode!=0: raise ValueError('session SDK process unavailable')
+                return reply.stdout
             with mock.patch.object(daemon, 'STATE_DB', Path(directory) / 'ledger.db'), \
                  mock.patch.object(daemon, 'epoch', return_value=1000), \
                  mock.patch.object(daemon, 'now_ms', return_value=1000000), \
@@ -140,7 +160,8 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
                  mock.patch.object(daemon, 'workflow_runtime_registry_records', return_value=registry), \
                  mock.patch.object(daemon, 'analyze_session_activity', return_value={'active': False, 'heavy': False}), \
                  mock.patch.object(ActionLedger, 'refresh_execution_precheck', new=persisted), \
-                 mock.patch.object(daemon, 'run_cmd', side_effect=command):
+                 mock.patch.object(daemon, 'run_cmd', side_effect=command), \
+                 mock.patch.object(api, 'run_sdk_process', side_effect=sdk_call):
                 if not qualification:
                     with mock.patch.object(api, 'SESSION_API_QUALIFICATION', None):
                         first = daemon.governed_reset_session(conn, self.key, 'repeated_failures',
@@ -156,8 +177,7 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
         approved = (('HOME', '/fixture/home'), ('HTTPS_PROXY', 'http://127.0.0.1:7890'))
         with mock.patch.dict(os.environ, {'NODE_OPTIONS': '--require=/unapproved/preload.js',
                                          'LD_PRELOAD': '/unapproved/preload.so'}):
-            launcher = api.SessionRpcLauncher(Path('/node'), Path('/cli'), '0' * 64,
-                ('node-route',), ('cli-route',), 'ws://127.0.0.1:18789', approved)
+            launcher = launcher_fixture(approved)
             self.assertEqual(launcher.environment, dict(approved))
             changed = launcher.environment
             changed['NODE_OPTIONS'] = '--require=/foreign'
@@ -168,18 +188,74 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
                       (('HOME', '/fixture'), ('HOME', '/other')), (),
                       (('HOME', 'relative'),), (('HOME', '/fixture'), ('NO_PROXY', 'x\x00y'))):
             with self.subTest(keys=[i[0] for i in items]), self.assertRaises(ValueError):
-                api.SessionRpcLauncher(Path('/node'), Path('/cli'), '0' * 64,
-                    ('node-route',), ('cli-route',), 'ws://127.0.0.1:18789', items)
+                launcher_fixture(items)
 
     def test_qualified_rpc_passes_only_fixed_environment_to_process(self):
-        launcher = api.SessionRpcLauncher(Path('/node'), Path('/cli'), '0' * 64,
-            ('node-route',), ('cli-route',), 'ws://127.0.0.1:18789', (('HOME', '/fixture/home'),))
-        reply = SimpleNamespace(returncode=0, stdout='{"sessionId":"fixture"}', stderr='')
-        with mock.patch.dict(os.environ, {'NODE_OPTIONS': '--require=/foreign', 'LD_PRELOAD': '/foreign'}), \
-             mock.patch.object(daemon.subprocess, 'run', return_value=reply) as run:
-            self.assertEqual(daemon.openclaw_gateway_call('sessions.describe', {}, rpc_launcher=launcher)[1], 'ok')
-        self.assertEqual(run.call_args.kwargs['env'], {'HOME': '/fixture/home'})
-        self.assertEqual(run.call_args.args[0][:2], ['/node', '/cli'])
+        launcher=launcher_fixture((('HOME','/fixture/home'),))
+        def child(argv,**kwargs):
+            kwargs['stdout'].write(sdk_reply({'sessionId':'fixture'}).encode());kwargs['stdout'].flush()
+            return SimpleNamespace(returncode=0)
+        with mock.patch.dict(os.environ,{'NODE_OPTIONS':'--require=/foreign','LD_PRELOAD':'/foreign'}), \
+             mock.patch.object(api.subprocess,'run',side_effect=child) as run:
+            self.assertEqual(daemon.openclaw_gateway_call('sessions.describe',{'key':'agent:cat_voice:x','agentId':'cat_voice'},rpc_launcher=launcher)[1],'ok')
+        self.assertEqual(run.call_args.kwargs['env'],{'HOME':'/fixture/home'})
+        self.assertEqual(run.call_args.kwargs['cwd'],'/fixture')
+        self.assertEqual(run.call_args.args[0][:2],['/node','/wrapper'])
+
+    def test_sdk_response_and_call_schema_are_closed(self):
+        launcher=launcher_fixture((('HOME','/fixture/home'),))
+        for method,params in [('sessions.reset',{'key':'x','agentId':'cat_voice'}),
+                              ('health',{}),('sessions.describe',{'key':'x','agentId':'cat_voice','token':'forged'}),
+                              ('sessions.describe',{'key':'x'*513,'agentId':'cat_voice'}),
+                              ('sessions.describe',{'key':'x\ny','agentId':'cat_voice'})]:
+            with self.subTest(method=method,params=params),self.assertRaises(ValueError):launcher.command(method,params)
+        for response in ('{}',sdk_reply(None),sdk_reply({})+' trailing',
+                         sdk_reply({},bootId='wrong'),sdk_reply({},bootId='bad\nboot'),sdk_reply({},protocol=True),
+                         sdk_reply({}).replace('"ok": true','"ok": true, "ok": true')):
+            with self.subTest(response=response),self.assertRaises((ValueError,TypeError)):
+                api.validate_sdk_response(response,version='fixture-v1',build_id='fixture-build',boot_id='server-boot')
+
+    def test_sdk_process_output_budget_and_nonzero_are_sanitized(self):
+        for kind in ('stdout','stderr','nonzero'):
+            def child(argv,**kwargs):
+                if kind!='nonzero':kwargs[kind].write(b'PRIVATE_SECRET'+b'x'*65536);kwargs[kind].flush()
+                return SimpleNamespace(returncode=75 if kind=='nonzero' else 0)
+            with self.subTest(kind=kind),mock.patch.object(api.subprocess,'run',side_effect=child):
+                with self.assertRaises(ValueError) as error:
+                    api.run_sdk_process(('/node','/wrapper','{}'),environment={'HOME':'/fixture'},cwd=Path('/fixture'),timeout=1)
+                self.assertNotIn('PRIVATE_SECRET',str(error.exception))
+
+    def test_sdk_is_required_and_old_protocol_text_cannot_qualify(self):
+        def absent(fixture):
+            api.SESSION_API_QUALIFICATION=replace(fixture.qualification,sdk=None)
+        first,_second,effects=self.invoke(sdk_mutation=absent)
+        self.assertEqual(first['ledgerState'],'blocked');self.assertEqual(effects,[])
+
+    def test_probe_actual_hello_version_build_protocol_and_methods_are_required(self):
+        for changes in (dict(protocol=1),dict(protocol=True),dict(version='other'),dict(buildId='other'),
+                        dict(bootId=''),dict(methods=['sessions.describe']),dict(methods=['sessions.reset','sessions.reset'])):
+            with self.subTest(changes=changes):
+                def changed(fixture):fixture.probe.return_value=sdk_reply(None,**changes)
+                first,_second,effects=self.invoke(sdk_mutation=changed)
+                self.assertEqual(first['ledgerState'],'blocked');self.assertEqual(effects,[])
+
+    def test_probe_window_source_and_hello_boot_drift_are_refused(self):
+        for kind in ('source','boot'):
+            with self.subTest(kind=kind):
+                def changed(fixture):
+                    calls=[]
+                    def probe(argv,**kwargs):
+                        payload=json.loads(argv[2]);calls.append(payload)
+                        self.assertEqual(payload['mode'],'probe');self.assertEqual(payload['method'],'health')
+                        self.assertEqual(payload['server']['bootId'],None)
+                        self.assertEqual(kwargs['cwd'],fixture.code)
+                        self.assertEqual(kwargs['environment'],dict(fixture.qualification.rpc_environment))
+                        self.assertNotIn('token',payload)
+                        if kind=='source':(fixture.code/'sdk.mjs').write_text('// changed during hello\n')
+                        return sdk_reply(None,bootId='new-boot' if kind=='boot' and len(calls)>1 else 'server-boot')
+                    fixture.probe.side_effect=probe
+                first,_second,effects=self.invoke(sdk_mutation=changed)
+                self.assertEqual(first['ledgerState'],'blocked');self.assertEqual(effects,[])
 
     def test_actual_qualified_fixture_resets_exactly_once_and_pins_cli(self):
         first, second, effects = self.invoke()
@@ -195,7 +271,7 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
 
     def test_actual_source_drift_after_eligibility_sends_no_reset(self):
         def mutate(fixture, calls):
-            if calls == 3: (fixture.code / 'protocol.mjs').write_text('export const PROTOCOL_VERSION = 2;\n')
+            if calls == 3: (fixture.code / 'sdk.mjs').write_text('// SDK source changed\n')
         first, _second, effects = self.invoke(mutation=mutate)
         self.assertEqual(first['ledgerState'], 'blocked')
         self.assertEqual(effects, [])
@@ -203,7 +279,7 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
     def test_same_bytes_inode_replacement_is_refused(self):
         def mutate(fixture, calls):
             if calls == 3:
-                file = fixture.code / 'protocol.mjs'
+                file = fixture.code / 'sdk.mjs'
                 replacement = fixture.code / 'replacement'; replacement.write_bytes(file.read_bytes())
                 replacement.chmod(0o600); os.replace(replacement, file)
         first, _second, effects = self.invoke(mutation=mutate)
@@ -320,7 +396,7 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
 
     def test_actual_unsupported_protocol_at_initial_boundary_sends_no_reset(self):
         def mutate(fixture, calls):
-            if calls == 1: (fixture.code / 'protocol.mjs').write_text('export const PROTOCOL_VERSION = 2;\n')
+            if calls == 1: (fixture.code / 'sdk.mjs').write_text('// SDK source changed\n')
         first, _second, effects = self.invoke(mutation=mutate)
         self.assertEqual(first['ledgerState'], 'blocked')
         self.assertEqual(effects, [])
@@ -337,10 +413,12 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
             path = fixture.process / 'stat'; path.write_text(path.read_text().replace('99', '100'))
         first, second, effects = self.invoke(final_mutation=mutate)
         self.assertEqual(first['ledgerState'], 'uncertain')
-        # A new producer-instance proof cannot be substituted into the old
-        # uncertain intent. The immutable ledger rejects the conflicting proof.
-        self.assertEqual(second['result'], 'uncertain')
-        self.assertEqual(second['error'], 'ActionConflict')
+        # Existing uncertain intent is a read-only historical receipt, never
+        # a new authorization or retry after a changed producer observation.
+        self.assertEqual(second['result'], 'existing')
+        self.assertEqual(second['ledgerState'], 'uncertain')
+        self.assertTrue(second['historicalExisting'])
+        self.assertFalse(second['authorizationReused'])
         self.assertEqual(effects, [])
 
     def test_nonzero_mutation_remains_uncertain_and_never_retries(self):
