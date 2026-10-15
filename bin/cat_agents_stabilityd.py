@@ -896,6 +896,53 @@ def run_hermes_profile_gateway_cmd(profile: str, command: str, timeout: int = 60
     return run_user_cmd(cmd, timeout=timeout)
 
 
+
+def resolve_hermes_native_route(profile: str, action_type: str, generation: str):
+    from stability_core import hermes_native_route as native
+    from stability_core.effect_capability import EffectRequest, EffectOperation
+    from stability_core.unit_capability import PROPERTIES
+    from stability_core.hermes_unit_environment import PROPERTIES as ENV_PROPERTIES
+    qualification = native.NATIVE_QUALIFICATION
+    if qualification is None or qualification.target_profile != profile:
+        return None  # Outside reviewed native scope; preserve governed CLI path.
+    def read(unit, properties):
+        command = ['/usr/bin/env', f'XDG_RUNTIME_DIR=/run/user/{qualification.owner_uid}',
+                   f'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{qualification.owner_uid}/bus',
+                   '/usr/bin/systemctl', '--user', 'show', unit, '--property=' + ','.join(properties)]
+        proc = run_user_cmd(command, timeout=8)
+        if proc.returncode != 0:
+            raise ValueError('hermes-native-properties-unavailable')
+        return proc.stdout
+    def manager():
+        command = ['/usr/bin/env', f'XDG_RUNTIME_DIR=/run/user/{qualification.owner_uid}',
+                   f'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{qualification.owner_uid}/bus',
+                   '/usr/bin/systemctl', '--user', 'show-environment']
+        proc = run_user_cmd(command, timeout=8)
+        if proc.returncode != 0:
+            raise ValueError('hermes-native-manager-unavailable')
+        return proc.stdout
+    target = ('hermes-gateway:' if action_type == 'hermes.gateway.restart' else 'hermes-profile:') + profile
+    return native.NativeRoute(qualification,
+        EffectRequest(action_type, EffectOperation.SYSTEMD_UNIT, target, platform.node(), generation), profile,
+        read_properties=lambda unit: read(unit, PROPERTIES),
+        read_environment=lambda unit: read(unit, tuple(sorted(ENV_PROPERTIES)) + ('WorkingDirectory',)),
+        read_manager=manager, clock_ms=now_ms)
+
+
+def read_hermes_native_state(route: Any) -> Dict[str, str]:
+    proc = run_user_cmd(list(route.state_argv()), timeout=8)
+    if proc.returncode != 0:
+        raise ValueError('hermes-native-state-unavailable')
+    result: Dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        key, separator, value = line.partition('=')
+        if not separator or key not in {'ActiveState', 'SubState'} or key in result:
+            raise ValueError('hermes-native-state-ambiguous')
+        result[key] = value
+    if set(result) != {'ActiveState', 'SubState'}:
+        raise ValueError('hermes-native-state-incomplete')
+    return result
+
 def hermes_gateway_operation_unconfirmed(proc: subprocess.CompletedProcess[str]) -> bool:
     """A successful CLI exit can acknowledge intent without confirming the effect.
 
@@ -8124,7 +8171,7 @@ def hermers_gateway_restart(
     rule = STANDING_RULES["hermes.gateway.restart"]
     def unit_is_explicitly_down() -> bool:
         try:
-            state = systemctl_user_show(unit).get("ActiveState")
+            state = (read_hermes_native_state(native_route) if native_route is not None else systemctl_user_show(unit)).get("ActiveState")
             return state in {"inactive", "failed"}
         except Exception:
             return False
@@ -8140,7 +8187,18 @@ def hermers_gateway_restart(
                        policy_ref, f"policy-digest:sha256:{policy_digest}"),
         metadata={"actor": "cat-agents-stabilityd", "request_source": "stabilityd-daemon"},
     )
+    try:
+        native_route = resolve_hermes_native_route(profile, spec.action_type, spec.generation)
+    except Exception:
+        return {"actionId": action_id, "result": "blocked", "profile": profile,
+                "unit": unit, "blockedReason": "hermes-qualified-native-source-drift"}
+
     def eligibility(spec_: ActionSpec, loaded: Dict[str, Any], now_ms: int) -> tuple[str, ...]:
+        try:
+            if native_route is not None:
+                native_route.verify()
+        except Exception:
+            return ()
         planned = loaded.get("hermersGatewayRestartProfiles")
         if (loaded.get("canRestartHermersGateway") is not True
                 or str(loaded.get("hermersGatewayRestartReason") or "") != str(reason)
@@ -8160,6 +8218,8 @@ def hermers_gateway_restart(
 
     def precheck(_spec: ActionSpec, _record: Any) -> BoundaryCheck:
         try:
+            if native_route is not None:
+                native_route.verify()
             latest = resolve_profile_scope()
         except Exception:
             latest = None
@@ -8177,7 +8237,8 @@ def hermers_gateway_restart(
     operation_meta: Dict[str, Any] = {}
     def operation(_spec: ActionSpec, record: Any) -> OperationResult:
         started = time.monotonic()
-        proc = run_hermes_profile_gateway_cmd(profile, "restart", timeout=60)
+        proc = (run_user_cmd(list(native_route.argv("restart")), timeout=60) if native_route is not None
+                else run_hermes_profile_gateway_cmd(profile, "restart", timeout=60))
         operation_meta.update(exitCode=proc.returncode, durationMs=int((time.monotonic() - started) * 1000),
                               stderrByteCount=len(proc.stderr or ""))
         if proc.returncode != 0:
@@ -8190,6 +8251,16 @@ def hermers_gateway_restart(
 
     def postcheck(_spec: ActionSpec, _record: Any, _result: OperationResult) -> PostcheckResult:
         try:
+            latest = resolve_profile_scope()
+            if (latest.status != "clear" or latest.target_generation != scope.target_generation
+                    or tuple(sorted(latest.affected_agents)) != tuple(sorted(scope.affected_agents))):
+                return PostcheckResult("unknown", "evidence://hermes-gateway-postcheck/owner-changed")
+            if native_route is not None:
+                ref = native_route.verify()
+                service = (read_hermes_native_state(native_route) if native_route is not None else systemctl_user_show(unit))
+                state = ("verified" if service.get("ActiveState") == "active" and service.get("SubState") == "running"
+                         else "failed" if service.get("ActiveState") in {"inactive", "failed"} else "unknown")
+                return PostcheckResult(state, ref)
             proc = run_hermes_profile_gateway_cmd(profile, "status", timeout=20)
             status_text = (proc.stdout or "").lower()
             explicit_failure = re.search(
@@ -8225,6 +8296,7 @@ def hermers_gateway_restart(
             "result": state_map.get(execution.record.state, "existing" if execution.disposition == "existing" else "blocked"),
             "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
             "profile": profile, "unit": unit, "reason": reason,
+            "nativeRouteUsed": native_route is not None,
             "exitCode": operation_meta.get("exitCode"), "durationMs": operation_meta.get("durationMs"),
             "stderrOmitted": True, "stderrByteCount": operation_meta.get("stderrByteCount", 0)}
 
@@ -8518,11 +8590,19 @@ def execute_hermers_profile_lifecycle(
         metadata={"actor": "cat-agents-stabilityd", "request_source": "stabilityd-daemon"},
     )
 
+    try:
+        native_route = resolve_hermes_native_route(profile, spec.action_type, spec.generation)
+    except Exception:
+        return {"actionId": action_id, "result": "blocked", "profile": profile,
+                "unit": unit, "blockedReason": "hermes-qualified-native-source-drift"}
+
     def current_boundary() -> Tuple[bool, str, str]:
         valid, why, ref = hermers_profile_live_owner(profile, list(item.get("agentIds") or []), generation)
         if not valid:
             return False, why, ""
         try:
+            if native_route is not None:
+                native_route.verify()
             registry = workflow_runtime_registry_records()
             profiles, meta = hermers_profiles_from_runtime_registry([], registry)
             activity = hermers_profile_workflow_activity(profiles).get(profile) or {}
@@ -8530,7 +8610,7 @@ def execute_hermers_profile_lifecycle(
                     or int(activity.get("activeRuntimeCount") or 0) > 0
                     or int(activity.get("activeDispatchCount") or 0) > 0):
                 return False, "active-or-unknown-workflow-activity", ""
-            service = systemctl_user_show(unit)
+            service = (read_hermes_native_state(native_route) if native_route is not None else systemctl_user_show(unit))
             active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
             if target_mode == "hibernate":
                 if not active:
@@ -8563,7 +8643,8 @@ def execute_hermers_profile_lifecycle(
     operation_meta: Dict[str, Any] = {}
     def operation(_spec: ActionSpec, record: Any) -> OperationResult:
         started = time.monotonic()
-        proc = run_hermes_profile_gateway_cmd(profile, action, timeout=30)
+        proc = (run_user_cmd(list(native_route.argv(action)), timeout=30) if native_route is not None
+                else run_hermes_profile_gateway_cmd(profile, action, timeout=30))
         operation_meta.update(exitCode=proc.returncode, durationMs=int((time.monotonic() - started) * 1000),
                               stderrByteCount=len(proc.stderr or ""))
         if proc.returncode != 0:
@@ -8576,7 +8657,17 @@ def execute_hermers_profile_lifecycle(
 
     def postcheck(_spec: ActionSpec, _record: Any, _result: OperationResult) -> PostcheckResult:
         try:
-            service = systemctl_user_show(unit)
+            valid, _why, _ref = hermers_profile_live_owner(profile, list(item.get("agentIds") or []), generation)
+            registry = workflow_runtime_registry_records()
+            profiles, meta = hermers_profiles_from_runtime_registry([], registry)
+            activity = hermers_profile_workflow_activity(profiles).get(profile) or {}
+            if (not valid or meta.get("scopeComplete") is not True or activity.get("probeOk") is not True
+                    or int(activity.get("activeRuntimeCount") or 0) > 0
+                    or int(activity.get("activeDispatchCount") or 0) > 0):
+                return PostcheckResult("unknown", "evidence://hermes-profile-postcheck/scope-changed")
+            if native_route is not None:
+                native_route.verify()
+            service = (read_hermes_native_state(native_route) if native_route is not None else systemctl_user_show(unit))
             active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
             active_state = service.get("ActiveState")
             if not isinstance(active_state, str) or not active_state:
@@ -8613,7 +8704,9 @@ def execute_hermers_profile_lifecycle(
             "result": state_map.get(execution.record.state, "existing"),
             "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
             "profile": profile, "unit": unit, "targetMode": target_mode,
-            "operation": f"hermes-gateway-{action}", "adapter": "hermes-cli",
+            "operation": f"hermes-gateway-{action}",
+            "adapter": "native-systemd" if native_route is not None else "hermes-cli",
+            "nativeRouteUsed": native_route is not None,
             "exitCode": operation_meta.get("exitCode"), "durationMs": operation_meta.get("durationMs"),
             "stderrOmitted": True, "stderrByteCount": operation_meta.get("stderrByteCount", 0)}
 
