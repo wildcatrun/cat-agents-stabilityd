@@ -6949,8 +6949,15 @@ def cron_actuate(
         ) for item in cron.get("expiredLeases") or []]
         reaped = [item for item in results if item["result"] == "ok"]
         failures = [item for item in results if item["result"] in {"blocked", "failed", "uncertain"}]
-        if reaped or failures:
-            outcome = "uncertain" if any(item["result"] == "uncertain" for item in failures) else \
+        existing = [item for item in results if item["result"] == "existing"]
+        if reaped or failures or existing:
+            # Historical receipts are evidence, never fresh authorization or a
+            # retry. Keep unresolved history visible beside any new outcomes.
+            historical_uncertain = any(item.get("ledgerState") in {"uncertain", "executing"}
+                                       for item in existing)
+            outcome = "uncertain" if historical_uncertain else \
+                "existing" if not reaped and not failures else \
+                "uncertain" if any(item["result"] == "uncertain" for item in failures) else \
                 "failed" if any(item["result"] == "failed" for item in failures) else \
                 "blocked" if failures else "ok"
             action = {"action": "reap_expired_leases", "result": outcome}
@@ -6958,6 +6965,8 @@ def cron_actuate(
                 action["reaped"] = reaped
             if failures:
                 action["failures"] = failures
+            if existing:
+                action["existing"] = existing
             actions.append(action)
     return actions
 

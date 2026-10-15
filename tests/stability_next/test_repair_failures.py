@@ -143,6 +143,28 @@ def test_completed_run_unlink_failure_is_failed_without_claiming_reap(monkeypatc
 
 
 class RepairFailureTests(unittest.TestCase):
+    def test_historical_receipts_remain_visible_without_masking_unresolved_batch(self):
+        for state, fresh, expected in (("uncertain", True, "uncertain"),
+                                       ("executing", True, "uncertain"),
+                                       ("succeeded", True, "ok"),
+                                       ("uncertain", False, "uncertain"),
+                                       ("succeeded", False, "existing")):
+            with self.subTest(state=state, fresh=fresh):
+                history = dict(result="existing", ledgerState=state,
+                               historicalExisting=True, authorizationReused=False)
+                results = [history] + ([dict(result="ok")] if fresh else [])
+                with mock.patch.object(stabilityd, "cleanup_stale_tmp_files", return_value=0), \
+                     mock.patch.object(stabilityd, "update_repair_queue_status", return_value={}), \
+                     mock.patch.object(stabilityd, "LEASE_REAP_ENABLED", True), \
+                     mock.patch.object(stabilityd, "governed_reap_expired_lease", side_effect=results) as reap:
+                    actions = stabilityd.cron_actuate(
+                        {"cron": {"expiredLeases": [{} for _ in results]}}, _policy())
+                batch = next(a for a in actions if a["action"] == "reap_expired_leases")
+                self.assertEqual(batch["result"], expected)
+                self.assertEqual(batch["existing"], [history])
+                self.assertEqual(batch.get("reaped", []), [{"result": "ok"}] if fresh else [])
+                self.assertEqual(reap.call_count, len(results))
+
     def _run(self, test_function):
         with tempfile.TemporaryDirectory() as directory:
             test_function(_MonkeyPatch(), Path(directory))
@@ -224,10 +246,18 @@ class RepairFailureTests(unittest.TestCase):
             with mock.patch.object(stabilityd, "append_jsonl", side_effect=PermissionError("private")):
                 first = stabilityd.cron_actuate(snapshot, policy)
             self.assertEqual([a for a in first if a["action"] == "reap_expired_leases"][0]["result"], "uncertain")
-            second = stabilityd.cron_actuate(snapshot, policy)
+            run_before = run.read_bytes()
+            with mock.patch.object(stabilityd, "reap_expired_lease_candidate", side_effect=AssertionError("historical operation replayed")) as operation:
+                second = stabilityd.cron_actuate(snapshot, policy)
+            operation.assert_not_called()
             reap = [a for a in second if a["action"] == "reap_expired_leases"][0]
             self.assertEqual(reap["result"], "uncertain")
-            self.assertEqual(reap["failures"][0].get("ledgerDisposition"), "existing", reap)
+            history = reap["existing"][0]
+            self.assertEqual(history["ledgerDisposition"], "existing")
+            self.assertEqual(history["ledgerState"], "uncertain")
+            self.assertTrue(history["historicalExisting"])
+            self.assertFalse(history["authorizationReused"])
+            self.assertEqual(run.read_bytes(), run_before)
             self.assertTrue(lease.exists())
             self.assertFalse((paths["RUNS_BY_JOB_DIR"] / "j1.jsonl").exists())
 
