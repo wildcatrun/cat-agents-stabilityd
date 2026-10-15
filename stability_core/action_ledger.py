@@ -68,6 +68,10 @@ class ActionConflict(RuntimeError):
     """An idempotency or active-scope invariant was violated."""
 
 
+class IdempotencyConflict(ActionConflict):
+    """An existing key has different immutable input or provenance."""
+
+
 class InvalidTransition(RuntimeError):
     """A compare-and-swap state transition was rejected."""
 
@@ -305,7 +309,7 @@ class ActionLedger:
                         existing.evidence_refs, dict(existing.metadata),
                     )
                     if existing_fingerprint != fingerprint:
-                        raise ActionConflict("idempotency key was reused with different input or references")
+                        raise IdempotencyConflict("idempotency key was reused with different input or references")
                     return existing
                 # Both actions operate on the same Hermes profile. Resolve only
                 # these fixed ASCII namespaces; tool metadata cannot add aliases.

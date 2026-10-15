@@ -58,7 +58,7 @@ from stability_core.config import (
     parse_actuator_environment_settings, parse_integer_settings, parse_hermers_profile_lifecycle_settings,
     parse_restart_actuator_settings, parse_hermers_gateway_restart_limit, startup_grace_active,
 )
-from stability_core.action_ledger import ActionLedger
+from stability_core.action_ledger import ActionLedger, IdempotencyConflict
 from stability_core.event_outbox import EventOutbox, EventOutboxError
 from stability_core.action_classes import classify_action_types, classify_commands
 from stability_core.preflight_recovery import (
@@ -66,7 +66,7 @@ from stability_core.preflight_recovery import (
     load_action_ledger_connection_readonly,
 )
 from stability_core.action_executor import (
-    ActionExecutor, ActionSpec, BoundaryCheck, OperationResult, PostcheckResult,
+    ActionExecutor, ActionSpec, BoundaryCheck, OperationResult, PostcheckResult, ExecutionResult,
 )
 from stability_core.authorization import (
     EligibilityProof, STANDING_RULES, TrustedPolicyAuthorizer, policy_reference,
@@ -7490,7 +7490,7 @@ def governed_reap_expired_lease(
     except Exception as exc:
         return {"targetRef": target_ref, "result": "uncertain", "errorClass": type(exc).__name__}
     states = {"succeeded": "ok", "failed": "failed", "blocked": "blocked", "uncertain": "uncertain"}
-    return {"targetRef": target_ref, "result": states.get(execution.record.state, "existing"),
+    return {"targetRef": target_ref, "result": "existing" if execution.disposition == "existing" else states.get(execution.record.state, "existing"),
             "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
             "leaseDigest": lease_digest,
             "failedStage": outcome.get("failedStage"), "errorClass": outcome.get("errorClass"),
@@ -7509,6 +7509,7 @@ def reset_session(
     last_key = f"session_reset:sha256:{session_key_digest}"
     last_reset = int(db_get(conn, last_key, 0) or 0)
     if last_reset and epoch() - last_reset < SESSION_RESET_COOLDOWN_SECONDS:
+            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
         return {"result": "cooldown_skip"}
     agent_id = session_key_agent_id(session_key)
     if not agent_id or not expected_session_id:
@@ -7735,7 +7736,7 @@ def governed_reset_session(
                 "error": type(exc).__name__}
     state_map = {"succeeded": "ok", "failed": "failed", "blocked": "blocked", "uncertain": "uncertain"}
     return {"actionId": execution.record.action_id, "sessionRef": session_ref,
-            "result": state_map.get(execution.record.state, "existing"),
+            "result": "existing" if execution.disposition == "existing" else state_map.get(execution.record.state, "existing"),
             "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
             "sessionIdDigest": session_id_digest, "reason": reason_code,
             "resetSessionIdDigest": hashlib.sha256(str(operation_meta.get("resetSessionId") or "").encode()).hexdigest()}
@@ -7754,6 +7755,7 @@ def session_actuate(
                     "candidateCount": len((snapshot.get("session") or {}).get("resetCandidates") or []),
                     "sample": ((snapshot.get("session") or {}).get("resetCandidates") or [])[:10],
                 }
+            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
             )
         return actions
     candidates = (snapshot.get("session") or {}).get("resetCandidates") or []
@@ -7826,7 +7828,26 @@ def execute_governed_effect(
             ledger, authorizer=authorizer, precheck=precheck, operation=operation,
             postcheck=postcheck, clock_ms=lambda: epoch() * 1000,
         )
-        return executor.execute(spec)
+        try:
+            return executor.execute(spec)
+        except IdempotencyConflict:
+            # Observation provenance can change while intent remains identical.
+            # This is a historical receipt lookup, never authorization or resume.
+            record = ledger.get(ActionLedger.stable_action_id(spec.idempotency_key))
+            metadata = dict(spec.metadata or {})
+            if "request_source" in metadata and metadata["request_source"] != spec.source:
+                raise
+            metadata["request_source"] = spec.source
+            input_digest = hashlib.sha256(json.dumps(spec.input_data, ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+            if (record is None or record.idempotency_key != spec.idempotency_key
+                    or record.action_id != ActionLedger.stable_action_id(spec.idempotency_key)
+                    or record.action_type != spec.action_type or record.target != spec.target
+                    or record.generation != spec.generation or record.input_digest != input_digest
+                    or record.authorization_ref != spec.authorization_ref
+                    or dict(record.metadata) != metadata):
+                raise
+            return ExecutionResult(record, "existing")
 
 
 def read_gateway_unit_properties(unit: str) -> str:
@@ -8048,7 +8069,7 @@ def gateway_restart(
         "actionId": execution.record.action_id,
         "ts": ts(), "tsEpoch": epoch(), "source": "cat-agents-stabilityd",
         "component": "gateway", "action": "restart_gateway",
-        "result": state_to_result.get(state, "existing" if execution.disposition == "existing" else "blocked"),
+        "result": "existing" if execution.disposition == "existing" else state_to_result.get(state, "existing" if execution.disposition == "existing" else "blocked"),
         "reason": reason_code, "ledgerState": state, "ledgerDisposition": execution.disposition,
         "exitCode": operation_meta.get("exitCode"), "durationMs": operation_meta.get("durationMs"),
         "stderrOmitted": True, "stderrByteCount": operation_meta.get("stderrByteCount", 0),
@@ -8067,6 +8088,7 @@ def gateway_restart(
 def hermers_gateway_restart(
     conn: sqlite3.Connection, profile: str, unit: str, reason: str, *,
     policy: Optional[Dict[str, Any]] = None, snapshot_generation: str = "",
+            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
 ) -> Dict[str, Any]:
     action_id = f"hermers-gateway-restart-{hashlib.sha256(profile.encode()).hexdigest()[:12]}-{int(time.time())}"
     if not re.match(r"^[A-Za-z0-9_.@-]+$", profile):
@@ -8293,7 +8315,7 @@ def hermers_gateway_restart(
     return {"actionId": execution.record.action_id, "ts": ts(), "tsEpoch": epoch(),
             "source": "cat-agents-stabilityd", "component": "hermers",
             "action": "restart_hermers_gateway",
-            "result": state_map.get(execution.record.state, "existing" if execution.disposition == "existing" else "blocked"),
+            "result": "existing" if execution.disposition == "existing" else state_map.get(execution.record.state, "existing" if execution.disposition == "existing" else "blocked"),
             "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
             "profile": profile, "unit": unit, "reason": reason,
             "nativeRouteUsed": native_route is not None,
@@ -8319,6 +8341,7 @@ def capture_resource_evidence(snapshot: Dict[str, Any], policy: Dict[str, Any], 
         "meminfo": command_probe(["cat", "/proc/meminfo"], timeout=3, max_chars=8_000),
         "memoryPressure": command_probe(["cat", "/proc/pressure/memory"], timeout=3, max_chars=4_000),
         "free": command_probe(["free", "-h"], timeout=3, max_chars=4_000),
+            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
         "gatewayService": command_probe(
             [
                 "systemctl",
@@ -8701,7 +8724,7 @@ def execute_hermers_profile_lifecycle(
                 "profile": profile, "unit": unit, "targetMode": target_mode, "error": type(exc).__name__}
     state_map = {"succeeded": "ok", "failed": "failed", "blocked": "blocked", "uncertain": "uncertain"}
     return {"actionId": execution.record.action_id, "action": "set_hermers_profile_mode",
-            "result": state_map.get(execution.record.state, "existing"),
+            "result": "existing" if execution.disposition == "existing" else state_map.get(execution.record.state, "existing"),
             "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
             "profile": profile, "unit": unit, "targetMode": target_mode,
             "operation": f"hermes-gateway-{action}",
@@ -8737,6 +8760,7 @@ def hermers_profile_mode_actuate(
             actions.append({"action": "set_hermers_profile_mode", "result": "blocked",
                             "profile": profile, "unit": unit, "targetMode": target_mode,
                             "blockedReason": "profile-not-in-lifecycle-allowlist"})
+            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
         elif item.get("activeWork"):
             actions.append({"action": "set_hermers_profile_mode", "result": "blocked",
                             "profile": profile, "unit": unit, "targetMode": target_mode,
@@ -8974,7 +8998,7 @@ def execute_hermers_process_signal(
     except Exception as exc:
         return {**base_result, "result": "uncertain", "error": type(exc).__name__}
     state_map = {"succeeded": "ok", "failed": "failed", "blocked": "blocked", "uncertain": "uncertain"}
-    return {**base_result, "result": state_map.get(execution.record.state, "existing"),
+    return {**base_result, "result": "existing" if execution.disposition == "existing" else state_map.get(execution.record.state, "existing"),
             "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
             "capabilityEvidence": latest.get("capabilityEvidence"),
             "reason": result_box.get("reason") if execution.disposition == "executed" else None}
@@ -9010,6 +9034,7 @@ def verify_hermers_orphan_worker(
         return False, "worker-has-live-parent"
     identity_ok, identity_reason = _verify_captured_process_identity(pid, item or {})
     if not identity_ok:
+            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
         return False, identity_reason
     return True, "verified-orphan"
 
