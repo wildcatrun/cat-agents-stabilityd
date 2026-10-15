@@ -1775,7 +1775,7 @@ def workflow_runtime_registry_records() -> Dict[str, Any]:
         payload["records"] = [dict(row) for row in rows]
         identities = [str(item.get("agent_id") or "").strip() for item in payload["records"]]
         complete_rows = all(
-            identity
+            str(item.get("agent_id") or "").strip()
             and str(item.get("runtime") or "").strip()
             and str(item.get("status") or "").strip()
             and str(item.get("platform") or "").strip()
