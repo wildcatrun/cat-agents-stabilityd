@@ -73,7 +73,11 @@ class GatewayCapabilityIntegrationTests(unittest.TestCase):
         self.assertFalse(first['capabilityEvidence']['actionAuthorized'])
         self.assertGreaterEqual(self.reads, 2)
         self.assertEqual(len(self.effects), 1)
-        self.assertEqual(self.call()['result'], 'ok')
+        duplicate = self.call()
+        self.assertEqual(duplicate['result'], 'existing')
+        self.assertTrue(duplicate['historicalExisting'])
+        self.assertFalse(duplicate['authorizationReused'])
+        self.assertEqual(duplicate['ledgerDisposition'], 'existing')
         self.assertEqual(len(self.effects), 1)
 
     def test_incomplete_effective_properties_block_before_restart(self):
