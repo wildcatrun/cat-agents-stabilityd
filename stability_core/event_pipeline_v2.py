@@ -123,8 +123,7 @@ class EventPipelineV2:
                      + len(events) * (1024 + len(canonical(str(self.stream.target)))))
             if len(events) > ARCHIVE_RECORDS or bound > ARCHIVE_BYTES:
                 raise EventOutboxError("pipeline-batch-archive-budget")
-            receipt = self.core.record_batch(handle, events, expected_count=len(events),
-                                            batch_digest=self.core.batch_digest(events))
+            receipt = self.core._record_owned_batch(handle, events)
             self.core.seal_generation(handle)
         except (EventOutboxError, ValueError, TypeError, OverflowError):
             self.close()

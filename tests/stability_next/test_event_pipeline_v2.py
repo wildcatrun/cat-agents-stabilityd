@@ -39,6 +39,17 @@ class EventPipelineV2Tests(unittest.TestCase):
         )
         return self.pipeline
 
+    def test_record_uses_one_validated_encoding_and_preserves_receipt(self):
+        pipeline = self.open(True)
+        events = [{'tsEpoch': 1, 'message': '猫\n"quoted"'}]
+        with mock.patch.object(pipeline.core, '_encode_events', wraps=pipeline.core._encode_events) as encode:
+            result = pipeline.record(events)
+        self.assertEqual(encode.call_count, 1)
+        self.assertEqual(result['record'], {'duplicate': False, 'count': 1, 'ordinal': 1})
+        self.assertEqual(result['generationOrdinal'], 1)
+        self.assertEqual(result['export']['coverage'], 'receipt-clear')
+        self.assertEqual(pipeline.stream.latest(), events)
+
     def test_borrowed_row_factory_pipeline_bounded_retirement_preserves_payloads(self):
         pipeline = self.open(True)
         for n in range(10):

@@ -59,7 +59,6 @@ def _atomic_replace(path: Path, writer, *, directory_identity=None, sync_directo
     if parent_fence is not None:
         if parent_fence.path != parent:
             raise OSError("publication directory fence scope changed")
-        parent_fence()
     else:
         parent.mkdir(parents=True, exist_ok=True)
     with (nullcontext(parent_fence) if parent_fence is not None else _directory_fence(parent)) as check:
@@ -69,7 +68,8 @@ def _atomic_replace(path: Path, writer, *, directory_identity=None, sync_directo
         fd = check.fd
         tmp_name = f"{filename}.{os.getpid()}.{time.time_ns()}.tmp"
         try:
-            if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) != check.identity:
+            held = os.fstat(fd)
+            if (held.st_dev, held.st_ino) != check.identity:
                 raise OSError("publication directory identity changed")
             tmp_fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                              | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=fd)

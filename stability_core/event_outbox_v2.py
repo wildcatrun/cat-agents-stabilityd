@@ -274,10 +274,21 @@ class EventOutboxV2:
 
     @masked('v2-record-failed')
     def record_batch(self,handle,events,*,expected_count,batch_digest):
+        return self._record_events(handle, events, expected_count, (batch_digest,))
+
+    @masked('v2-record-failed')
+    def _record_owned_batch(self,handle,events):
+        # Internal producers supply original events, never prevalidated bytes.
+        # Encoding, limits and digests are established together in this call.
+        return self._record_events(handle, events, len(events), ())
+
+    def _record_events(self,handle,events,expected_count,supplied_digest):
         if type(expected_count) is not int or expected_count!=len(events):fail('v2-expected-count-invalid')
         encoded=self._encode_events(events)
         actual=digest(canonical([item[0] for item in encoded]))
-        if not isinstance(batch_digest,str) or actual!=batch_digest:fail('v2-batch-digest-conflict')
+        if supplied_digest:
+            batch_digest=supplied_digest[0]
+            if not isinstance(batch_digest,str) or actual!=batch_digest:fail('v2-batch-digest-conflict')
         with self._transaction():
             row=self._handle(handle)
             if row[3] is not None:

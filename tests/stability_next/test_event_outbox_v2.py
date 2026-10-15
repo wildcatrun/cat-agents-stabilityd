@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from stability_core.action_ledger import ActionLedger
 from stability_core.event_outbox import EventOutbox, EventOutboxError
@@ -49,6 +50,37 @@ class EventOutboxV2Tests(unittest.TestCase):
         self.witness.write_bytes(canonical(witness_value(request)))
         self.box.retire(receipt,witness_path=self.witness)
         return request,receipt
+
+    def test_owned_batch_encodes_once_and_keeps_exact_evidence(self):
+        events = [{'tsEpoch': 1, 'message': '猫\nquoted " text', 'nested': [1, None]}]
+        expected = self.box._encode_events(events)
+        handle = self.box.begin_generation('p', 'boot')
+        with mock.patch.object(self.box, '_encode_events', wraps=self.box._encode_events) as encode:
+            receipt = self.box._record_owned_batch(handle, events)
+            self.assertEqual(encode.call_count, 1)
+        self.assertEqual(receipt, {'duplicate': False, 'count': 1, 'ordinal': handle.ordinal})
+        row = self.box.connection.execute('SELECT payload_digest,line,line_digest FROM event_v2_rows').fetchone()
+        self.assertEqual(tuple(row), expected[0])
+        stored = self.box.connection.execute('SELECT batch_digest FROM event_v2_generations').fetchone()[0]
+        self.assertEqual(stored, self.box.batch_digest(events))
+        self.box.seal_generation(handle)
+        self.assertTrue(self.box._record_owned_batch(handle, events)['duplicate'])
+        events[0]['message'] = 'changed'
+        with self.assertRaisesRegex(EventOutboxError, 'v2-generation-batch-conflict'):
+            self.box._record_owned_batch(handle, events)
+        self.assertEqual(tuple(self.box.connection.execute('SELECT payload_digest,line,line_digest FROM event_v2_rows').fetchone()), expected[0])
+
+    def test_owned_batch_rejects_invalid_events_without_recording(self):
+        handle = self.box.begin_generation('p', 'boot')
+        for events in ([{'tsEpoch': True}], [{'tsEpoch': 1, 'value': float('nan')}],
+                       [{'tsEpoch': 1, 'message': 'x' * (self.box.max_payload_bytes + 1)}]):
+            with self.assertRaises(EventOutboxError):
+                self.box._record_owned_batch(handle, events)
+        self.assertEqual(self.box.connection.execute('SELECT COUNT(*) FROM event_v2_rows').fetchone()[0], 0)
+        self.assertIsNone(self.box.connection.execute('SELECT expected_count FROM event_v2_generations').fetchone()[0])
+        for bad_digest in (None, '', '0' * 64, ()):
+            with self.assertRaisesRegex(EventOutboxError, 'v2-batch-digest-conflict'):
+                self.box.record_batch(handle, self.events, expected_count=1, batch_digest=bad_digest)
 
     def test_mandatory_handle_and_atomic_batch_digest(self):
         handle=self.box.begin_generation('p','boot')
