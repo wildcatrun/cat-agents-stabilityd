@@ -23,6 +23,25 @@ from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
 STATES = frozenset({"planned", "executing", "succeeded", "failed", "blocked", "uncertain"})
 ACTIVE_STATES = ("planned", "executing", "uncertain")
+
+
+def _assert_profile_scope_clear(conn, target, action_id):
+    """Check fixed runtime aliases inside the caller's write transaction."""
+    match = re.fullmatch(r"hermes-(?:gateway|profile):([A-Za-z0-9_-]{1,64})", target)
+    if match is None:
+        return
+    profile = match.group(1).lower()
+    reserved = conn.execute(
+        """SELECT 1 FROM action_ledger
+           WHERE target COLLATE NOCASE IN (?, ?)
+           AND state IN ('planned','executing','uncertain')
+           AND action_id != ? LIMIT 1""",
+        ("hermes-gateway:" + profile, "hermes-profile:" + profile, action_id),
+    ).fetchone()
+    if reserved is not None:
+        raise ActionConflict("Hermes profile scope is already reserved")
+
+
 TERMINAL_STATES = frozenset({"succeeded", "failed", "blocked"})
 _TRANSITIONS = {
     "planned": frozenset({"executing", "blocked"}),
@@ -288,6 +307,12 @@ class ActionLedger:
                     if existing_fingerprint != fingerprint:
                         raise ActionConflict("idempotency key was reused with different input or references")
                     return existing
+                # Both actions operate on the same Hermes profile. Resolve only
+                # these fixed ASCII namespaces; tool metadata cannot add aliases.
+                # This read shares the BEGIN IMMEDIATE insertion transaction, so
+                # another current writer cannot reserve the other alias between
+                # the check and INSERT. Keep stored targets and schema unchanged.
+                _assert_profile_scope_clear(conn, target, action_id)
                 conn.execute(
                     """INSERT INTO action_ledger
                     (action_id,idempotency_key,action_type,target,generation,state,input_digest,
@@ -347,6 +372,12 @@ class ActionLedger:
             raise InvalidTransition("final precheck evidence reference is required")
         now = time.time_ns() // 1_000_000
         with self._write() as conn:
+            claimed = conn.execute(
+                "SELECT target FROM action_ledger WHERE action_id=? AND state='executing' AND version=?",
+                (action_id, expected_version),
+            ).fetchone()
+            if claimed is not None:
+                _assert_profile_scope_clear(conn, claimed["target"], action_id)
             cursor = conn.execute(
                 """UPDATE action_ledger SET updated_at_ms=?, version=version+1, precheck_ref=?
                    WHERE action_id=? AND state='executing' AND version=?""",
@@ -379,6 +410,13 @@ class ActionLedger:
             raise InvalidTransition("terminal outcome requires operation and post-check references")
         now = time.time_ns() // 1_000_000
         with self._write() as conn:
+            if new_state == "executing":
+                planned = conn.execute(
+                    "SELECT target FROM action_ledger WHERE action_id=? AND state=? AND version=?",
+                    (action_id, expected_state, expected_version),
+                ).fetchone()
+                if planned is not None:
+                    _assert_profile_scope_clear(conn, planned["target"], action_id)
             cursor = conn.execute(
                 """UPDATE action_ledger SET state=?, updated_at_ms=?, version=version+1,
                    outcome_ref=?, postcheck_ref=?, precheck_ref=COALESCE(?,precheck_ref)
