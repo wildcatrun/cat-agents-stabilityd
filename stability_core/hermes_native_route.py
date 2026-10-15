@@ -4,6 +4,7 @@ Independent reviewed expected source identities bind the actual profile/home/
 standalone implementation. This does not prove all Python dependencies or loaded
 memory bytes. A native route cannot certify mux CLI/schema capabilities.
 """
+from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import os
@@ -23,7 +24,7 @@ from .hermes_dotenv_projection import CONTROL_KEYS, IMPORT_KEYS
 import stat
 
 
-def _read_program_source(path, *, owner_uid):
+def _read_program_source(path, *, owner_uid, include_bytes=False):
     if not path.is_absolute() or '..' in path.parts:
         raise ValueError('native source scope invalid')
     identity = lambda x: (x.st_dev, x.st_ino, x.st_uid, x.st_mode, x.st_nlink,
@@ -50,7 +51,8 @@ def _read_program_source(path, *, owner_uid):
                 or any((p.lstat().st_dev, p.lstat().st_ino, p.lstat().st_uid, p.lstat().st_mode) != i
                        for p, i in parents)):
             raise ValueError('native source read drift')
-        return (str(path), hashlib.sha256(raw).hexdigest(), identity(before), tuple(parents))
+        result = (str(path), hashlib.sha256(raw).hexdigest(), identity(before), tuple(parents))
+        return (result, bytes(raw)) if include_bytes else result
     finally:
         os.close(fd)
 
@@ -253,3 +255,179 @@ class NativeRoute:
     def state_argv(self):
         return (*self.argv('start')[:-2], 'show', self.unit,
                 '--property=ActiveState,SubState')
+
+
+@dataclass(frozen=True)
+class MuxQualification:
+    """Independently reviewed CLI/protocol source window, never an action grant."""
+    owner_uid: int
+    runtime_root: Path
+    target_profile: str
+    interpreter_entry: Path
+    interpreter_sha256: str
+    cli_entry: Path
+    cli_sha256: str
+    sources: tuple
+    environment: tuple
+    cwd: Path
+    socket_path: Path
+    host_home: Path
+    peer_cmdline_digest: str
+    peer_boot_id: str
+    provenance_ref: str
+    code_root: Path | None = None
+    bridge_entry: Path | None = None
+    bridge_sha256: str = ''
+    protocol: int = 1
+    semantics: str = 'reviewed-hermes-mux-cli-logical-membership-v1'
+
+
+MUX_QUALIFICATION = None
+
+MUX_RUNTIME_MODULES = (
+    'hermes_cli', 'hermes_cli.main', 'hermes_cli.gateway', 'hermes_cli.profiles',
+    'hermes_cli.gateway_profile_lifecycle', 'hermes_constants',
+    'gateway', 'gateway.control_socket',
+)
+
+
+def qualified_module_origins(code_root, sources, *, search_paths):
+    """Inspect the finite contract's real import routes without executing init.
+
+    A same-named, same-hash file elsewhere is insufficient: the actual loader
+    must select the reviewed module/package path under the installation root.
+    This deliberately makes no statement about every other Python dependency.
+    """
+    from importlib.machinery import PathFinder, SourceFileLoader
+    if not isinstance(code_root, Path) or not code_root.is_absolute() or '..' in code_root.parts:
+        raise ValueError('mux code root unavailable')
+    approved = {Path(path) for path, _digest in sources}
+    origins, locations = {}, {}
+    for name in MUX_RUNTIME_MODULES:
+        parent = name.rpartition('.')[0]
+        paths = locations[parent] if parent else search_paths
+        spec = PathFinder.find_spec(name, paths)
+        package = name in {'hermes_cli', 'gateway'}
+        relative = Path(*name.split('.'))
+        expected = code_root / relative / '__init__.py' if package else code_root / relative.with_suffix('.py')
+        if (spec is None or type(spec.loader) is not SourceFileLoader
+                or spec.origin != str(expected) or expected not in approved
+                or spec.loader.path != str(expected)):
+            raise ValueError('mux actual module origin not qualified')
+        if package:
+            if tuple(spec.submodule_search_locations or ()) != (str(expected.parent),):
+                raise ValueError('mux actual package route not qualified')
+            locations[name] = (str(expected.parent),)
+        origins[name] = str(expected)
+    return origins
+
+
+class MuxRoute:
+    def __init__(self, qualification, request, profile):
+        from .effect_capability import EffectOperation
+        q = qualification
+        if (type(q) is not MuxQualification or type(q.owner_uid) is not int or q.owner_uid != os.geteuid()
+                or type(request) is not EffectRequest
+                or q.target_profile != profile or q.protocol != 1 or type(q.protocol) is not int
+                or q.semantics != 'reviewed-hermes-mux-cli-logical-membership-v1'
+                or not q.provenance_ref.startswith('evidence://')
+                or request.operation is not EffectOperation.HERMES_CLI
+                or request.action_type not in {'hermes.gateway.restart', 'hermes.profile.lifecycle'}
+                or request.target != ('hermes-gateway:' if request.action_type == 'hermes.gateway.restart'
+                                      else 'hermes-profile:') + profile
+                or type(q.sources) is not tuple or not q.sources
+                or type(q.environment) is not tuple
+                or not {'main.py', 'profiles.py', 'gateway.py', 'control_socket.py',
+                        'gateway_profile_lifecycle.py'} <= {p.name for p, _ in q.sources}
+                or not isinstance(q.bridge_entry, Path) or not isinstance(q.code_root, Path)):
+            raise ValueError('mux source qualification unavailable')
+        self.q, self.request, self.profile, self._pin = q, request, profile, None
+        self.last_residency = 'unknown'
+        self.verify()
+
+    def _observe(self):
+        from .adapter_contract import sha256_file
+        from .unit_capability import resolve_unit_executable
+        from .hermes_control import query_readonly, profile_residency
+        from .session_api_capability import _kernel_executable_identity
+        import time
+        q = self.q
+        home = q.runtime_root / 'profiles' / self.profile
+        env = dict(q.environment)
+        if (len(env) != len(q.environment) or env.get('HERMES_HOME') != str(home)
+                or q.cwd != home or set(env) & IMPORT_KEYS
+                or any(type(k) is not str or type(v) is not str or '\x00' in k + v
+                       or len(k) > 128 or len(v) > 4096 for k, v in q.environment)):
+            raise ValueError('mux fixed launch context refused')
+        executable, interpreter_route = resolve_unit_executable(q.interpreter_entry, owner_uid=q.owner_uid)
+        cli, cli_route = resolve_unit_executable(q.cli_entry, owner_uid=q.owner_uid)
+        if sha256_file(str(executable)) != q.interpreter_sha256 or sha256_file(str(cli)) != q.cli_sha256:
+            raise ValueError('mux fixed launcher changed')
+        bridge = _read_program_source(q.bridge_entry, owner_uid=q.owner_uid)
+        if bridge[1] != q.bridge_sha256:
+            raise ValueError('mux governed bridge changed')
+        sources = []
+        for path, expected in q.sources:
+            measured = _read_program_source(path, owner_uid=q.owner_uid)
+            if measured[1] != expected:
+                raise ValueError('mux source window changed')
+            sources.append(measured)
+        origins = qualified_module_origins(q.code_root, q.sources, search_paths=(str(q.code_root),))
+        config = read_profile_config(home, profile=self.profile, runtime_root=q.runtime_root, owner_uid=q.owner_uid)
+        if config.standalone:
+            raise ValueError('mux target is standalone')
+        live = observe_profile_live(q.runtime_root, profile=self.profile, owner_uid=q.owner_uid)
+        socket_identity = lambda: (lambda s: (s.st_dev, s.st_ino, s.st_uid, s.st_mode, s.st_ctime_ns))(q.socket_path.lstat())
+        socket_before = socket_identity()
+        first = query_readonly(q.socket_path, 'identify', expected_uid=q.owner_uid)
+        second = query_readonly(q.socket_path, 'status', expected_uid=q.owner_uid)
+        membership = profile_residency(first, second, expected_home=q.host_home,
+            profile=self.profile, now_monotonic=time.monotonic())
+        if (membership['topology'] != 'multiplex-membership'
+                or second.process_identity.get('cmdlineDigest') != q.peer_cmdline_digest
+                or second.process_identity.get('bootId') != q.peer_boot_id):
+            raise ValueError('mux runtime instance or schema unqualified')
+        image = _kernel_executable_identity(Path('/proc'), second.peer_pid, executable)
+        final_config = read_profile_config(home, profile=self.profile, runtime_root=q.runtime_root, owner_uid=q.owner_uid)
+        final_live = observe_profile_live(q.runtime_root, profile=self.profile, owner_uid=q.owner_uid)
+        if (socket_identity() != socket_before or config != final_config or not _same_live_scope(_live_scope(live), _live_scope(final_live))
+                or tuple(_read_program_source(p, owner_uid=q.owner_uid) for p, _ in q.sources) != tuple(sources)
+                or resolve_unit_executable(q.interpreter_entry, owner_uid=q.owner_uid) != (executable, interpreter_route)
+                or resolve_unit_executable(q.cli_entry, owner_uid=q.owner_uid) != (cli, cli_route)
+                or _read_program_source(q.bridge_entry, owner_uid=q.owner_uid) != bridge
+                or qualified_module_origins(q.code_root, q.sources, search_paths=(str(q.code_root),)) != origins):
+            raise ValueError('mux source or launcher window drift')
+        # Process identity includes birth/starttime, boot, UID, cmdline and cgroup.
+        stable = (str(executable), interpreter_route, str(cli), cli_route, tuple(sources),
+                  config, second.process_identity, image, socket_before, bridge, origins, _live_scope(final_live))
+        self.peer_identity = dict(second.process_identity)
+        return stable, membership['residency']
+
+    def verify(self, expected=None):
+        observed, residency = self._observe()
+        if self._pin is None:
+            self._pin = observed
+        elif (observed[:-1] != self._pin[:-1] or not _same_live_scope(self._pin[-1], observed[-1])):
+            raise ValueError('mux pinned runtime identity drift')
+        else:
+            promoted = dict(observed[-1])
+            promoted.update({p: i for p, i in self._pin[-1].items() if i is not None})
+            self._pin = (*self._pin[:-1], promoted)
+        if expected is not None and residency != expected:
+            raise ValueError('mux logical target residency changed')
+        self.last_residency = residency
+        return 'evidence://hermes-mux-route/sha256/' + hashlib.sha256(repr((observed, residency)).encode()).hexdigest()
+
+    def command(self, verb):
+        import json
+        if verb not in {'start', 'stop', 'restart'}:
+            raise ValueError('mux profile operation refused')
+        payload = dict(profile=self.profile, verb=verb,
+            home=str(self.q.runtime_root / 'profiles' / self.profile),
+            hostHome=str(self.q.host_home), socket=str(self.q.socket_path), peer=self.peer_identity,
+            homeIdentity=self._pin[-1][str(self.q.runtime_root / 'profiles' / self.profile)],
+            sourcePins=[(str(path), digest) for path, digest in self.q.sources], codeRoot=str(self.q.code_root),
+            serveUnserved=verb in {'start', 'restart'} and self.last_residency == 'unserved')
+        return ((str(self.q.interpreter_entry), str(self.q.bridge_entry),
+                 json.dumps(payload, sort_keys=True, separators=(',', ':'))),
+                dict(self.q.environment), self.q.cwd)

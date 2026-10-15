@@ -929,6 +929,23 @@ def resolve_hermes_native_route(profile: str, action_type: str, generation: str)
         read_manager=manager, clock_ms=now_ms)
 
 
+
+def resolve_hermes_mux_route(profile: str, action_type: str, generation: str):
+    from stability_core import hermes_native_route as routes
+    from stability_core.effect_capability import EffectRequest, EffectOperation
+    qualification = routes.MUX_QUALIFICATION
+    if qualification is None or qualification.target_profile != profile:
+        return None
+    target = ('hermes-gateway:' if action_type == 'hermes.gateway.restart' else 'hermes-profile:') + profile
+    return routes.MuxRoute(qualification,
+        EffectRequest(action_type, EffectOperation.HERMES_CLI, target, platform.node(), generation), profile)
+
+
+def run_hermes_mux_command(route: Any, verb: str, timeout: int):
+    argv, environment, cwd = route.command(verb)
+    return subprocess.run(list(argv), text=True, capture_output=True, timeout=timeout,
+                          env=environment, cwd=str(cwd))
+
 def read_hermes_native_state(route: Any) -> Dict[str, str]:
     proc = run_user_cmd(list(route.state_argv()), timeout=8)
     if proc.returncode != 0:
@@ -7492,6 +7509,7 @@ def governed_reap_expired_lease(
     states = {"succeeded": "ok", "failed": "failed", "blocked": "blocked", "uncertain": "uncertain"}
     return {"targetRef": target_ref, "result": "existing" if execution.disposition == "existing" else states.get(execution.record.state, "existing"),
             "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
+            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
             "leaseDigest": lease_digest,
             "failedStage": outcome.get("failedStage"), "errorClass": outcome.get("errorClass"),
             "partialWrites": outcome.get("partialWrites"),
@@ -7509,7 +7527,6 @@ def reset_session(
     last_key = f"session_reset:sha256:{session_key_digest}"
     last_reset = int(db_get(conn, last_key, 0) or 0)
     if last_reset and epoch() - last_reset < SESSION_RESET_COOLDOWN_SECONDS:
-            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
         return {"result": "cooldown_skip"}
     agent_id = session_key_agent_id(session_key)
     if not agent_id or not expected_session_id:
@@ -7738,6 +7755,7 @@ def governed_reset_session(
     return {"actionId": execution.record.action_id, "sessionRef": session_ref,
             "result": "existing" if execution.disposition == "existing" else state_map.get(execution.record.state, "existing"),
             "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
+            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
             "sessionIdDigest": session_id_digest, "reason": reason_code,
             "resetSessionIdDigest": hashlib.sha256(str(operation_meta.get("resetSessionId") or "").encode()).hexdigest()}
 
@@ -7755,7 +7773,6 @@ def session_actuate(
                     "candidateCount": len((snapshot.get("session") or {}).get("resetCandidates") or []),
                     "sample": ((snapshot.get("session") or {}).get("resetCandidates") or [])[:10],
                 }
-            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
             )
         return actions
     candidates = (snapshot.get("session") or {}).get("resetCandidates") or []
@@ -8071,6 +8088,7 @@ def gateway_restart(
         "component": "gateway", "action": "restart_gateway",
         "result": "existing" if execution.disposition == "existing" else state_to_result.get(state, "existing" if execution.disposition == "existing" else "blocked"),
         "reason": reason_code, "ledgerState": state, "ledgerDisposition": execution.disposition,
+            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
         "exitCode": operation_meta.get("exitCode"), "durationMs": operation_meta.get("durationMs"),
         "stderrOmitted": True, "stderrByteCount": operation_meta.get("stderrByteCount", 0),
         "blockedReason": "durable-authority-or-precheck-denied" if state == "blocked" else None,
@@ -8088,7 +8106,6 @@ def gateway_restart(
 def hermers_gateway_restart(
     conn: sqlite3.Connection, profile: str, unit: str, reason: str, *,
     policy: Optional[Dict[str, Any]] = None, snapshot_generation: str = "",
-            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
 ) -> Dict[str, Any]:
     action_id = f"hermers-gateway-restart-{hashlib.sha256(profile.encode()).hexdigest()[:12]}-{int(time.time())}"
     if not re.match(r"^[A-Za-z0-9_.@-]+$", profile):
@@ -8193,6 +8210,9 @@ def hermers_gateway_restart(
     rule = STANDING_RULES["hermes.gateway.restart"]
     def unit_is_explicitly_down() -> bool:
         try:
+            if mux_route is not None:
+                mux_route.verify(expected="unserved")
+                return True
             state = (read_hermes_native_state(native_route) if native_route is not None else systemctl_user_show(unit)).get("ActiveState")
             return state in {"inactive", "failed"}
         except Exception:
@@ -8211,6 +8231,7 @@ def hermers_gateway_restart(
     )
     try:
         native_route = resolve_hermes_native_route(profile, spec.action_type, spec.generation)
+        mux_route = resolve_hermes_mux_route(profile, spec.action_type, spec.generation) if native_route is None else None
     except Exception:
         return {"actionId": action_id, "result": "blocked", "profile": profile,
                 "unit": unit, "blockedReason": "hermes-qualified-native-source-drift"}
@@ -8260,6 +8281,7 @@ def hermers_gateway_restart(
     def operation(_spec: ActionSpec, record: Any) -> OperationResult:
         started = time.monotonic()
         proc = (run_user_cmd(list(native_route.argv("restart")), timeout=60) if native_route is not None
+                else run_hermes_mux_command(mux_route, "restart", timeout=60) if mux_route is not None
                 else run_hermes_profile_gateway_cmd(profile, "restart", timeout=60))
         operation_meta.update(exitCode=proc.returncode, durationMs=int((time.monotonic() - started) * 1000),
                               stderrByteCount=len(proc.stderr or ""))
@@ -8277,6 +8299,8 @@ def hermers_gateway_restart(
             if (latest.status != "clear" or latest.target_generation != scope.target_generation
                     or tuple(sorted(latest.affected_agents)) != tuple(sorted(scope.affected_agents))):
                 return PostcheckResult("unknown", "evidence://hermes-gateway-postcheck/owner-changed")
+            if mux_route is not None:
+                return PostcheckResult("verified", mux_route.verify(expected="served"))
             if native_route is not None:
                 ref = native_route.verify()
                 service = (read_hermes_native_state(native_route) if native_route is not None else systemctl_user_show(unit))
@@ -8317,8 +8341,9 @@ def hermers_gateway_restart(
             "action": "restart_hermers_gateway",
             "result": "existing" if execution.disposition == "existing" else state_map.get(execution.record.state, "existing" if execution.disposition == "existing" else "blocked"),
             "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
+            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
             "profile": profile, "unit": unit, "reason": reason,
-            "nativeRouteUsed": native_route is not None,
+            "nativeRouteUsed": native_route is not None, "muxRouteUsed": mux_route is not None,
             "exitCode": operation_meta.get("exitCode"), "durationMs": operation_meta.get("durationMs"),
             "stderrOmitted": True, "stderrByteCount": operation_meta.get("stderrByteCount", 0)}
 
@@ -8341,7 +8366,6 @@ def capture_resource_evidence(snapshot: Dict[str, Any], policy: Dict[str, Any], 
         "meminfo": command_probe(["cat", "/proc/meminfo"], timeout=3, max_chars=8_000),
         "memoryPressure": command_probe(["cat", "/proc/pressure/memory"], timeout=3, max_chars=4_000),
         "free": command_probe(["free", "-h"], timeout=3, max_chars=4_000),
-            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
         "gatewayService": command_probe(
             [
                 "systemctl",
@@ -8615,6 +8639,7 @@ def execute_hermers_profile_lifecycle(
 
     try:
         native_route = resolve_hermes_native_route(profile, spec.action_type, spec.generation)
+        mux_route = resolve_hermes_mux_route(profile, spec.action_type, spec.generation) if native_route is None else None
     except Exception:
         return {"actionId": action_id, "result": "blocked", "profile": profile,
                 "unit": unit, "blockedReason": "hermes-qualified-native-source-drift"}
@@ -8633,8 +8658,12 @@ def execute_hermers_profile_lifecycle(
                     or int(activity.get("activeRuntimeCount") or 0) > 0
                     or int(activity.get("activeDispatchCount") or 0) > 0):
                 return False, "active-or-unknown-workflow-activity", ""
-            service = (read_hermes_native_state(native_route) if native_route is not None else systemctl_user_show(unit))
-            active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
+            if mux_route is not None:
+                mux_route.verify(expected="served" if target_mode == "hibernate" else "unserved")
+                active = mux_route.last_residency == "served"
+            else:
+                service = (read_hermes_native_state(native_route) if native_route is not None else systemctl_user_show(unit))
+                active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
             if target_mode == "hibernate":
                 if not active:
                     return False, "profile-no-longer-active", ""
@@ -8667,6 +8696,7 @@ def execute_hermers_profile_lifecycle(
     def operation(_spec: ActionSpec, record: Any) -> OperationResult:
         started = time.monotonic()
         proc = (run_user_cmd(list(native_route.argv(action)), timeout=30) if native_route is not None
+                else run_hermes_mux_command(mux_route, action, timeout=30) if mux_route is not None
                 else run_hermes_profile_gateway_cmd(profile, action, timeout=30))
         operation_meta.update(exitCode=proc.returncode, durationMs=int((time.monotonic() - started) * 1000),
                               stderrByteCount=len(proc.stderr or ""))
@@ -8690,23 +8720,27 @@ def execute_hermers_profile_lifecycle(
                 return PostcheckResult("unknown", "evidence://hermes-profile-postcheck/scope-changed")
             if native_route is not None:
                 native_route.verify()
-            service = (read_hermes_native_state(native_route) if native_route is not None else systemctl_user_show(unit))
-            active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
-            active_state = service.get("ActiveState")
-            if not isinstance(active_state, str) or not active_state:
-                state = "unknown"
-            elif target_mode == "hot" and active:
+            if mux_route is not None:
+                ref = mux_route.verify(expected="unserved" if target_mode == "hibernate" else "served")
                 state = "verified"
-            elif target_mode == "hibernate" and not active and active_state == "inactive":
-                state = "verified"
-            elif active_state == "unknown":
-                state = "unknown"
             else:
-                state = "failed"
-            ref = "evidence://hermes-profile-postcheck/sha256/" + hashlib.sha256(
-                json.dumps({"active": active, "activeState": service.get("ActiveState"),
-                            "subState": service.get("SubState")}, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
+                service = (read_hermes_native_state(native_route) if native_route is not None else systemctl_user_show(unit))
+                active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
+                active_state = service.get("ActiveState")
+                if not isinstance(active_state, str) or not active_state:
+                    state = "unknown"
+                elif target_mode == "hot" and active:
+                    state = "verified"
+                elif target_mode == "hibernate" and not active and active_state == "inactive":
+                    state = "verified"
+                elif active_state == "unknown":
+                    state = "unknown"
+                else:
+                    state = "failed"
+                ref = "evidence://hermes-profile-postcheck/sha256/" + hashlib.sha256(
+                    json.dumps({"active": active, "activeState": service.get("ActiveState"),
+                                "subState": service.get("SubState")}, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
             if state == "verified" and _result.status == "complete" and target_mode == "hibernate":
                 db_set(conn, f"hermers_profile_mode:planned:{profile}",
                        {"profile": profile, "targetMode": target_mode, "unit": unit,
@@ -8726,10 +8760,11 @@ def execute_hermers_profile_lifecycle(
     return {"actionId": execution.record.action_id, "action": "set_hermers_profile_mode",
             "result": "existing" if execution.disposition == "existing" else state_map.get(execution.record.state, "existing"),
             "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
+            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
             "profile": profile, "unit": unit, "targetMode": target_mode,
             "operation": f"hermes-gateway-{action}",
-            "adapter": "native-systemd" if native_route is not None else "hermes-cli",
-            "nativeRouteUsed": native_route is not None,
+            "adapter": "native-systemd" if native_route is not None else "qualified-mux-cli" if mux_route is not None else "hermes-cli",
+            "nativeRouteUsed": native_route is not None, "muxRouteUsed": mux_route is not None,
             "exitCode": operation_meta.get("exitCode"), "durationMs": operation_meta.get("durationMs"),
             "stderrOmitted": True, "stderrByteCount": operation_meta.get("stderrByteCount", 0)}
 
@@ -8760,7 +8795,6 @@ def hermers_profile_mode_actuate(
             actions.append({"action": "set_hermers_profile_mode", "result": "blocked",
                             "profile": profile, "unit": unit, "targetMode": target_mode,
                             "blockedReason": "profile-not-in-lifecycle-allowlist"})
-            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
         elif item.get("activeWork"):
             actions.append({"action": "set_hermers_profile_mode", "result": "blocked",
                             "profile": profile, "unit": unit, "targetMode": target_mode,
@@ -9000,6 +9034,7 @@ def execute_hermers_process_signal(
     state_map = {"succeeded": "ok", "failed": "failed", "blocked": "blocked", "uncertain": "uncertain"}
     return {**base_result, "result": "existing" if execution.disposition == "existing" else state_map.get(execution.record.state, "existing"),
             "ledgerState": execution.record.state, "ledgerDisposition": execution.disposition,
+            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
             "capabilityEvidence": latest.get("capabilityEvidence"),
             "reason": result_box.get("reason") if execution.disposition == "executed" else None}
 
@@ -9034,7 +9069,6 @@ def verify_hermers_orphan_worker(
         return False, "worker-has-live-parent"
     identity_ok, identity_reason = _verify_captured_process_identity(pid, item or {})
     if not identity_ok:
-            "historicalExisting": execution.disposition == "existing", "authorizationReused": False,
         return False, identity_reason
     return True, "verified-orphan"
 

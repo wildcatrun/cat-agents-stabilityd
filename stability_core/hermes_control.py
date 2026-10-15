@@ -180,3 +180,73 @@ def profile_residency(identify: ControlObservation, status: ControlObservation,
     return {'profile': profile, 'residency': 'served' if profile in memberships[1] else 'unserved',
             'topology': 'multiplex-membership', 'peerPid': status.peer_pid,
             'channelReadiness': 'unknown', 'actionAuthorized': False}
+
+
+def send_profile_effect(socket_path: Path, verb: str, *, profile: str,
+                        expected_identity: dict, timeout: float = 2.0):
+    """Source-qualified SDK write on the SAME verified peer connection.
+
+    The governed adapter owns authorization/source qualification. This closed
+    transport cannot send host/service verbs or an arbitrary protocol payload.
+    An exception after send is uncertain, never permission to retry.
+    """
+    if (verb not in {'serve-profile', 'unserve-profile'} or type(profile) is not str
+            or not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', profile) or profile == 'default'
+            or not isinstance(expected_identity, dict) or expected_identity.get('status') != 'known'
+            or type(timeout) not in (int, float) or not 0 < timeout <= 2
+            or not hasattr(socket, 'SO_PEERCRED')):
+        raise ValueError('profile effect scope unavailable')
+    uid, expected_pid = expected_identity.get('uid'), expected_identity.get('pid')
+    if type(uid) is not int or type(expected_pid) is not int or expected_identity.get('euid') != uid:
+        raise ValueError('profile effect peer scope unavailable')
+    path = Path(socket_path)
+    identity = lambda s: (s.st_dev, s.st_ino, s.st_uid, s.st_mode, s.st_ctime_ns)
+    if not path.is_absolute() or '..' in path.parts:
+        raise ValueError('profile effect socket path refused')
+    parent_identity = lambda s: (s.st_dev, s.st_ino, s.st_uid, s.st_mode)
+    parents = []
+    for parent in path.parents:
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, uid} or info.st_mode & 0o022:
+            raise ValueError('profile effect socket parent refused')
+        parents.append((parent, parent_identity(info)))
+    before = path.lstat()
+    if not stat.S_ISSOCK(before.st_mode) or before.st_uid != uid or before.st_mode & 0o077:
+        raise ValueError('profile effect socket refused')
+    unchanged = lambda: identity(path.lstat()) == identity(before) and all(parent_identity(p.lstat()) == i for p, i in parents)
+    deadline = time.monotonic() + timeout
+    request_id = uuid.uuid4().hex
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(timeout); connection.connect(str(path))
+        pid, peer_uid, _gid = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        current = read_process_identity(pid)
+        if (pid != expected_pid or peer_uid != uid or not unchanged()
+                or not identities_match(expected_identity, current)[0]):
+            raise ValueError('profile effect connected peer changed')
+        connection.sendall(json.dumps(dict(verb=verb, id=request_id, protocol=1,
+            params={'name': profile})).encode() + b'\n')
+        raw = bytearray()
+        while b'\n' not in raw:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0: raise TimeoutError('profile effect deadline')
+            connection.settimeout(remaining)
+            part = connection.recv(min(8192, MAX_RESPONSE + 1 - len(raw)))
+            if not part: raise ValueError('profile effect truncated response')
+            raw.extend(part)
+            if len(raw) > MAX_RESPONSE: raise ValueError('profile effect response budget')
+        if (not unchanged() or time.monotonic() > deadline
+                or not identities_match(expected_identity, read_process_identity(pid))[0]):
+            raise ValueError('profile effect outcome instance uncertain')
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result: raise ValueError('duplicate profile effect response field')
+                result[key] = value
+            return result
+        answer = json.loads(raw, object_pairs_hook=unique,
+            parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite profile effect response')))
+        if (not isinstance(answer, dict) or answer.get('ok') is not True or type(answer.get('protocol')) is not int
+                or answer['protocol'] != 1 or answer.get('id') != request_id
+                or not isinstance(answer.get('result'), dict)):
+            raise ValueError('profile effect response schema unknown')
+        return answer['result']
