@@ -13,6 +13,14 @@ def _identity(info):
             info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
+def _directory_identity(info):
+    return (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
+
+
+def _observation_identity(info):
+    return _directory_identity(info) if stat.S_ISDIR(info.st_mode) else _identity(info)
+
+
 @dataclass(frozen=True)
 class ProfileLiveObservation:
     profile: str
@@ -68,7 +76,7 @@ def observe_profile_live(runtime_root, *, profile, owner_uid):
                 result = None
             else:
                 trusted(info)
-                result = _identity(info)
+                result = _observation_identity(info)
             observed.append((parent_fd, name, path, result))
             return result
 
@@ -78,24 +86,24 @@ def observe_profile_live(runtime_root, *, profile, owner_uid):
             fds.append(fd)
             info = os.fstat(fd)
             trusted(info, directory=True)
-            if _identity(info) != _identity(path.lstat()):
+            if _directory_identity(info) != _directory_identity(path.lstat()):
                 raise ValueError('profile live directory drift')
-            directories.append((fd, path, _identity(info)))
+            directories.append((fd, path, _directory_identity(info)))
             return fd
 
         def fence():
             for fd, path, expected in directories:
-                if _identity(os.fstat(fd)) != expected or _identity(path.lstat()) != expected:
+                if _directory_identity(os.fstat(fd)) != expected or _directory_identity(path.lstat()) != expected:
                     raise ValueError('profile live directory drift')
             for fd, name, path, expected in observed:
                 try:
-                    current = _identity(os.stat(name, dir_fd=fd, follow_symlinks=False))
+                    current = _observation_identity(os.stat(name, dir_fd=fd, follow_symlinks=False))
                 except FileNotFoundError:
                     current = None
                 if current != expected:
                     raise ValueError('profile live metadata drift')
                 try:
-                    current_path = _identity(path.lstat())
+                    current_path = _observation_identity(path.lstat())
                 except FileNotFoundError:
                     current_path = None
                 if current_path != expected:

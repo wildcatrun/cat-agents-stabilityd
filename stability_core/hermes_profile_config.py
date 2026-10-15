@@ -50,13 +50,14 @@ def read_profile_config(home: Path, *, profile: str, runtime_root: Path, owner_u
         raise ValueError('profile home route refused')
     path = home / 'config.yaml'
     identity = lambda s: (s.st_dev, s.st_ino, s.st_uid, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    directory_identity = lambda s: (s.st_dev, s.st_ino, s.st_uid, s.st_mode)
     ancestors = []
     for parent in path.parents:
         info = parent.lstat()
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, owner_uid}
                 or info.st_mode & 0o022):
             raise ValueError('profile config ancestor refused')
-        ancestors.append((parent, identity(info)))
+        ancestors.append((parent, directory_identity(info)))
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
@@ -101,6 +102,6 @@ def read_profile_config(home: Path, *, profile: str, runtime_root: Path, owner_u
     except Exception:
         raise ValueError('profile config interpretation refused') from None
     if (identity(path.lstat()) != identity(before)
-            or any(identity(parent.lstat()) != expected for parent, expected in ancestors)):
+            or any(directory_identity(parent.lstat()) != expected for parent, expected in ancestors)):
         raise ValueError('profile config scope drift')
     return ProfileConfigEvidence(home, profile, hashlib.sha256(raw).hexdigest(), identity(before), standalone, retired)

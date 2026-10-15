@@ -21,6 +21,29 @@ class ProfileConfigTests(unittest.TestCase):
         self.path.chmod(0o600)
         return read_profile_config(self.home, profile='fixture', runtime_root=self.root, owner_uid=os.getuid())
 
+    def test_unrelated_directory_creation_during_read_preserves_config(self):
+        original=os.read;changed=False
+        def read(fd,size):
+            nonlocal changed
+            raw=original(fd,size)
+            if not changed:(self.home/'unrelated-dir').mkdir();changed=True
+            return raw
+        with mock.patch('os.read',side_effect=read): evidence=self.read('gateway:\n  standalone: true\n')
+        self.assertTrue(changed);self.assertTrue(evidence.standalone)
+
+    def test_ancestor_mode_change_during_read_still_refused(self):
+        original=os.read;changed=False
+        def read(fd,size):
+            nonlocal changed
+            raw=original(fd,size)
+            if not changed:self.home.chmod(0o777);changed=True
+            return raw
+        try:
+            with mock.patch('os.read',side_effect=read):
+                with self.assertRaises(ValueError):self.read('gateway:\n  standalone: true\n')
+        finally:self.home.chmod(0o700)
+        self.assertTrue(changed)
+
     def test_standalone_matches_installed_boolean_tokens(self):
         for value, expected in (('true', True), ('false', False), ('null', False), ('"true"', True),
                                 ('" ON "', True), ('"yes"', True), ('1', True), ('0', False),

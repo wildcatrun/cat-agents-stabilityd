@@ -21,6 +21,17 @@ class ProfileLiveTests(unittest.TestCase):
     def observe(self):
         return observe_profile_live(self.root, profile='fixture', owner_uid=os.getuid())
 
+    def test_unrelated_directory_creation_during_observation_is_not_owner_drift(self):
+        original=os.fstat;changed=False;home_inode=self.home.stat().st_ino
+        def observed(fd):
+            nonlocal changed
+            info=original(fd)
+            if info.st_ino==home_inode and not changed:
+                (self.home/'unrelated-dir').mkdir();changed=True
+            return info
+        with mock.patch('os.fstat',side_effect=observed): evidence=self.observe()
+        self.assertTrue(changed);self.assertTrue(evidence.live)
+
     def test_actual_markers_are_stat_only_no_secret_or_authority(self):
         with mock.patch('os.read', side_effect=AssertionError('content read forbidden')):
             result = self.observe()

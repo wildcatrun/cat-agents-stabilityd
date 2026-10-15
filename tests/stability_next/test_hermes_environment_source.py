@@ -8,6 +8,35 @@ class EnvironmentSourceTests(unittest.TestCase):
         tmp=tempfile.TemporaryDirectory(dir=Path.home());self.addCleanup(tmp.cleanup)
         self.root=Path(tmp.name);self.path=self.root/'.env'
     def read(self,**kw):return read_environment_source(self.path,owner_uid=os.getuid(),**kw)
+    def test_unrelated_directory_creation_during_read_preserves_source(self):
+        self.path.write_text('KEY=fixture\n'); original=os.read; changed=False
+        def read(fd,size):
+            nonlocal changed
+            data=original(fd,size)
+            if not changed: (self.root/'unrelated-dir').mkdir();changed=True
+            return data
+        with mock.patch('os.read',side_effect=read): evidence=self.read()
+        self.assertTrue(changed);self.assertTrue(evidence.present)
+        self.assertEqual(evidence.sha256,hashlib.sha256(b'KEY=fixture\n').hexdigest())
+
+    def test_directory_replacement_and_symlink_during_read_refused(self):
+        for kind in ('replace','symlink'):
+            with self.subTest(kind=kind):
+                scope=self.root/kind;scope.mkdir();path=scope/'.env';path.write_text('KEY=fixture\n')
+                original=os.read;changed=False
+                def read(fd,size):
+                    nonlocal changed
+                    data=original(fd,size)
+                    if not changed:
+                        retired=self.root/(kind+'-retired');scope.rename(retired)
+                        if kind=='replace':scope.mkdir();(scope/'.env').write_text('KEY=fixture\n')
+                        else:scope.symlink_to(retired,target_is_directory=True)
+                        changed=True
+                    return data
+                with mock.patch('os.read',side_effect=read):
+                    with self.assertRaises(ValueError):read_environment_source(path,owner_uid=os.getuid())
+                self.assertTrue(changed)
+
     def test_digest_without_values(self):
         self.path.write_text('SECRET=synthetic-private\n');self.path.chmod(0o600)
         evidence=self.read();self.assertTrue(evidence.present)
