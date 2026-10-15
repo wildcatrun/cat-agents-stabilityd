@@ -178,12 +178,28 @@ class DisasterRecoveryTests(unittest.TestCase):
 
         spec = self.spec(key=idempotency_key)
         action_id = ActionLedger.stable_action_id(idempotency_key)
-        with ActionLedger(self.path) as recovered:
-            record = recovered.get(action_id)
-            self.assertIsNotNone(record)
-            self.assertEqual(record.state, "executing")
-            retry = self.executor(recovered).execute(spec)
-            self.assertEqual((retry.disposition, retry.record.state), ("existing", "executing"))
+        callback_hits = []
+        def forbidden(*_):
+            callback_hits.append(True)
+            self.fail("unreconciled crash recovery must not invoke callbacks")
+        versions = []
+        for _ in range(2):
+            with ActionLedger(self.path) as recovered:
+                record = recovered.get(action_id)
+                self.assertIsNotNone(record)
+                self.assertEqual(record.state, "executing")
+                executor = ActionExecutor(
+                    recovered, authorizer=forbidden, precheck=forbidden,
+                    operation=forbidden, postcheck=forbidden, clock_ms=lambda: 1_000_000,
+                )
+                retry = executor.execute(spec)
+                self.assertEqual((retry.disposition, retry.record.state), ("existing", "executing"))
+                self.assertEqual(retry.record.action_id, action_id)
+                versions.append(retry.record.version)
+        # Executor exception handling must not swallow a forbidden invocation
+        # and make an early-return assertion appear to pass.
+        self.assertEqual(callback_hits, [])
+        self.assertEqual(versions[0], versions[1])
 
         self.assertEqual(marker_path.read_text(encoding="utf-8"), "effect\n")
         self.assertEqual(self.effects, [])
