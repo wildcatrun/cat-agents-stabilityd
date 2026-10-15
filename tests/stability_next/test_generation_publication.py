@@ -54,6 +54,30 @@ SPEC.loader.exec_module(stabilityd)
 
 
 class GenerationPublicationTests(unittest.TestCase):
+    def test_other_parent_replaced_during_later_sidecar_preserves_latest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first, second = root / 'first', root / 'second'
+            first.mkdir(); second.mkdir()
+            latest = root / 'latest.json'
+            latest.write_text('{"generationId":"old"}\n')
+            a, b = first / 'a.json', second / 'b.json'
+            original = generation.write_json_atomic
+            def write(path, payload, **kwargs):
+                if path == b:
+                    prior_bytes = a.read_bytes()
+                    first.rename(root / 'retired')
+                    first.mkdir()
+                    a.write_bytes(prior_bytes)
+                return original(path, payload, **kwargs)
+            with mock.patch.object(generation, 'write_json_atomic', side_effect=write):
+                with self.assertRaisesRegex(OSError, 'directory identity changed'):
+                    generation.publish_generation({'generationId':'new'},
+                        [(a, {'generationId':'new'}), (b, {'generationId':'new'})], latest)
+            self.assertTrue(b.is_file())
+            self.assertEqual(a.read_bytes(), (root / 'retired/a.json').read_bytes())
+            self.assertEqual(json.loads(latest.read_text())['generationId'], 'old')
+
     def test_json_encoding_failure_preserves_old_pointer_and_cleans_temp(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'latest.json'

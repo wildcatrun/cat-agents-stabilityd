@@ -133,9 +133,13 @@ def publish_generation(
             identities[parent] = check.identity
             fences[parent] = check
         artifact_metas = []
+        for check in checks:
+            check()
         for path, payload, parent in artifacts:
-            for check in checks:
-                check()
+            # Each writer fences its own directory throughout replacement.
+            # Recheck the whole batch before any latest commit, so an unrelated
+            # directory replacement still refuses publication without repeating
+            # every other parent's metadata checks before each sidecar.
             artifact_metas.append(write_json_atomic(path, payload, directory_identity=identities[parent], _sync_directory=False, _parent_fence=fences[parent], compact=compact_sidecars))
         for check in checks:
             check()
