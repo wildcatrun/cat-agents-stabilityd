@@ -109,7 +109,20 @@ def mux_fixture(served=True, with_socket=True, discovery_absent=False):
             (package / '__init__.py', gateway_package / '__init__.py',
              package / 'main.py', package / 'profiles.py', package / 'gateway.py',
              package / 'gateway_profile_lifecycle.py', gateway_package / 'control_socket.py', f.root / 'hermes_constants.py'))
-        bridge = Path(routes.__file__).with_name('hermes_mux_bridge.py')
+        # The isolated QA checkout is read-only and owned by its host UID, not
+        # DynamicUser. Deploy the exact candidate helpers into this fixture's
+        # private owned plugin root; retain production ownership checks.
+        candidate_core = Path(routes.__file__).parent
+        plugin_root = f.root / 'fixture-plugin'; plugin_root.mkdir(mode=0o700)
+        private_core = plugin_root / 'stability_core'; private_core.mkdir(mode=0o700)
+        for original in candidate_core.glob('*.py'):
+            copied = private_core / original.name
+            raw = original.read_bytes(); copied.write_bytes(raw); copied.chmod(0o600)
+            if hashlib.sha256(copied.read_bytes()).digest() != hashlib.sha256(raw).digest():
+                raise AssertionError('fixture candidate helper copy changed')
+        bridge = private_core / 'hermes_mux_bridge.py'
+        if hashlib.sha256(bridge.read_bytes()).hexdigest() != BRIDGE_SHA256:
+            raise AssertionError('fixture bridge differs from reviewed candidate')
         identity = read_process_identity(os.getpid())
         q = routes.MuxQualification(os.getuid(), f.q.runtime_root, 'catbody', Path(f.q.argv[0]),
             f.q.executable_sha256, cli, hashlib.sha256(base.SOURCES['main.py'].encode()).hexdigest(), f.q.sources + extra_sources,
@@ -146,6 +159,29 @@ def mux_fixture(served=True, with_socket=True, discovery_absent=False):
 
 
 class MuxScopeTests(unittest.TestCase):
+    def test_private_plugin_copy_preserves_candidate_bytes_and_owned_reader_boundary(self):
+        with mux_fixture(with_socket=False) as f:
+            bridge = f.qualification.bridge_entry
+            candidate_core = Path(routes.__file__).parent
+            self.assertEqual(routes._read_program_source(bridge, owner_uid=os.getuid())[1], BRIDGE_SHA256)
+            for original in candidate_core.glob('*.py'):
+                copied = bridge.parent / original.name
+                self.assertEqual(copied.read_bytes(), original.read_bytes())
+                self.assertEqual(copied.stat().st_uid, os.getuid())
+            # Model the R36 foreign-owned checkout ancestor without chown or
+            # privileges. A foreign UID must still fail before source reading.
+            real_lstat = Path.lstat
+            foreign_parent = bridge.parent.parent
+            def foreign_owner(path, *args, **kwargs):
+                info = real_lstat(path, *args, **kwargs)
+                if path == foreign_parent:
+                    fields = list(info); fields[4] = os.getuid() + 100001
+                    return os.stat_result(fields)
+                return info
+            with mock.patch.object(Path, 'lstat', foreign_owner):
+                with self.assertRaisesRegex(ValueError, 'native source parent untrusted'):
+                    routes._read_program_source(bridge, owner_uid=os.getuid())
+
     def test_unknown_context_preserves_existing_path(self):
         with mock.patch.object(routes, 'MUX_QUALIFICATION', None):
             self.assertIsNone(base.daemon.resolve_hermes_mux_route('catbody', 'hermes.profile.lifecycle', 'boot'))
