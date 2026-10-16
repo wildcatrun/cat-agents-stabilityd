@@ -59,6 +59,14 @@ def _digest(value):
     return value
 
 
+def _render_template(value, values):
+    if type(value) is not str:
+        raise ValueError('installation template type refused')
+    # Only the three declared routing placeholders are templates. Literal
+    # braces in a fixed argv element (e.g. Python -c code) are ordinary bytes.
+    return re.sub(r'\{(profile|home|runtime_root)\}',lambda match:values[match[1]],value)
+
+
 def _unique(items):
     result={}
     for key,value in items:
@@ -183,8 +191,7 @@ class InstallationFactory:
             sources=self._sources(contract,code)
             values={'profile':profile,'home':str(home),'runtime_root':str(root)}
             def render(value):
-                if type(value) is not str:raise ValueError('installation template type refused')
-                return value.format_map(values)
+                return _render_template(value,values)
             common=dict(owner_uid=item['ownerUid'],runtime_root=root,target_profile=profile,
                         sources=sources,provenance_ref='evidence://installation-contract/'+contract['id'])
             if kind=='native':
@@ -201,7 +208,12 @@ class InstallationFactory:
                 boot=self._boot_reader()
                 if type(boot) is not str or request.generation!=request.node_id+':'+boot.lower():
                     raise ValueError('installation boot generation changed')
-                peer_argv=tuple(render(v) for v in item['muxPeerArgv'])
+                # Peer argv is an exact launch declaration, never a template:
+                # even a literal '{profile}' inside -c code must stay intact.
+                peer_argv=tuple(item['muxPeerArgv'])
+                if (not 1<=len(peer_argv)<=64 or any(type(v) is not str or not v
+                        or len(v)>65536 or '\x00' in v for v in peer_argv)):
+                    raise ValueError('installation peer argv refused')
                 q=MuxQualification(**common,interpreter_entry=_path(item['interpreterEntry']),
                     interpreter_sha256=_digest(item['interpreterSha256']),cli_entry=_path(item['cliEntry']),
                     cli_sha256=_digest(item['cliSha256']),

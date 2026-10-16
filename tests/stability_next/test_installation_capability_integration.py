@@ -48,6 +48,30 @@ def assembled_fixture(change=None):
 
 
 class InstallationCapabilityIntegrationTests(unittest.TestCase):
+    def test_literal_argv_braces_are_not_routing_placeholders(self):
+        values=dict(profile='fixture',home='/fixture/home',runtime_root='/fixture/runtime')
+        literal="print({'ids': ids, 'count': len(ids), 'flags': {1, 2}})"
+        self.assertEqual(installation._render_template(literal,values),literal)
+        self.assertEqual(installation._render_template('{home}/{profile}:{runtime_root}',values),
+                         '/fixture/home/fixture:/fixture/runtime')
+        self.assertEqual(installation._render_template('{unknown}',values),'{unknown}')
+        # Replacement paths containing braces are not expanded a second time.
+        self.assertEqual(installation._render_template('{home}',dict(values,home='/fixture/{profile}')),
+                         '/fixture/{profile}')
+        from test_hermes_mux_route_integration import mux_fixture
+        with mux_fixture(with_socket=False) as fixture:
+            factory=fixture.installation_factory
+            layout=factory._manifest['installations'][0]
+            layout['muxPeerArgv']=['/fixture/python','-c',literal+"; print('{profile}')"]
+            factory._boot_reader=lambda:'fixture-boot'
+            request=EffectRequest('hermes.profile.lifecycle',EffectOperation.HERMES_CLI,
+                'hermes-profile:catbody',layout['nodeId'],layout['nodeId']+':fixture-boot')
+            decision=factory.hermes(request,fixture.registry,'catbody')
+            self.assertEqual(decision.status,'supported-mux',decision)
+            expected=hashlib.sha256(b'\0'.join(token.encode() for token in layout['muxPeerArgv'])+b'\0').hexdigest()
+            self.assertEqual(decision.qualification.peer_cmdline_digest,expected)
+            self.assertFalse(decision.action_authorized)
+
     def test_owned_contract_factory_connects_actual_native_restart_without_qualification_globals(self):
         with assembled_fixture() as (f,factory,path):
             result=base.NativeIntegrationTests().restart()
