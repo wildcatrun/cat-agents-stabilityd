@@ -17,6 +17,11 @@ SPEC.loader.exec_module(stabilityd)
 
 
 class SessionActuatorTests(unittest.TestCase):
+    def setUp(self):
+        from clock_fixture_support import install_clock_fixture
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        install_clock_fixture(self, stabilityd, Path(tmp.name)/'actuation.lock')
+
     def test_handler_entry_receipt_completes_actual_governed_reset_and_persists_only_digests(self):
         from test_effect_capability_session_integration import qualified_session_fixture, sdk_reply, api
         key, session_id = 'agent:cat_voice:fixture:private-channel', 'private-stable-session-id'
@@ -58,7 +63,10 @@ class SessionActuatorTests(unittest.TestCase):
             for sentinel in (key, session_id, 'SYNTHETIC_PRIVATE_ENTRY'):
                 self.assertNotIn(sentinel, str(first))
                 self.assertNotIn(sentinel.encode(), path.read_bytes())
-            self.assertEqual(conn.execute('SELECT COUNT(*) FROM kv').fetchone()[0], 1)
+            import sqlite3
+            with sqlite3.connect(path) as stored:
+                self.assertEqual(stored.execute('SELECT COUNT(*) FROM kv').fetchone()[0], 1)
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM kv').fetchone()[0], 0)
 
     def test_actual_handler_entry_receipt_is_normalized_without_session_payload(self):
         key = 'agent:cat_voice:fixture'

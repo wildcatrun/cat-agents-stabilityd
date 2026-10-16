@@ -23,6 +23,8 @@ class ProtectionActuatorTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         root = Path(temp.name).resolve()
+        from clock_fixture_support import install_clock_fixture
+        install_clock_fixture(self,stabilityd,root/'actuation.lock')
         binary = root / 'fixture-runtime'
         binary.write_bytes(b'synthetic-runtime-executable')
         binary.chmod(0o700)
@@ -40,6 +42,11 @@ class ProtectionActuatorTests(unittest.TestCase):
                       mock.patch.object(stabilityd, 'read_gateway_unit_properties', return_value=properties)):
             patch.start()
             self.addCleanup(patch.stop)
+
+    def timing_receipts(self):
+        import sqlite3, json
+        with sqlite3.connect(stabilityd.STATE_DB) as conn:
+            return {key:json.loads(value) for key,value in conn.execute('SELECT key,value FROM kv')}
 
     def test_hermes_process_reap_fails_closed_when_owner_scope_unknown(self):
         process = {
@@ -141,6 +148,7 @@ class ProtectionActuatorTests(unittest.TestCase):
              mock.patch.object(stabilityd, "run_cmd", return_value=success) as run_cmd:
             first = stabilityd.actuate(mock.Mock(), snapshot, policy)
             second = stabilityd.actuate(mock.Mock(), snapshot, policy)
+            receipts = self.timing_receipts()
 
         self.assertEqual(first[0]["ledgerState"], "succeeded")
         self.assertEqual(first[0]["result"], "ok")
@@ -149,7 +157,9 @@ class ProtectionActuatorTests(unittest.TestCase):
         self.assertTrue(second[0]["historicalExisting"])
         self.assertFalse(second[0]["authorizationReused"])
         run_cmd.assert_called_once()
-        cooldown.assert_called_once()
+        cooldown.assert_not_called()  # mirror now shares terminal transaction
+        self.assertGreater(receipts['stabilityd_last_gateway_restart_at'], 0)
+        self.assertEqual(len(receipts['stabilityd_gateway_restart_history']), 1)
         health.assert_called_once()
 
     def test_hermes_gateway_restart_requires_live_registry_scope(self):
@@ -204,12 +214,15 @@ class ProtectionActuatorTests(unittest.TestCase):
             second = stabilityd.hermers_gateway_restart(
                 mock.Mock(), profile, unit, reason, policy=policy, snapshot_generation="fixture-gen",
             )
+            receipts = self.timing_receipts()
         self.assertEqual(first["ledgerState"], "succeeded")
         self.assertEqual(first["result"], "ok")
         self.assertEqual(second["ledgerDisposition"], "existing")
         self.assertEqual(run_cmd.call_count, 2)  # one restart plus its status postcheck
-        state_write.assert_called_once()
-        history_write.assert_called_once()
+        state_write.assert_not_called()
+        history_write.assert_not_called()
+        self.assertGreater(receipts['hermers_gateway_restart:catbody'], 0)
+        self.assertEqual(len(receipts['stabilityd_hermers_gateway_restart_history']), 1)
 
     def test_hermes_gateway_restart_pending_receipt_stays_uncertain_despite_healthy_status(self):
         registry = {"source": "db", "writeEligible": True, "records": [{
@@ -309,7 +322,7 @@ class ProtectionActuatorTests(unittest.TestCase):
                      SimpleNamespace(returncode=0, stdout=status_line, stderr=""),
                  ]) as run_cmd:
                 action = stabilityd.hermers_gateway_restart(
-                    mock.Mock(), profile, unit, reason, policy=policy, snapshot_generation="fixture-gen",
+                    mock.Mock(), profile, unit, reason, policy=dict(policy), snapshot_generation="fixture-gen",
                 )
             self.assertEqual(action["ledgerState"], "failed")
             self.assertEqual(action["result"], "failed")
@@ -398,11 +411,14 @@ class ProtectionActuatorTests(unittest.TestCase):
             second = stabilityd.execute_hermers_profile_lifecycle(
                 mock.Mock(), profile, item, "hibernate", policy, "fixture-generation",
             )
+            receipts = self.timing_receipts()
         self.assertEqual(first["ledgerState"], "succeeded")
         self.assertEqual(first["result"], "ok")
         self.assertEqual(second["ledgerDisposition"], "existing")
         run_cmd.assert_called_once()
-        self.assertEqual(state_write.call_count, 2)
+        state_write.assert_not_called()
+        self.assertGreater(receipts['hermers_profile_mode:catbody:hibernate'],0)
+        self.assertEqual(receipts['hermers_profile_mode:planned:catbody']['targetMode'],'hibernate')
 
     def test_hermes_profile_stop_pending_receipt_stays_uncertain_despite_inactive_unit(self):
         profile = "catbody"
@@ -532,9 +548,12 @@ class ProtectionActuatorTests(unittest.TestCase):
             action = stabilityd.execute_hermers_profile_lifecycle(
                 mock.Mock(), profile, item, "hibernate", policy, "fixture-generation",
             )
+            receipts = self.timing_receipts()
         self.assertEqual(action["ledgerState"], "failed")
         self.assertEqual(action["result"], "failed")
-        self.assertEqual(state_write.call_count, 1)  # attempt cooldown only
+        state_write.assert_not_called()
+        self.assertGreater(receipts['hermers_profile_mode:catbody:hibernate'],0)
+        self.assertNotIn('hermers_profile_mode:planned:catbody',receipts)
         self.assertFalse(any('planned:' in str(call.args[1]) for call in state_write.call_args_list))
 
 

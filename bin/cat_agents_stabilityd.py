@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import contextvars
+import threading
 import copy
 import datetime as dt
 import errno
@@ -6412,10 +6414,17 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         mode = "resource-pressure"
 
     now_s = epoch()
+    timing = mechanical_timing_projection(conn)
     last_restart = int(db_get(conn, "stabilityd_last_gateway_restart_at", 0) or 0)
     cooldown_until = last_restart + RESTART_COOLDOWN_SECONDS if last_restart else 0
     cooldown_active = cooldown_until > now_s
     restart_history = recent_restart_history(conn)
+    if timing is not None:
+        remaining = timing['windows'].get('openclaw.gateway',0)
+        cooldown_until = now_s + (remaining+999)//1000 if remaining else 0
+        cooldown_active = remaining > 0
+        restart_history = [now_s-RESTART_WINDOW_SECONDS+(ms+999)//1000
+                           for ms in timing['history'].get('openclaw.gateway.history',[])]
     restart_storm = len(restart_history) >= MAX_RESTARTS_PER_WINDOW
     restart_storm_clears_at = min(restart_history) + RESTART_WINDOW_SECONDS if restart_storm and restart_history else 0
     if restart_storm:
@@ -6444,6 +6453,15 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
     hermers_cooldown_until = hermers_last_restart + RESTART_COOLDOWN_SECONDS if hermers_last_restart else 0
     hermers_cooldown_active = hermers_cooldown_until > now_s
     hermers_restart_history = recent_hermers_gateway_restart_history(conn)
+    if timing is not None:
+        hermers_restart_history = [{'tsEpoch':now_s-RESTART_WINDOW_SECONDS+(ms+999)//1000, 'profile':''}
+                                  for ms in timing['history'].get('hermes.gateway.history',[])]
+        waiting = [timing['windows'].get('hermes.gateway:'+item['profile'],0)
+                   for item in hermers_gateway_restart_profiles]
+        hermers_cooldown_active = bool(waiting and all(ms>0 for ms in waiting))
+        hermers_cooldown_until = now_s+(min(waiting)+999)//1000 if hermers_cooldown_active else 0
+        hermers_gateway_restart_profiles = [item for item in hermers_gateway_restart_profiles
+                                           if timing['windows'].get('hermes.gateway:'+item['profile'],0)==0]
     hermers_restart_storm = len(hermers_restart_history) >= MAX_RESTARTS_PER_WINDOW
     hermers_restart_candidate = bool(hermers_gateway_restart_profiles and hot(streaks, "hermers_gateway_service_down"))
     hermers_restart_remaining = max(0, MAX_RESTARTS_PER_WINDOW - len(hermers_restart_history))
@@ -6602,6 +6620,9 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
     )
     policy = {
         "schemaVersion": 1,
+        "clockDiscipline": {"state": "available" if timing is not None else "unavailable-or-quarantined",
+                            "epoch": timing['epoch'] if timing is not None else None,
+                            "executionFence": "required-for-time-dependent-effects"},
         "updatedAt": ts(),
         "updatedAtEpoch": now_s,
         "validUntilEpoch": now_s + POLICY_TTL_SECONDS,
@@ -7544,11 +7565,6 @@ def reset_session(
     expected_session_id: Optional[str] = None, expected_store_path: Optional[Path] = None,
     rpc_launcher: Any = None,
 ) -> Dict[str, Any]:
-    session_key_digest = hashlib.sha256(str(session_key).encode("utf-8")).hexdigest()
-    last_key = f"session_reset:sha256:{session_key_digest}"
-    last_reset = int(db_get(conn, last_key, 0) or 0)
-    if last_reset and epoch() - last_reset < SESSION_RESET_COOLDOWN_SECONDS:
-        return {"result": "cooldown_skip"}
     agent_id = session_key_agent_id(session_key)
     if not agent_id or not expected_session_id:
         return {"result": "target-generation-required"}
@@ -7558,7 +7574,6 @@ def reset_session(
     )
     if status != "ok" or not isinstance(current, dict):
         return {"result": "gateway-reset-failed", "errorClass": status}
-    db_set(conn, last_key, epoch())
     return {"result": "reset", "sessionId": current.get("sessionId")}
 
 
@@ -7673,7 +7688,6 @@ def governed_reset_session(
     reason_code = "context_overflow" if reason == "context_overflow" else "repeated_failures"
     policy_digest, policy_ref = policy_reference(policy)
     rule = STANDING_RULES["openclaw.session.reset"]
-    last_key = f"session_reset:sha256:{session_key_digest}"
     spec = ActionSpec(
         idempotency_key=(f"openclaw.session.reset:{session_key_digest}:{session_id_digest}:{generation}:"
                          f"{int(epoch() // max(1, SESSION_RESET_COOLDOWN_SECONDS))}"),
@@ -7735,9 +7749,6 @@ def governed_reset_session(
         supported, receipt, _cli = capability()
         if not supported:
             return BoundaryCheck("rejected", "evidence://openclaw-session-api/unqualified")
-        last = int(db_get(conn, last_key, 0) or 0)
-        if last and epoch() - last < SESSION_RESET_COOLDOWN_SECONDS:
-            return BoundaryCheck("rejected", "evidence://openclaw-session-scope/cooldown")
         return BoundaryCheck("approved", receipt.evidence_ref)
 
     operation_meta: Dict[str, Any] = {}
@@ -7828,7 +7839,84 @@ def session_actuate(
     return actions
 
 
-def execute_governed_effect(
+_CLOCK_ACTIONS = frozenset({'openclaw.gateway.restart', 'hermes.gateway.restart',
+                            'openclaw.session.reset', 'hermes.profile.lifecycle'})
+_ACTUATION_CONTEXT = contextvars.ContextVar('stabilityd_actuation_context', default=None)
+
+
+@contextlib.contextmanager
+def governed_actuation_context():
+    identity = (os.getpid(), threading.get_ident(), str(ACTUATION_LOCK_PATH.resolve()))
+    if _ACTUATION_CONTEXT.get() == identity:
+        yield
+        return
+    with ActuationLock(ACTUATION_LOCK_PATH):
+        token = _ACTUATION_CONTEXT.set(identity)
+        try:
+            yield
+        finally:
+            _ACTUATION_CONTEXT.reset(token)
+
+
+def daemon_clock(conn):
+    from stability_core.daemon_clock import DaemonClock
+    return DaemonClock(conn, restart_ms=RESTART_COOLDOWN_SECONDS*1000,
+        restart_window_ms=RESTART_WINDOW_SECONDS*1000, session_ms=SESSION_RESET_COOLDOWN_SECONDS*1000,
+        lifecycle_ms=HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS*1000,
+        max_restarts=MAX_RESTARTS_PER_WINDOW)
+
+
+def mechanical_timing_projection(conn):
+    """Display/admission projection only; executor independently rechecks clocks.
+
+    Failure does not disable time-independent pressure relief. Timing effects
+    still require healthy clock proof at their two actual execution boundaries.
+    """
+    owned = not conn.in_transaction
+    original_sync = None
+    savepoint = False
+    try:
+        if owned:
+            original_sync = conn.execute('PRAGMA synchronous').fetchone()[0]
+            if original_sync != 2: conn.execute('PRAGMA synchronous=FULL')
+            conn.execute('BEGIN IMMEDIATE')
+        else:
+            conn.execute('SAVEPOINT stability_clock_projection')
+            savepoint = True
+        clock = daemon_clock(conn)
+        proof = clock.observe()
+        if not proof.usable:
+            if owned: conn.commit()
+            else: conn.execute('RELEASE stability_clock_projection')
+            return None
+        windows = {r[0]: max(0, r[1]-proof.mono_ms) for r in conn.execute('SELECT scope,deadline FROM stability_clock_windows')}
+        history = {}
+        for scope, deadline in conn.execute('SELECT scope,deadline FROM stability_clock_history WHERE deadline>?', (proof.mono_ms,)):
+            history.setdefault(scope, []).append(deadline-proof.mono_ms)
+        if owned: conn.commit()
+        else: conn.execute('RELEASE stability_clock_projection')
+        return {'windows':windows, 'history':history, 'epoch':proof.epoch}
+    except Exception:
+        if owned and conn.in_transaction: conn.rollback()
+        elif savepoint and conn.in_transaction:
+            conn.execute('ROLLBACK TO stability_clock_projection')
+            conn.execute('RELEASE stability_clock_projection')
+        return None
+    finally:
+        if original_sync is not None and original_sync != 2 and not conn.in_transaction:
+            conn.execute('PRAGMA synchronous='+str(int(original_sync)))
+
+
+def execute_governed_effect(spec, policy, *, eligibility_evidence, precheck, operation, postcheck):
+    if spec.action_type in _CLOCK_ACTIONS:
+        with governed_actuation_context():
+            return _execute_governed_effect_locked(spec, policy, eligibility_evidence=eligibility_evidence,
+                precheck=precheck, operation=operation, postcheck=postcheck)
+    return _execute_governed_effect_locked(spec, policy, eligibility_evidence=eligibility_evidence,
+        precheck=precheck, operation=operation, postcheck=postcheck)
+
+
+def _execute_governed_effect_locked(
     spec: ActionSpec,
     policy: Dict[str, Any],
     *,
@@ -7874,9 +7962,25 @@ def execute_governed_effect(
         source=spec.source, clock_ms=lambda: epoch() * 1000,
     )
     with ActionLedger(STATE_DB) as ledger:
+        timing_evidence = policy.get('clockDiscipline')
+        policy_clock_epoch = (timing_evidence.get('epoch')
+                              if isinstance(timing_evidence, dict)
+                              and timing_evidence.get('state') == 'available'
+                              and timing_evidence.get('executionFence') == 'required-for-time-dependent-effects'
+                              else None)
+        def timing_check(connection, spec_, record, phase):
+            if not isinstance(policy_clock_epoch, str) or not policy_clock_epoch:
+                return False
+            clock = daemon_clock(connection)
+            allowed, proof = clock.check(spec_, policy_clock_epoch)
+            return allowed
+        def effect_timing(connection, spec_, record, result):
+            daemon_clock(connection).effect(spec_, record)
+        timing_hooks = ({'timing_check': timing_check, 'effect_timing': effect_timing}
+                        if spec.action_type in _CLOCK_ACTIONS else {})
         executor = ActionExecutor(
             ledger, authorizer=authorizer, precheck=precheck, operation=operation,
-            postcheck=postcheck, clock_ms=lambda: epoch() * 1000,
+            postcheck=postcheck, clock_ms=lambda: epoch() * 1000, **timing_hooks,
         )
         try:
             return executor.execute(spec)
@@ -8075,9 +8179,6 @@ def gateway_restart(
                               stderrByteCount=len(proc.stderr or ""))
         if proc.returncode != 0:
             return OperationResult("partial", f"outcome://gateway-restart/exit-{proc.returncode}")
-        # Record cooldown before declaring operation complete; a write failure
-        # makes the ledger uncertain and prevents an automatic restart replay.
-        record_restart_time(conn)
         return OperationResult("complete", f"outcome://gateway-restart/{record.action_id}")
 
     def postcheck(_spec: ActionSpec, _record: Any, _result: OperationResult) -> PostcheckResult:
@@ -8199,40 +8300,7 @@ def hermers_gateway_restart(
                 "profile": profile, "unit": unit,
                 "blockedReason": "protected-or-unknown-profile-scope",
                 "protectionScopeStatus": getattr(scope, "status", "unknown")}
-    last_key = f"hermers_gateway_restart:{profile}"
-    last_restart = int(db_get(conn, last_key, 0) or 0)
     now_s = epoch()
-    restart_history = recent_hermers_gateway_restart_history(conn)
-    if len(restart_history) >= MAX_RESTARTS_PER_WINDOW:
-        return {
-            "actionId": action_id,
-            "ts": ts(),
-            "tsEpoch": now_s,
-            "source": "cat-agents-stabilityd",
-            "component": "hermers",
-            "action": "restart_hermers_gateway",
-            "result": "blocked",
-            "profile": profile,
-            "unit": unit,
-            "reason": reason,
-            "blockedReason": "restart-storm",
-            "recentRestartCount": len(restart_history),
-            "maxRestarts": MAX_RESTARTS_PER_WINDOW,
-        }
-    if last_restart and now_s - last_restart < RESTART_COOLDOWN_SECONDS:
-        return {
-            "actionId": action_id,
-            "ts": ts(),
-            "tsEpoch": now_s,
-            "source": "cat-agents-stabilityd",
-            "component": "hermers",
-            "action": "restart_hermers_gateway",
-            "result": "cooldown_skip",
-            "profile": profile,
-            "unit": unit,
-            "reason": reason,
-            "cooldownUntilEpoch": last_restart + RESTART_COOLDOWN_SECONDS,
-        }
     policy_digest, policy_ref = policy_reference(policy)
     reason_code = re.sub(r"[^A-Za-z0-9_-]+", "-", str(reason))[:80] or "policy"
     scope_ref = "evidence://hermes-profile-scope/sha256/" + hashlib.sha256(
@@ -8306,11 +8374,6 @@ def hermers_gateway_restart(
                 or tuple(sorted(latest.affected_agents)) != tuple(sorted(scope.affected_agents))
                 or not unit_is_explicitly_down()):
             return BoundaryCheck("rejected", "evidence://hermes-profile-scope/unknown")
-        if len(recent_hermers_gateway_restart_history(conn)) >= MAX_RESTARTS_PER_WINDOW:
-            return BoundaryCheck("rejected", "evidence://hermes-gateway/restart-storm")
-        last = int(db_get(conn, last_key, 0) or 0)
-        if last and epoch() - last < RESTART_COOLDOWN_SECONDS:
-            return BoundaryCheck("rejected", "evidence://hermes-gateway/cooldown")
         return BoundaryCheck("approved", scope_ref)
 
     operation_meta: Dict[str, Any] = {}
@@ -8325,8 +8388,6 @@ def hermers_gateway_restart(
             return OperationResult("partial", f"outcome://hermes-gateway-restart/exit-{proc.returncode}")
         if hermes_gateway_operation_unconfirmed(proc):
             return OperationResult("partial", "outcome://hermes-gateway-restart/unconfirmed")
-        db_set(conn, last_key, epoch())
-        record_hermers_gateway_restart_time(conn, profile)
         return OperationResult("complete", f"outcome://hermes-gateway-restart/{record.action_id}")
 
     def postcheck(_spec: ActionSpec, _record: Any, _result: OperationResult) -> PostcheckResult:
@@ -8650,12 +8711,6 @@ def execute_hermers_profile_lifecycle(
                 "profile": profile, "unit": unit, "targetMode": target_mode,
                 "blockedReason": owner_reason}
     now_s = epoch()
-    action_key = f"hermers_profile_mode:{profile}:{target_mode}"
-    last_action = int(db_get(conn, action_key, 0) or 0)
-    if last_action and now_s - last_action < HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS:
-        return {"actionId": action_id, "action": "set_hermers_profile_mode", "result": "cooldown_skip",
-                "profile": profile, "unit": unit, "targetMode": target_mode,
-                "cooldownUntilEpoch": last_action + HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS}
     policy_digest, policy_ref = policy_reference(policy)
     rule = STANDING_RULES["hermes.profile.lifecycle"]
     action = "stop" if target_mode == "hibernate" else "start"
@@ -8726,9 +8781,6 @@ def execute_hermers_profile_lifecycle(
         eligible, _, ref = current_boundary()
         if not eligible:
             return BoundaryCheck("rejected", "evidence://hermes-profile-lifecycle/boundary-changed")
-        last = int(db_get(conn, action_key, 0) or 0)
-        if last and epoch() - last < HERMERS_PROFILE_LIFECYCLE_COOLDOWN_SECONDS:
-            return BoundaryCheck("rejected", "evidence://hermes-profile-lifecycle/cooldown")
         return BoundaryCheck("approved", ref)
 
     operation_meta: Dict[str, Any] = {}
@@ -8743,8 +8795,6 @@ def execute_hermers_profile_lifecycle(
             return OperationResult("partial", f"outcome://hermes-profile-{action}/exit-{proc.returncode}")
         if hermes_gateway_operation_unconfirmed(proc):
             return OperationResult("partial", f"outcome://hermes-profile-{action}/unconfirmed")
-        # This cooldown bounds attempts; it does not confirm target residency.
-        db_set(conn, action_key, epoch())
         return OperationResult("complete", f"outcome://hermes-profile-{action}/{record.action_id}")
 
     def postcheck(_spec: ActionSpec, _record: Any, _result: OperationResult) -> PostcheckResult:
@@ -8780,11 +8830,6 @@ def execute_hermers_profile_lifecycle(
                     json.dumps({"active": active, "activeState": service.get("ActiveState"),
                                 "subState": service.get("SubState")}, sort_keys=True, separators=(",", ":")).encode()
                 ).hexdigest()
-            if state == "verified" and _result.status == "complete" and target_mode == "hibernate":
-                db_set(conn, f"hermers_profile_mode:planned:{profile}",
-                       {"profile": profile, "targetMode": target_mode, "unit": unit,
-                        "reason": reason_code, "setAt": ts(), "setAtEpoch": epoch(),
-                        "source": "cat-agents-stabilityd"})
             return PostcheckResult(state, ref)
         except Exception:
             return PostcheckResult("unknown", "evidence://hermes-profile-postcheck/unknown")
@@ -9975,7 +10020,7 @@ def run_once(conn: sqlite3.Connection, no_action: bool = False) -> Dict[str, Any
     # once, inside the locked/budgeted body, including direct body callers.
     with contextlib.ExitStack() as stack:
         try:
-            stack.enter_context(ActuationLock(ACTUATION_LOCK_PATH))
+            stack.enter_context(governed_actuation_context())
         except ActuationBusy:
             return {
                 "schemaVersion": 1, "status": "busy", "checkedAt": ts(),

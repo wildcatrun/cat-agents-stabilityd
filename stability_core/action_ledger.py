@@ -393,6 +393,17 @@ class ActionLedger:
         assert record is not None
         return record
 
+    def run_timing_check(self, callback):
+        """Trusted constructor hook; commit clock observations, never authority.
+
+        A false/unknown return may intentionally persist quarantine. Raising
+        aborts this transaction and cannot grant an effect.
+        """
+        if not callable(callback):
+            raise TypeError("timing callback must be callable")
+        with self._write() as conn:
+            return callback(conn)
+
     def transition(
         self,
         action_id: str,
@@ -403,8 +414,11 @@ class ActionLedger:
         outcome_ref: Optional[str] = None,
         postcheck_ref: Optional[str] = None,
         precheck_ref: Optional[str] = None,
+        transaction_hook=None,
     ) -> ActionRecord:
         """Record an ordinary state transition; never resolve uncertain executions here."""
+        if transaction_hook is not None and (new_state not in {"succeeded", "failed", "uncertain"} or not callable(transaction_hook)):
+            raise InvalidTransition("effect timing hook requires post-operation terminal transition")
         if new_state not in STATES or new_state not in _TRANSITIONS.get(expected_state, frozenset()):
             raise InvalidTransition(f"transition {expected_state}->{new_state} is not allowed")
         outcome_ref = _optional_ref(outcome_ref)
@@ -429,6 +443,9 @@ class ActionLedger:
             )
             if cursor.rowcount != 1:
                 raise InvalidTransition("state/version compare-and-swap failed")
+            if transaction_hook is not None:
+                row = conn.execute("SELECT * FROM action_ledger WHERE action_id=?", (action_id,)).fetchone()
+                transaction_hook(conn, self._record(row))
         record = self.get(action_id)
         assert record is not None
         return record

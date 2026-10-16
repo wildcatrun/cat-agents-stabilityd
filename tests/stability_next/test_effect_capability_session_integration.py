@@ -115,6 +115,11 @@ daemon = importlib.util.module_from_spec(SPEC); sys.modules[SPEC.name] = daemon;
 
 
 class SessionCapabilityIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        from clock_fixture_support import install_clock_fixture
+        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup)
+        install_clock_fixture(self,daemon,Path(tmp.name)/'actuation.lock')
+
     key, session = 'agent:cat_voice:fixture:PRIVATE_TARGET', 'PRIVATE_SESSION'
 
     def invoke(self, *, mutation=None, nonzero=False, qualification=True, final_mutation=None, sdk_mutation=None):

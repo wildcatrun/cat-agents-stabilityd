@@ -127,10 +127,16 @@ class ActionExecutor:
         operation: Operation,
         postcheck: Postcheck,
         clock_ms: Optional[Callable[[], int]] = None,
+        timing_check=None,
+        effect_timing=None,
     ) -> None:
         callbacks = (authorizer, precheck, operation, postcheck)
         if any(callback is None or not callable(callback) for callback in callbacks):
             raise ValueError("authorizer, precheck, operation, and postcheck callbacks are required")
+        if any(hook is not None and not callable(hook) for hook in (timing_check, effect_timing)):
+            raise ValueError("timing hooks must be trusted callable constructors")
+        self._timing_check = timing_check
+        self._effect_timing = effect_timing
         self._ledger = ledger
         self._authorizer = authorizer
         self._precheck = precheck
@@ -171,6 +177,9 @@ class ActionExecutor:
             return self._block(record, "outcome://precheck-rejected", getattr(precheck, "reference", None))
         if not self._grant_matches(spec, record, grant) or _canonical_digest(spec.input_data) != record.input_digest:
             return self._block(record, "outcome://authorization-expired-or-input-changed")
+
+        if not self._timing_approved(spec, record, "before-cas"):
+            return self._block(record, "outcome://clock-before-cas-refused")
 
         # This CAS is the final side-effect fence.  Another contender may have
         # completed or claimed the action after our read; it must not operate.
@@ -219,6 +228,8 @@ class ActionExecutor:
             executing.action_id, expected_version=executing.version,
             precheck_ref=final_precheck.reference,
         )
+        if not self._timing_approved(spec, executing, "before-effect"):
+            return self._block_executing(executing, "outcome://clock-before-effect-refused")
         operation_failed = False
         try:
             operation_result = self._operation(spec, executing)
@@ -244,19 +255,36 @@ class ActionExecutor:
             or verification.status not in {"verified", "failed"}
             or postcheck_ref is None
         )
+        effect_hook = None
+        if operation_result.status == "complete" and outcome_ref is not None and self._effect_timing is not None:
+            effect_hook = lambda conn, terminal: self._effect_timing(conn, spec, terminal, operation_result)
         if uncertain:
             final = self._ledger.transition(
                 executing.action_id, expected_state="executing", expected_version=executing.version,
                 new_state="uncertain", outcome_ref=outcome_ref, postcheck_ref=postcheck_ref,
+                **({"transaction_hook": effect_hook} if effect_hook is not None else {}),
             )
             return ExecutionResult(final, "uncertain")
 
         final_state = "succeeded" if verification.status == "verified" else "failed"
+
         final = self._ledger.transition(
             executing.action_id, expected_state="executing", expected_version=executing.version,
             new_state=final_state, outcome_ref=outcome_ref, postcheck_ref=postcheck_ref,
+            **({"transaction_hook": effect_hook} if effect_hook is not None else {}),
         )
         return ExecutionResult(final, "executed")
+
+    def _timing_approved(self, spec, record, phase):
+        if self._timing_check is None:
+            return True
+        try:
+            return self._ledger.run_timing_check(
+                lambda conn: self._timing_check(conn, spec, record, phase)
+            ) is True
+        except Exception:
+            # No exception text/payload is persisted. No effect has run here.
+            return False
 
     @staticmethod
     def _validate_spec(spec: ActionSpec) -> None:

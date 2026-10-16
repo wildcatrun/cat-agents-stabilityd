@@ -1,0 +1,181 @@
+{
+  "schemaVersion": 2,
+  "boundary": "V18 finite clock projection only; exact full-policy and repair-gate oracle; no execution authority",
+  "v1FixtureSha256": "95235070b2921efd7c96260450b62cade904eaec2a4d3e51a3eb1f7353e0f5fc",
+  "candidate": {
+    "sourceSha256": "dade1b6cde1f9b422b9ae0dd7fdcb59cd951a654e83e0e83c37c37d8c1d335ec",
+    "functions": {
+      "resource_pressure_active": "7b273e61dc2a698846e31126cc9d95433b4078ecce551573a81bace2319baca7",
+      "max_severity": "888d3f29e901da76e93cab0e3288b526385b6635c69af0560e159fb90c3377cb",
+      "auth_finding_is_pressure": "81a06c7109ad826ad91ed4b01d1ba1d3f86eaa4ca06d6710fc102018d8ad2e97",
+      "hot": "18e667f832e979b3e25b701477912336ee5c811b2f6f01330cd1c586aaabf1e8",
+      "sustained": "f23b77b2c54813093f2f58ac241038df0371c89ffbb3fc1a554ca877d397cfb5",
+      "build_lane_policy": "29bd8b61a8ff78909dda26cc6f16117e4ae6123e991cdd19abe70308bcd2d079",
+      "policy_from_findings": "baed7c444411471a7c0ceb21917a355fb183226bfaddfc2947956810197442bc",
+      "build_repair_gate_from_policy": "f8de589254290cf855f5ec908f22ca2af10e879a2a98a564e5d95d2a90b0700e"
+    }
+  },
+  "approvedNewDependency": "mechanical_timing_projection",
+  "approvedNewField": "clockDiscipline",
+  "clockScenarios": [
+    {
+      "name": "healthy-pre-expiry",
+      "baseCase": "matrix/hard-fault/critical/hot",
+      "wallEpoch": 10080,
+      "legacyRestartEpoch": 10000,
+      "remainingMs": 1720000,
+      "expectedCandidateCanRestart": false,
+      "expectedLegacyCanRestart": false,
+      "projection": {
+        "windows": {
+          "openclaw.gateway": 1720000
+        },
+        "history": {},
+        "epoch": "fixture-epoch-new"
+      }
+    },
+    {
+      "name": "forward-wall-jump-mono-still-cooling",
+      "baseCase": "matrix/hard-fault/critical/hot",
+      "wallEpoch": 20000,
+      "legacyRestartEpoch": 10000,
+      "remainingMs": 1720000,
+      "expectedCandidateCanRestart": false,
+      "expectedLegacyCanRestart": true,
+      "projection": {
+        "windows": {
+          "openclaw.gateway": 1720000
+        },
+        "history": {},
+        "epoch": "fixture-epoch-new"
+      }
+    },
+    {
+      "name": "backward-wall-jump-mono-still-cooling",
+      "baseCase": "matrix/hard-fault/critical/hot",
+      "wallEpoch": 9950,
+      "legacyRestartEpoch": 10000,
+      "remainingMs": 1720000,
+      "expectedCandidateCanRestart": false,
+      "expectedLegacyCanRestart": false,
+      "projection": {
+        "windows": {
+          "openclaw.gateway": 1720000
+        },
+        "history": {},
+        "epoch": "fixture-epoch-new"
+      }
+    },
+    {
+      "name": "recovery-new-epoch-still-cooling",
+      "baseCase": "matrix/hard-fault/critical/hot",
+      "wallEpoch": 20060,
+      "legacyRestartEpoch": 10000,
+      "remainingMs": 1660000,
+      "expectedCandidateCanRestart": false,
+      "expectedLegacyCanRestart": true,
+      "projection": {
+        "windows": {
+          "openclaw.gateway": 1660000
+        },
+        "history": {},
+        "epoch": "fixture-epoch-new"
+      }
+    },
+    {
+      "name": "recovery-monotonic-expired",
+      "baseCase": "matrix/hard-fault/critical/hot",
+      "wallEpoch": 21800,
+      "legacyRestartEpoch": 10000,
+      "remainingMs": 0,
+      "expectedCandidateCanRestart": true,
+      "expectedLegacyCanRestart": true,
+      "projection": {
+        "windows": {},
+        "history": {},
+        "epoch": "fixture-epoch-new"
+      }
+    },
+    {
+      "name": "backward-recovery-mono-expired-before-legacy-wall",
+      "baseCase": "matrix/hard-fault/critical/hot",
+      "wallEpoch": 9900,
+      "legacyRestartEpoch": 10000,
+      "remainingMs": 0,
+      "expectedCandidateCanRestart": true,
+      "expectedLegacyCanRestart": false,
+      "projection": {
+        "windows": {},
+        "history": {},
+        "epoch": "fixture-epoch-new"
+      }
+    },
+    {
+      "name": "forward-quarantine-candidate-is-not-authority",
+      "baseCase": "matrix/hard-fault/critical/hot",
+      "wallEpoch": 20000,
+      "legacyRestartEpoch": 10000,
+      "remainingMs": 0,
+      "expectedCandidateCanRestart": true,
+      "expectedLegacyCanRestart": true,
+      "projection": null
+    },
+    {
+      "name": "forward-wall-does-not-clear-monotonic-storm",
+      "baseCase": "matrix/hard-fault/critical/hot",
+      "wallEpoch": 90000,
+      "legacyRestartEpoch": 10000,
+      "remainingMs": 0,
+      "expectedCandidateCanRestart": false,
+      "expectedLegacyCanRestart": true,
+      "projection": {
+        "windows": {},
+        "history": {
+          "openclaw.gateway.history": [
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        "epoch": "fixture-epoch-new"
+      },
+      "historyRemainingMs": [
+        1000000,
+        1000000,
+        1000000
+      ]
+    }
+  ],
+  "automaticActivation": false,
+  "hermesProfileScenario": {
+    "baseCase": "matrix/hermers/critical/hot",
+    "scopeSource": "synthetic runtime_agents rows; not a production member registry",
+    "runtimeAgents": [
+      {
+        "agent_id": "fixture_one",
+        "runtime": "hermes_acp",
+        "endpoint_ref": "hermes-profile:fixture_one"
+      },
+      {
+        "agent_id": "fixture_two",
+        "runtime": "hermes_acp",
+        "endpoint_ref": "hermes-profile:fixture_two"
+      }
+    ],
+    "coolingProfile": "fixture_one",
+    "remainingMs": 60000,
+    "historyRemainingMs": 1800000,
+    "phases": [
+      {
+        "name": "hermes-per-profile-cooldown-one-eligible",
+        "globalHistoryCount": 1,
+        "expectedCanRestart": true
+      },
+      {
+        "name": "hermes-global-storm-applies-to-remaining-profile",
+        "globalHistoryCount": 3,
+        "expectedCanRestart": false
+      }
+    ]
+  }
+}

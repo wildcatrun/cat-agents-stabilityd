@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 2,
+  "currentGate": "clock-policy-scope-v2",
+  "fixture": "tests/fixtures/compat/clock_policy_scope_v2.json",
+  "historicalGate": "current-policy-shadow-v1",
+  "automaticActivation": false
+}

@@ -21,6 +21,8 @@ class EntryIdempotencyTests(unittest.TestCase):
         self.patch = mock.patch.object(m, 'STATE_DB', self.path); self.patch.start(); self.addCleanup(self.patch.stop)
         self.now = mock.patch.object(m, 'epoch', return_value=2000000000); self.now.start(); self.addCleanup(self.now.stop)
         self.calls = []
+        from clock_fixture_support import install_clock_fixture
+        install_clock_fixture(self,m,self.root/'actuation.lock')
 
     def spec(self, n=1):
         policy = dict(updatedAtEpoch=2000000000-n, validUntilEpoch=2000000060+n, canRestartGateway=True)

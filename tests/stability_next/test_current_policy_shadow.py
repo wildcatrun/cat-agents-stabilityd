@@ -19,11 +19,13 @@ class CurrentPolicyShadowTests(unittest.TestCase):
                                             ':bin/cat_agents_stabilityd.py'], cwd=ROOT, text=True, timeout=10)
         candidate = subprocess.check_output(['git', 'show', cls.fixture['candidateCommit'] +
                                             ':bin/cat_agents_stabilityd.py'], cwd=ROOT, text=True, timeout=10)
+        cls.historical_candidate = candidate
         if hashlib.sha256(candidate.encode()).hexdigest() != cls.fixture['pins']['candidate']['sourceSha256']:
             raise ValueError('candidate commit/source provenance mismatch')
 
     def test_full_policy_replay_permits_only_previously_reviewed_visibility_fields(self):
-        report = verifier.replay(ROOT)
+        # V1 remains pinned historical evidence; the explicit V2 gate tests current source.
+        report = verifier.replay(ROOT, candidate_source=self.historical_candidate)
         self.assertEqual(report['scenarioCount'], 203)
         self.assertFalse(report['automaticActivation'])
         self.assertFalse(report['collectorExecution'])
