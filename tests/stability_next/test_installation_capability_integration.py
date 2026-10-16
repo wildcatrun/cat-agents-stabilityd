@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 import test_hermes_native_route_integration as base
@@ -112,7 +113,15 @@ class InstallationCapabilityIntegrationTests(unittest.TestCase):
             self.assertNotIn('catbody',path.read_text())
 
     def test_packaged_catalog_is_actual_source_material_without_invented_members_or_activation(self):
-        factory=installation.load_packaged_installations()
+        # The isolated Linux runner has a different UID than the read-only
+        # checkout owner. Exercise the production loader against an owned copy
+        # of exactly the pinned release artifact, without weakening its guards.
+        raw=installation.PACKAGED_MANIFEST.read_bytes()
+        with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
+            path=Path(directory)/'qualified_installations_v1.json'
+            path.write_bytes(raw);path.chmod(0o600)
+            with mock.patch.object(installation,'PACKAGED_MANIFEST',path):
+                factory=installation.load_packaged_installations()
         catalog=factory._manifest
         self.assertEqual({c['family'] for c in catalog['sourceContracts']},{'hermes','openclaw'})
         self.assertEqual({c['kind'] for c in catalog['sourceContracts']},{'native','mux','session'})
