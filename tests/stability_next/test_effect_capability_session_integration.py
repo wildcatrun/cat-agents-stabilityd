@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 from stability_core import session_api_capability as api
+from stability_core import installation_capability as installation
 from stability_core.adapter_contract import AdapterContract
 from stability_core.content_artifact import ContentArtifactSpec
 
@@ -78,6 +79,9 @@ def qualified_session_fixture(stabilityd):
             'evidence://session-api-qualification/independent-fixture-v1', 18789, (units,), proc,
             rpc_environment=(('HOME', str(root)),),
             sdk=api.SessionSdkQualification('sdk.mjs',wrapper,hashlib.sha256(wrapper.read_bytes()).hexdigest(),'fixture-v1','fixture-build'))
+        from stability_core import installation_capability as installation
+        from installation_fixture_support import session_artifact
+        factory=session_artifact(qualification,root/'qualified_installations_v1.json',raw_files,node_id='fixture-node')
         original_access = os.access
         def fixture_access(path, mode, *args, **kwargs):
             # Transport is mocked; these exact synthetic program files are not
@@ -95,14 +99,14 @@ def qualified_session_fixture(stabilityd):
                 except OSError:
                     pass
             return original_access(path, mode, *args, **kwargs)
-        with mock.patch.object(api, '_run_sdk_probe', return_value=sdk_reply(None)) as probe, \
-             mock.patch.object(api, 'SESSION_API_QUALIFICATION', qualification), \
+        with mock.patch.object(installation, 'load_packaged_installations', return_value=factory), \
+             mock.patch.object(api, '_run_sdk_probe', return_value=sdk_reply(None)) as probe, \
              mock.patch('os.access', side_effect=fixture_access), \
              mock.patch.object(stabilityd.platform, 'node', return_value='fixture-node'), \
              mock.patch.object(stabilityd, 'read_gateway_unit_properties', return_value=props), \
              mock.patch.object(stabilityd, 'systemctl_show_gateway', return_value={
                  'ActiveState': 'active', 'SubState': 'running', 'MainPID': 42}):
-            yield SimpleNamespace(qualification=qualification, code=code, process=process, cli=cli, unit=unit, node=node, wrapper=wrapper, probe=probe)
+            yield SimpleNamespace(qualification=qualification, code=code, process=process, cli=cli, unit=unit, node=node, wrapper=wrapper, probe=probe, installation_factory=factory)
 
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / 'bin/cat_agents_stabilityd.py'
@@ -163,7 +167,7 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
                  mock.patch.object(daemon, 'run_cmd', side_effect=command), \
                  mock.patch.object(api, 'run_sdk_process', side_effect=sdk_call):
                 if not qualification:
-                    with mock.patch.object(api, 'SESSION_API_QUALIFICATION', None):
+                    with mock.patch.object(installation, 'load_packaged_installations', side_effect=ValueError('fixture artifact unavailable')):
                         first = daemon.governed_reset_session(conn, self.key, 'repeated_failures',
                             dict(canResetSession=True, updatedAtEpoch=999, validUntilEpoch=1060), 'snapshot', self.session)
                 else:
@@ -215,6 +219,79 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
             with self.subTest(response=response),self.assertRaises((ValueError,TypeError)):
                 api.validate_sdk_response(response,version='fixture-v1',build_id='fixture-build',boot_id='server-boot')
 
+    def test_factory_binds_literal_unit_script_alias_to_reviewed_source(self):
+        def configure(fixture):
+            alias=fixture.code.parent/'declared-package'
+            alias.symlink_to(fixture.code,target_is_directory=True)
+            entry=alias/fixture.cli.name
+            fixture.installation_factory._manifest['installations'][0]['cliEntry']=str(entry)
+            old=str(fixture.cli);new=str(entry)
+            daemon.read_gateway_unit_properties.return_value=daemon.read_gateway_unit_properties.return_value.replace(old,new)
+            fixture.unit.write_text(fixture.unit.read_text().replace(old,new))
+            command=fixture.process/'cmdline'
+            command.write_bytes(command.read_bytes().replace(old.encode(),new.encode()))
+            fixture.cli.chmod(0o600)  # Node source is not itself an executable.
+        first,_second,effects=self.invoke(sdk_mutation=configure)
+        self.assertEqual(first['ledgerState'],'succeeded')
+        self.assertEqual(len(effects),1)
+        def replace_alias(fixture):
+            alias=fixture.code.parent/'declared-package'
+            other=fixture.code.parent/'replacement'
+            if other.exists():return
+            other.mkdir()
+            (other/fixture.cli.name).write_bytes(ENTRY)
+            alias.unlink();alias.symlink_to(other,target_is_directory=True)
+        first,_second,effects=self.invoke(sdk_mutation=configure,final_mutation=replace_alias)
+        # This hook runs after the durable effect claim. Drift prevents reset,
+        # but the claimed intent must remain uncertain and cannot be retried.
+        self.assertEqual(first['ledgerState'],'uncertain')
+        self.assertEqual(_second['ledgerState'],'uncertain')
+        self.assertEqual(_second['result'],'existing')
+        self.assertEqual(effects,[])
+
+    def test_script_route_owned_ancestor_alias_and_drift(self):
+        with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
+            root=Path(directory); real=root/'real'; real.mkdir()
+            script=real/'index.js'; script.write_text('// reviewed script\n');script.chmod(0o600)
+            alias=root/'alias';alias.symlink_to(real,target_is_directory=True)
+            declared=alias/'index.js'
+            resolved,pinned=api._script_source_route(declared,owner_uid=os.getuid())
+            self.assertEqual(resolved,script)
+            (root/'sibling').mkdir()
+            self.assertEqual(api._script_source_route(declared,owner_uid=os.getuid()),(resolved,pinned))
+            other=root/'other';other.mkdir();(other/'index.js').write_text('// other')
+            alias.unlink();alias.symlink_to(other,target_is_directory=True)
+            self.assertNotEqual(api._script_source_route(declared,owner_uid=os.getuid()),(resolved,pinned))
+            real.chmod(0o770)
+            with self.assertRaises(ValueError):api._script_source_route(script,owner_uid=os.getuid())
+
+    def test_script_route_parent_after_nested_alias_matches_kernel(self):
+        with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
+            root=Path(directory);safe=root/'safe';safe.mkdir()
+            other=root/'other';other.mkdir();(other/'deep').mkdir()
+            (safe/'payload.js').write_text('// lexical decoy')
+            actual=other/'payload.js';actual.write_text('// kernel producer')
+            (safe/'jump').symlink_to(other/'deep',target_is_directory=True)
+            entry=root/'entry.js';entry.symlink_to('safe/jump/../payload.js')
+            resolved,route=api._script_source_route(entry,owner_uid=os.getuid())
+            self.assertEqual(resolved,actual)
+            self.assertEqual(resolved.read_bytes(),entry.read_bytes())
+            self.assertIn(str(safe/'jump'),[row[0] for row in route])
+            # A qualification for the lexical decoy cannot match this route.
+            self.assertNotEqual(resolved,safe/'payload.js')
+
+    def test_expected_build_absence_is_pinned_not_wildcard(self):
+        launcher=replace(launcher_fixture((('HOME','/fixture/home'),)),server_build_id=None)
+        payload=json.loads(launcher.command('sessions.describe',dict(key='x',agentId='main'))[2])
+        self.assertIsNone(payload['server']['buildId'])
+        hello,_=api.validate_sdk_response(sdk_reply({},buildId=None),version='fixture-v1',build_id=None,boot_id='server-boot')
+        self.assertIsNone(hello['buildId'])
+        for value in ('fixture-build','',False):
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                api.validate_sdk_response(sdk_reply({},buildId=value),version='fixture-v1',build_id=None,boot_id='server-boot')
+        with self.assertRaises(ValueError):
+            api.validate_sdk_response(sdk_reply({},buildId=None),version='fixture-v1',build_id='fixture-build',boot_id='server-boot')
+
     def test_sdk_process_output_budget_and_nonzero_are_sanitized(self):
         for kind in ('stdout','stderr','nonzero'):
             def child(argv,**kwargs):
@@ -227,7 +304,7 @@ class SessionCapabilityIntegrationTests(unittest.TestCase):
 
     def test_sdk_is_required_and_old_protocol_text_cannot_qualify(self):
         def absent(fixture):
-            api.SESSION_API_QUALIFICATION=replace(fixture.qualification,sdk=None)
+            fixture.installation_factory._manifest['sourceContracts'][0].pop('sdkEntry')
         first,_second,effects=self.invoke(sdk_mutation=absent)
         self.assertEqual(first['ledgerState'],'blocked');self.assertEqual(effects,[])
 

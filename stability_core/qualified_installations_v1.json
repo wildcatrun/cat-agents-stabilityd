@@ -1,0 +1,211 @@
+{
+  "schemaVersion": 1,
+  "sourceContracts": [
+    {
+      "id": "hermes-installed-profile-standalone-v1",
+      "family": "hermes",
+      "kind": "native",
+      "semantics": "reviewed-hermes-profile-standalone-source-window-v1",
+      "files": [
+        {
+          "path": "hermes_cli/main.py",
+          "sha256": "3b89b46e67f35398ba0af6b3441172490469702cd0e4e0381ff7e45ea78b2eef",
+          "bytes": 152342
+        },
+        {
+          "path": "hermes_cli/profiles.py",
+          "sha256": "47d01aff498b302905ce887e4b0a90907f107f32cbcdff380cf1ed5f01e3e23b",
+          "bytes": 113182
+        },
+        {
+          "path": "hermes_cli/gateway_multiplex_mode.py",
+          "sha256": "d61d2a27d92fa70a113f80ab248991f3ae363f66bcec940ea3f581305cd608de",
+          "bytes": 16973
+        }
+      ],
+      "status": "reviewed",
+      "reviewRef": "hermes-launch-source/manifest.json + standalone-route-source-manifest-20261015.json"
+    },
+    {
+      "id": "hermes-installed-mux-source-v1",
+      "family": "hermes",
+      "kind": "mux",
+      "semantics": "reviewed-hermes-mux-cli-logical-membership-v1",
+      "status": "reviewed",
+      "files": [
+        {
+          "path": "hermes_cli/__init__.py",
+          "sha256": "d05c98cd44e22781497a20cd968af0d9b8962406b909f1889168c624545b229e",
+          "bytes": 1843
+        },
+        {
+          "path": "hermes_cli/main.py",
+          "sha256": "3b89b46e67f35398ba0af6b3441172490469702cd0e4e0381ff7e45ea78b2eef",
+          "bytes": 152342
+        },
+        {
+          "path": "hermes_cli/gateway.py",
+          "sha256": "d8cdbd900dbebcbaffc0406442711bbd592f292614e1d59578f9b4c163c379f3",
+          "bytes": 240576
+        },
+        {
+          "path": "hermes_cli/profiles.py",
+          "sha256": "47d01aff498b302905ce887e4b0a90907f107f32cbcdff380cf1ed5f01e3e23b",
+          "bytes": 113182
+        },
+        {
+          "path": "hermes_cli/gateway_profile_lifecycle.py",
+          "sha256": "e6953b4b98c843cf02c799a23fdb73c8104cd15fa0e213e61744beb66c8b3a1b",
+          "bytes": 4719
+        },
+        {
+          "path": "hermes_constants.py",
+          "sha256": "3dd95a77b1a4956280f146e3b065789ca5d82921f69e6e2cae06d49a13f82405",
+          "bytes": 73638
+        },
+        {
+          "path": "gateway/__init__.py",
+          "sha256": "8920ead12b3b78cc727b2c6257192e954bc790717676484ad66b3238e511b95e",
+          "bytes": 574
+        },
+        {
+          "path": "gateway/control_socket.py",
+          "sha256": "9dbdb691f1bab69340be5131f50d6b0b62ffa6b80341b601a3948f5ff3998ef3",
+          "bytes": 19628
+        }
+      ],
+      "bridgeSha256": "154b649b19bb7ce30f843a56ea671b395ef60f56cee4b4658c1615cb95a70650",
+      "reviewRef": "installation-initializer-source-review-20261017.md; existing official control/lifecycle snapshots"
+    },
+    {
+      "id": "openclaw-installed-session-sdk-v1",
+      "family": "openclaw",
+      "kind": "session",
+      "semantics": "v1",
+      "status": "reviewed",
+      "files": [
+        {
+          "path": "dist/call-DlP8G_Up.mjs",
+          "sha256": "0a7d7cf9133e55b333f408144e1a687358d6e3ffb08dc4cfb604eb545103d588",
+          "bytes": 36290
+        },
+        {
+          "path": "package.json",
+          "sha256": "927716ef228eeba5c840f2e271a8a0b6b45241266a1c7347cd46578876b28c4f",
+          "bytes": 145068
+        },
+        {
+          "path": "dist/index.js",
+          "sha256": "b15528fc85fb67513f3a23a578aaf9c026e348d71264d968f5b49d138c16071a",
+          "bytes": 5577
+        },
+        {
+          "path": "dist/version-DVbtJnqw.mjs",
+          "sha256": "d78d0733662cb1d01797dd22e7747af141ba650fcf176fd69f0700e299aea214",
+          "bytes": 4364
+        },
+        {
+          "path": "dist/message-handler-Lb8_GOZn.mjs",
+          "sha256": "144e9a66edd105c130bb4fc1d20a1096a3dd5d393a217c205c7498a0a0f793f3",
+          "bytes": 175807
+        },
+        {
+          "path": "dist/build-info.json",
+          "sha256": "60ed9930241cd02d8b8a1aa2eead2bcd52ff7ab3b967b825a3d393822aef28dc",
+          "bytes": 196
+        }
+      ],
+      "packageName": "openclaw",
+      "packageVersion": "2026.9.7",
+      "sdkEntry": "dist/call-DlP8G_Up.mjs",
+      "wrapperSha256": "e1b3b3d43cc81802e7315c668d8d00c0408e291b711bc0e325d813934ae74778",
+      "reviewRef": "installation-session-server-source-review-20261017.md; existing fixed official SDK replay",
+      "observedServerMetadata": {
+        "version": "2026.9.7",
+        "buildId": "2026.9.7-release-c074824a27c9-2026-09-29T23-33-45.013Z",
+        "buildInfoSha256": "60ed9930241cd02d8b8a1aa2eead2bcd52ff7ab3b967b825a3d393822aef28dc",
+        "approved": false
+      },
+      "serverVersion": "2026.9.7",
+      "serverBuildId": "2026.9.7-release-c074824a27c9-2026-09-29T23-33-45.013Z"
+    }
+  ],
+  "installations": [
+    {
+      "id": "dev-hermes",
+      "family": "hermes",
+      "nodeId": "VM-4-17-ubuntu",
+      "ownerUid": 1002,
+      "status": "layout-metadata-pending",
+      "codeRoot": "/home/flashcat/hermes-agent",
+      "runtimeRoot": "/home/flashcat/.hermes",
+      "unitRoots": [
+        "/home/flashcat/.config/systemd/user"
+      ],
+      "contracts": {
+        "native": "hermes-installed-profile-standalone-v1",
+        "mux": "hermes-installed-mux-source-v1"
+      },
+      "nativeArgv": [
+        "/home/flashcat/hermes-agent/venv/bin/python",
+        "-m",
+        "hermes_cli.main",
+        "--profile",
+        "{profile}",
+        "gateway",
+        "run"
+      ],
+      "interpreterEntry": "/home/flashcat/hermes-agent/venv/bin/python",
+      "interpreterSha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+      "cliEntry": "/home/flashcat/.local/bin/hermes",
+      "cliSha256": "694d14bc27ebbda855b6ff66169521903b0c85a1ee0d70399b192650bf510647",
+      "missingQualificationInputs": [
+        "native manager/env projection approved expected digests and source absence contract",
+        "mux explicit host launch/home/socket layout approval"
+      ],
+      "observedAdmissionBlocks": [
+        "source-root-and-unit-root-mode-0775",
+        "source-files-mode-0664",
+        "permissions-not-changed-by-this-candidate"
+      ],
+      "observedLaunchMetadata": {
+        "digestEvidence": "installation-environment-digests-20261017.json",
+        "managerSha256": "80322c323f2f1ec3d8eace51b0d639ba586a70490a72ed165a8dea34805b7547",
+        "environmentFilesPresent": true,
+        "importKeysPresent": [
+          "LD_LIBRARY_PATH"
+        ],
+        "approved": false
+      }
+    },
+    {
+      "id": "dev-openclaw",
+      "family": "openclaw",
+      "nodeId": "VM-4-17-ubuntu",
+      "ownerUid": 1002,
+      "status": "layout-metadata-pending",
+      "codeRoot": "/home/flashcat/.local/lib/node_modules/openclaw",
+      "contract": "openclaw-installed-session-sdk-v1",
+      "missingQualificationInputs": [
+        "finite script alias route installation admission and owned permissions",
+        "reviewed RPC environment and source closure",
+        "permission hardening installation approval and post-check"
+      ],
+      "observedAdmissionBlocks": [
+        "source-root-mode-0775",
+        "source-files-mode-0664",
+        "permissions-not-changed-by-this-candidate"
+      ],
+      "observedUnitMetadata": {
+        "manager": "system",
+        "unitRoots": [
+          "/etc/systemd/system"
+        ],
+        "cliEntry": "/usr/lib/node_modules/openclaw/dist/index.js",
+        "cliRelative": "dist/index.js",
+        "endpointPort": 23466,
+        "approved": false
+      }
+    }
+  ]
+}

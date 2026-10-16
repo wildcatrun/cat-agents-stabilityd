@@ -74,6 +74,18 @@ export async function r(o) {
             with self.subTest(vendor=vendor):
                 self.refused(vendor=vendor)
 
+    def test_explicit_build_absence_is_exact(self):
+        absent=lambda p:p['server'].update(buildId=None)
+        for mode in ('probe','call'):
+            code,result=self.run_bridge(mode=mode,change=absent,vendor="delete h.server.buildId;")
+            self.assertEqual(code,0)
+            self.assertIsNone(result['hello']['buildId'])
+            for vendor in ("", "h.server.buildId=null;", "h.server.buildId='';"):
+                with self.subTest(mode=mode,vendor=vendor):
+                    self.refused(mode=mode,change=absent,vendor=vendor)
+        for vendor in ("delete h.server.buildId;", "h.server.buildId=null;", "h.server.buildId='';"):
+            self.refused(vendor=vendor)
+
     def test_source_changed_after_import(self):
         self.refused(vendor="fs.appendFileSync(new URL(import.meta.url),'\\n// drift');")
 

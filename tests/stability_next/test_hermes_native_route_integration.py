@@ -50,9 +50,13 @@ def fixture():
             if cmd[-1] == 'show-environment': return SimpleNamespace(returncode=0, stdout='', stderr='')
             effects.append(tuple(cmd)); state.update(ActiveState='inactive' if cmd[-2] == 'stop' else 'active', SubState='dead' if cmd[-2] == 'stop' else 'running')
             return SimpleNamespace(**reply)
+        from stability_core import installation_capability as installation
+        from installation_fixture_support import native_artifact
+        factory = native_artifact(q, root / 'qualified_installations_v1.json', node_id=daemon.platform.node(),
+            environment_template=env.replace(str(home), '{home}'))
         with contextlib.ExitStack() as stack:
-            for p in (mock.patch.object(native, 'NATIVE_QUALIFICATION', q),
-                                            mock.patch.object(daemon, 'workflow_runtime_registry_records', return_value=registry),
+            stack.enter_context(mock.patch.object(installation, 'load_packaged_installations', return_value=factory))
+            for p in (mock.patch.object(daemon, 'workflow_runtime_registry_records', return_value=registry),
                       mock.patch.object(daemon, 'current_host_generation', return_value='boot:fixture'),
                                             mock.patch.object(daemon, 'run_user_cmd', side_effect=run),
                       mock.patch.object(daemon, 'STATE_DB', root / 'state/ledger.db'),
@@ -149,11 +153,12 @@ class NativeIntegrationTests(unittest.TestCase):
             marker.unlink(); marker.write_bytes(b'replacement')
             with self.assertRaises(ValueError): route.verify()
 
-    def test_other_profile_is_outside_native_qualification_scope(self):
+    def test_other_profile_without_registry_owner_is_unqualified(self):
         with fixture():
-            self.assertIsNone(daemon.resolve_hermes_native_route('catnose', 'hermes.gateway.restart', 'boot:fixture'))
+            with self.assertRaisesRegex(ValueError,'hermes-installation-unqualified'):
+                daemon.resolve_hermes_native_route('catnose', 'hermes.gateway.restart', 'boot:fixture')
 
-    def test_posteffect_scope_revocation_blocks_planned_hibernate_on_both_routes(self):
+    def test_posteffect_scope_revocation_ignores_deprecated_qualification_global(self):
         for use_native in (True, False):
             for revoke in ('owner', 'dispatch'):
                 with self.subTest(native=use_native, revoke=revoke), fixture() as f, \
@@ -175,10 +180,11 @@ class NativeIntegrationTests(unittest.TestCase):
                          mock.patch.object(daemon, 'run_hermes_profile_gateway_cmd', side_effect=legacy):
                         result = self.lifecycle(True)
                     self.assertEqual(result.get('ledgerState'), 'uncertain', result)
+                    self.assertTrue(result['nativeRouteUsed'])  # Factory, never legacy-global fallback.
                     self.assertFalse(any('planned' in str(call) for call in persist.call_args_list))
                     self.assertEqual(len(f.effects), 1)
 
-    def test_posteffect_owner_revocation_cannot_confirm_restart_on_both_routes(self):
+    def test_posteffect_owner_revocation_ignores_deprecated_qualification_global(self):
         for use_native in (True, False):
             with self.subTest(native=use_native), fixture() as f:
                 original = daemon.run_user_cmd.side_effect
@@ -194,6 +200,7 @@ class NativeIntegrationTests(unittest.TestCase):
                      mock.patch.object(daemon, 'run_hermes_profile_gateway_cmd', side_effect=legacy):
                     result = self.restart()
                 self.assertEqual(result.get('ledgerState'), 'uncertain', result)
+                self.assertTrue(result['nativeRouteUsed'])
                 self.assertEqual(len(f.effects), 1)
 
     def restart(self):

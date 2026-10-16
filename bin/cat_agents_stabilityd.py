@@ -897,14 +897,25 @@ def run_hermes_profile_gateway_cmd(profile: str, command: str, timeout: int = 60
 
 
 
+def hermes_installation_decision(profile: str, action_type: str, generation: str):
+    from stability_core.installation_capability import load_packaged_installations
+    from stability_core.effect_capability import EffectRequest, EffectOperation
+    target = ('hermes-gateway:' if action_type == 'hermes.gateway.restart' else 'hermes-profile:') + profile
+    request = EffectRequest(action_type, EffectOperation.HERMES_CLI, target, platform.node(), generation)
+    return load_packaged_installations().hermes(request, workflow_runtime_registry_records(), profile)
+
+
 def resolve_hermes_native_route(profile: str, action_type: str, generation: str):
     from stability_core import hermes_native_route as native
     from stability_core.effect_capability import EffectRequest, EffectOperation
     from stability_core.unit_capability import PROPERTIES
     from stability_core.hermes_unit_environment import PROPERTIES as ENV_PROPERTIES
-    qualification = native.NATIVE_QUALIFICATION
-    if qualification is None or qualification.target_profile != profile:
-        return None  # Outside reviewed native scope; preserve governed CLI path.
+    decision = hermes_installation_decision(profile, action_type, generation)
+    if decision.status == 'supported-mux':
+        return None
+    if decision.status != 'supported-native':
+        raise ValueError('hermes-installation-unqualified')
+    qualification = decision.qualification
     def read(unit, properties):
         command = ['/usr/bin/env', f'XDG_RUNTIME_DIR=/run/user/{qualification.owner_uid}',
                    f'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{qualification.owner_uid}/bus',
@@ -933,9 +944,10 @@ def resolve_hermes_native_route(profile: str, action_type: str, generation: str)
 def resolve_hermes_mux_route(profile: str, action_type: str, generation: str):
     from stability_core import hermes_native_route as routes
     from stability_core.effect_capability import EffectRequest, EffectOperation
-    qualification = routes.MUX_QUALIFICATION
-    if qualification is None or qualification.target_profile != profile:
-        return None
+    decision = hermes_installation_decision(profile, action_type, generation)
+    if decision.status != 'supported-mux':
+        raise ValueError('hermes-installation-unqualified')
+    qualification = decision.qualification
     target = ('hermes-gateway:' if action_type == 'hermes.gateway.restart' else 'hermes-profile:') + profile
     return routes.MuxRoute(qualification,
         EffectRequest(action_type, EffectOperation.HERMES_CLI, target, platform.node(), generation), profile)
@@ -7679,7 +7691,13 @@ def governed_reset_session(
     from stability_core.effect_capability import EffectRequest, EffectOperation
     capability_request = EffectRequest(spec.action_type, EffectOperation.OPENCLAW_RPC,
                                        spec.target, platform.node(), generation)
-    qualification = session_api_capability.SESSION_API_QUALIFICATION
+    from stability_core.installation_capability import load_packaged_installations
+    try:
+        installation = load_packaged_installations().session(capability_request,
+            workflow_runtime_registry_records(), session_info.get('agentId'))
+        qualification = installation.qualification if installation.status == 'supported-session' else None
+    except Exception:
+        qualification = None
     capability = session_api_capability.make_session_api_capability(capability_request,
         qualification=qualification, clock_ms=now_ms,
         node_reader=lambda: (platform.node(), current_host_generation()),
@@ -8247,9 +8265,12 @@ def hermers_gateway_restart(
     try:
         native_route = resolve_hermes_native_route(profile, spec.action_type, spec.generation)
         mux_route = resolve_hermes_mux_route(profile, spec.action_type, spec.generation) if native_route is None else None
-    except Exception:
+    except Exception as exc:
+        reason = ("hermes-installation-unqualified" if isinstance(exc, ValueError)
+                  and str(exc) == "hermes-installation-unqualified"
+                  else "hermes-qualified-native-source-drift")
         return {"actionId": action_id, "result": "blocked", "profile": profile,
-                "unit": unit, "blockedReason": "hermes-qualified-native-source-drift"}
+                "unit": unit, "blockedReason": reason}
 
     def eligibility(spec_: ActionSpec, loaded: Dict[str, Any], now_ms: int) -> tuple[str, ...]:
         try:
@@ -8655,9 +8676,12 @@ def execute_hermers_profile_lifecycle(
     try:
         native_route = resolve_hermes_native_route(profile, spec.action_type, spec.generation)
         mux_route = resolve_hermes_mux_route(profile, spec.action_type, spec.generation) if native_route is None else None
-    except Exception:
+    except Exception as exc:
+        reason = ("hermes-installation-unqualified" if isinstance(exc, ValueError)
+                  and str(exc) == "hermes-installation-unqualified"
+                  else "hermes-qualified-native-source-drift")
         return {"actionId": action_id, "result": "blocked", "profile": profile,
-                "unit": unit, "blockedReason": "hermes-qualified-native-source-drift"}
+                "unit": unit, "blockedReason": reason}
 
     def current_boundary() -> Tuple[bool, str, str]:
         valid, why, ref = hermers_profile_live_owner(profile, list(item.get("agentIds") or []), generation)

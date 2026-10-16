@@ -31,7 +31,12 @@ class ProtectionActuatorTests(unittest.TestCase):
         properties = ('Id=openclaw-gateway.service\nLoadState=loaded\nFragmentPath=' + str(unit)
                       + '\nDropInPaths=\nExecStart={ path=' + str(binary) + ' ; argv[]='
                       + str(binary) + ' --fixture ; ignore_errors=no ; }\n')
-        for patch in (mock.patch.object(unit_capability, 'UNIT_ROOTS', (root,)),
+        # This suite isolates protection/ledger/postcheck behavior at its
+        # existing fake runtime leaf. Installation qualification is covered by
+        # owned artifact+reader integration, not claimed by these unit mocks.
+        for patch in (mock.patch.object(stabilityd, 'resolve_hermes_native_route', return_value=None),
+                      mock.patch.object(stabilityd, 'resolve_hermes_mux_route', return_value=None),
+                      mock.patch.object(unit_capability, 'UNIT_ROOTS', (root,)),
                       mock.patch.object(stabilityd, 'read_gateway_unit_properties', return_value=properties)):
             patch.start()
             self.addCleanup(patch.stop)

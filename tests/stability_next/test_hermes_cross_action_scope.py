@@ -37,7 +37,11 @@ def fixture(profile="catbody"):
         def command(profile,verb,timeout=60):
             if verb!='status':effects.append((profile,verb))
             return SimpleNamespace(returncode=0,stdout='Gateway active and running',stderr='')
-        for patch in (mock.patch.object(m,'STATE_DB',path),mock.patch.object(hermes_native_route,'NATIVE_QUALIFICATION',None),
+        # Deliberately isolate alias transaction guards from source capability:
+        # this suite's fake CLI is not an installation-qualification positive.
+        for patch in (mock.patch.object(m,'resolve_hermes_native_route',return_value=None),
+                      mock.patch.object(m,'resolve_hermes_mux_route',return_value=None),
+                      mock.patch.object(m,'STATE_DB',path),mock.patch.object(hermes_native_route,'NATIVE_QUALIFICATION',None),
                       mock.patch.object(m,'workflow_runtime_registry_records',return_value=registry),
                       mock.patch.object(m,'current_host_generation',return_value='new-generation'),
                       mock.patch.object(m,'db_get',return_value=0),mock.patch.object(m,'db_set'),

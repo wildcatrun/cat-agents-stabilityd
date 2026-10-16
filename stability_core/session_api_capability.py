@@ -19,7 +19,7 @@ from .adapter_contract import AdapterContract, AdapterDescriptor, sha256_file
 from .content_artifact import ContentArtifactSpec, measure_content_artifact
 from .effect_capability import EffectCapabilityProvider, EffectRequest, EffectOperation
 from .process_identity import read_process_identity, identities_match, IDENTITY_FIELDS
-from .unit_capability import read_unit_binding, binding_identity, resolve_unit_executable
+from .unit_capability import read_unit_binding, binding_identity
 
 
 # Reviewed launch context contains routing/config paths and proxy settings only.
@@ -54,7 +54,7 @@ class SessionSdkQualification:
     wrapper_entry: Path
     wrapper_sha256: str
     server_version: str
-    server_build_id: str
+    server_build_id: str | None
     semantics: str = 'v1'
 
 
@@ -80,6 +80,63 @@ def _wrapper_identity(path, owner_uid, expected):
             raise ValueError('session SDK wrapper drift')
         return identity(before),tuple(parents)
     finally: os.close(fd)
+
+
+def _script_source_route(entry, *, owner_uid):
+    """Pin the declared JS entry route, including owned ancestor aliases.
+
+    This is source routing, not executable approval; Node retains the existing
+    executable reader. Source bytes are checked by the qualified code manifest.
+    """
+    if (not isinstance(entry, Path) or not entry.is_absolute() or '..' in entry.parts
+            or type(owner_uid) is not int or owner_uid<0):
+        raise ValueError('session script route refused')
+    root=Path('/').lstat()
+    if not stat.S_ISDIR(root.st_mode) or root.st_uid not in {0,owner_uid} or root.st_mode & 0o022:
+        raise ValueError('session script root refused')
+    pending=list(entry.parts[1:]); current=Path('/')
+    route=[('/', 'directory', (root.st_dev,root.st_ino,root.st_uid,root.st_mode),None)]; links=0
+    while pending:
+        component=pending.pop(0)
+        if component=='.':continue
+        if component=='..':
+            current=current.parent
+            continue
+        current=current/component
+        info=current.lstat()
+        if info.st_uid not in {0,owner_uid}:
+            raise ValueError('session script route owner refused')
+        full=(info.st_dev,info.st_ino,info.st_uid,info.st_mode,info.st_nlink,
+              info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+        if stat.S_ISLNK(info.st_mode):
+            links+=1
+            if links>16: raise ValueError('session script link budget')
+            target=os.readlink(current)
+            after=current.lstat()
+            if full!=(after.st_dev,after.st_ino,after.st_uid,after.st_mode,after.st_nlink,
+                       after.st_size,after.st_mtime_ns,after.st_ctime_ns):
+                raise ValueError('session script link drift')
+            route.append((str(current),'link',full,target))
+            # Preserve traversal order: a nested symlink before '..' must be
+            # resolved before walking its parent, exactly as the kernel does.
+            target_path=Path(target)
+            pending=list(target_path.parts[1:] if target_path.is_absolute() else target_path.parts)+pending
+            current=Path('/') if target_path.is_absolute() else current.parent
+        elif stat.S_ISDIR(info.st_mode):
+            if info.st_mode & 0o022: raise ValueError('session script directory refused')
+            route.append((str(current),'directory',full[:4],None))
+            if not pending: raise ValueError('session script file required')
+        else:
+            if pending or not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_mode & 0o022:
+                raise ValueError('session script file refused')
+            route.append((str(current),'file',full,None))
+    return current,tuple(route)
+
+
+def _valid_expected_build(value):
+    # None is a trusted expectation of wire-field absence, never a wildcard.
+    return value is None or (type(value) is str and 0<len(value)<=256
+                             and re.search(r'[\x00-\x1f\x7f]',value) is None)
 
 
 def validate_sdk_response(text, *, version, build_id, boot_id=None, probe=False):
@@ -156,7 +213,7 @@ class SessionRpcLauncher:
     sdk_entry: Path | None = None
     sources: tuple = ()
     server_version: str = ''
-    server_build_id: str = ''
+    server_build_id: str | None = ''
     server_boot_id: str = ''
     cwd: Path | None = None
 
@@ -177,7 +234,8 @@ class SessionRpcLauncher:
                        or not Path(row[0]).is_absolute() or '..' in Path(row[0]).parts or len(row[0])>512
                        or re.search(r'[\x00-\x1f\x7f]',row[0]) is not None
                        or type(row[1]) is not str or re.fullmatch(r'[0-9a-f]{64}',row[1]) is None for row in self.sources)
-                or not all(type(v) is str and v and len(v)<=256 and re.search(r'[\x00-\x1f\x7f]',v) is None for v in (self.server_version,self.server_build_id,self.server_boot_id))):
+                or not all(type(v) is str and v and len(v)<=256 and re.search(r'[\x00-\x1f\x7f]',v) is None for v in (self.server_version,self.server_boot_id))
+                or not _valid_expected_build(self.server_build_id)):
             raise ValueError('session SDK launcher binding unavailable')
 
     @property
@@ -284,7 +342,8 @@ def make_session_api_capability(request, *, qualification, clock_ms, node_reader
             raise ValueError('session qualification scope refused')
         if (type(q.sdk) is not SessionSdkQualification or q.sdk.semantics!='v1'
                 or q.sdk.entry_relative not in q.code.files
-                or not all(type(v) is str and 0<len(v)<=256 and re.search(r'[\x00-\x1f\x7f]',v) is None for v in (q.sdk.server_version,q.sdk.server_build_id))
+                or not all(type(v) is str and 0<len(v)<=256 and re.search(r'[\x00-\x1f\x7f]',v) is None for v in (q.sdk.server_version,))
+                or not _valid_expected_build(q.sdk.server_build_id)
                 or len(q.code.files)>64
                 or re.fullmatch(r'[0-9a-f]{64}',q.sdk.wrapper_sha256) is None):
             raise ValueError('session SDK source qualification unavailable')
@@ -293,14 +352,14 @@ def make_session_api_capability(request, *, qualification, clock_ms, node_reader
         _rpc_environment(q.rpc_environment)
         code_identity = _code_identity(q.code)
         measurement = measure_content_artifact(q.code)
-        cli, route = resolve_unit_executable(q.cli_entry, owner_uid=q.runtime_uid)
+        cli, route = _script_source_route(q.cli_entry, owner_uid=q.runtime_uid)
         if cli != q.code.root / q.gateway_entry_relative:
             raise ValueError('session CLI producer route unknown')
         unit = read_unit_binding(current, unit='openclaw-gateway.service',
             read_properties=unit_properties_reader, clock_ms=clock_ms,
             unit_roots=q.unit_roots, owner_uid=q.runtime_uid)
         argv = unit.effective_config.execstart_argv
-        if len(argv) < 3 or argv[1] != str(cli) or argv[2] != 'gateway':
+        if len(argv) < 3 or argv[1] != str(q.cli_entry) or argv[2] != 'gateway':
             raise ValueError('session Gateway producer route unknown')
         if argv.count('--port') != 1 or argv[argv.index('--port') + 1] != str(q.endpoint_port):
             raise ValueError('session Gateway endpoint route unknown')
@@ -344,7 +403,7 @@ def make_session_api_capability(request, *, qualification, clock_ms, node_reader
                 or binding_identity(read_unit_binding(current, unit='openclaw-gateway.service',
                     read_properties=unit_properties_reader, clock_ms=clock_ms,
                     unit_roots=q.unit_roots, owner_uid=q.runtime_uid)) != binding_identity(unit)
-                or resolve_unit_executable(q.cli_entry, owner_uid=q.runtime_uid) != (cli, route)):
+                or _script_source_route(q.cli_entry, owner_uid=q.runtime_uid) != (cli, route)):
             raise ValueError('session runtime observation drift')
         identity = (measurement, code_identity, route, binding_identity(unit), binary, endpoint, kernel_image,
                     tuple(after.get(field) for field in IDENTITY_FIELDS), q.provenance_ref, protocol_version, q.rpc_environment, wrapper_identity, hello['bootId'],tuple(sorted(hello['methods'])))

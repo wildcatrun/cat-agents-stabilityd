@@ -41,7 +41,7 @@ function validate(p) {
   if (!exact(p, ['schema','mode','sdkEntry','sources','endpoint','server','method','params']) || p.schema !== 1 ||
       !['probe','call'].includes(p.mode) || !bounded(p.sdkEntry) || !path.isAbsolute(p.sdkEntry) ||
       !/^ws:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})$/.test(p.endpoint) || Number(p.endpoint.split(':').at(-1)) > 65535 ||
-      !exact(p.server,['version','buildId','bootId']) || !bounded(p.server.version) || p.server.version.length > 256 || !bounded(p.server.buildId) || p.server.buildId.length > 256 ||
+      !exact(p.server,['version','buildId','bootId']) || !bounded(p.server.version) || p.server.version.length > 256 || (p.server.buildId !== null && (!bounded(p.server.buildId) || p.server.buildId.length > 256)) ||
       !Array.isArray(p.sources) || p.sources.length < 1 || p.sources.length > 64) fail();
   const seen = new Set();
   for (const s of p.sources) {
@@ -78,11 +78,13 @@ async function main() {
       // The SDK swallows this callback's exceptions; rejection belongs to dispatch fence.
       hello = undefined;
       if (!record(value) || value.protocol !== 4 || !record(value.server) ||
-          value.server.version !== p.server.version || value.server.buildId !== p.server.buildId ||
+          value.server.version !== p.server.version ||
+          (p.server.buildId === null ? Object.hasOwn(value.server,'buildId') :
+            (!Object.hasOwn(value.server,'buildId') || value.server.buildId !== p.server.buildId)) ||
           !bounded(value.server.bootId) || value.server.bootId.length > 256 || !record(value.features) ||
           !Array.isArray(value.features.methods) || value.features.methods.length > 4096 ||
           !value.features.methods.every(bounded)) return;
-      hello = {protocol:4,version:value.server.version,buildId:value.server.buildId,
+      hello = {protocol:4,version:value.server.version,buildId:p.server.buildId,
         bootId:value.server.bootId,methods:['sessions.describe','sessions.reset'].filter(m => value.features.methods.includes(m))};
     },
     assertDispatchCurrent() {

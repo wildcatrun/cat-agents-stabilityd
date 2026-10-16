@@ -130,6 +130,12 @@ def mux_fixture(served=True, with_socket=True, discovery_absent=False):
             f.home, path, f.q.runtime_root, identity.get('cmdlineDigest',''), identity.get('bootId',''),
             'evidence://reviewed-installed-source-fixture/mux-protocol1', code_root=f.root, bridge_entry=bridge,
             bridge_sha256=BRIDGE_SHA256)
+        from stability_core import installation_capability as installation
+        from installation_fixture_support import mux_artifact
+        # Real peer argv is fixture process routing metadata. Its permitted
+        # shape is supplied as the fixture's independent launch declaration.
+        peer_argv=tuple(part.decode() for part in Path('/proc/self/cmdline').read_bytes().rstrip(b'\0').split(b'\0')) if sys.platform.startswith('linux') else tuple(sys.orig_argv if hasattr(sys,'orig_argv') else [sys.executable,*sys.argv])
+        factory=mux_artifact(q,private_core/'qualified_installations_v1.json',node_id=base.daemon.platform.node(),peer_argv=peer_argv)
         real_access = os.access
         def fixture_access(path, mode, *args, **kwargs):
             if mode == os.X_OK and Path(path) == cli:
@@ -144,13 +150,13 @@ def mux_fixture(served=True, with_socket=True, discovery_absent=False):
             argv, env, cwd = route.command(verb); commands.append((argv, env, cwd))
             return subprocess.run(list(argv), env=env, cwd=str(cwd), timeout=timeout, text=True, capture_output=True)
         try:
-            with mock.patch('os.access', side_effect=fixture_access), \
-                 mock.patch.object(routes, 'NATIVE_QUALIFICATION', None), \
-                 mock.patch.object(routes, 'MUX_QUALIFICATION', q), \
+            with mock.patch.object(installation, 'load_packaged_installations', return_value=factory), \
+                 mock.patch.object(base.daemon, 'current_host_generation', return_value=base.daemon.platform.node()+':'+identity.get('bootId','')), \
+                 mock.patch('os.access', side_effect=fixture_access), \
                  mock.patch.object(base.daemon, 'run_hermes_mux_command', side_effect=effect), \
                  mock.patch.object(base.daemon, 'systemctl_user_show', side_effect=AssertionError('mux must not read profile unit')), \
                  mock.patch.object(base.daemon, 'run_hermes_profile_gateway_cmd', side_effect=AssertionError('qualified mux must not fallback')):
-                yield SimpleNamespace(**dict(vars(f), qualification=q, state=state, commands=commands, writes=writes))
+                yield SimpleNamespace(**dict(vars(f), qualification=q, state=state, commands=commands, writes=writes, installation_factory=factory))
         finally:
             stopped.set(); listener.close()
             if with_socket: worker.join(3)
@@ -182,9 +188,10 @@ class MuxScopeTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'native source parent untrusted'):
                     routes._read_program_source(bridge, owner_uid=os.getuid())
 
-    def test_unknown_context_preserves_existing_path(self):
+    def test_unknown_context_refuses_unqualified_runtime_action(self):
         with mock.patch.object(routes, 'MUX_QUALIFICATION', None):
-            self.assertIsNone(base.daemon.resolve_hermes_mux_route('catbody', 'hermes.profile.lifecycle', 'boot'))
+            with self.assertRaises(ValueError):
+                base.daemon.resolve_hermes_mux_route('catbody', 'hermes.profile.lifecycle', 'boot')
 
     def test_import_origins_bind_actual_package_and_module_paths_without_execution(self):
         with mux_fixture(with_socket=False) as f:
@@ -377,8 +384,8 @@ class MuxActualPeerTests(unittest.TestCase):
                 self.assertEqual(f.commands, [])
 
     def test_peer_boot_or_cmdline_not_independently_qualified_zero_effect(self):
-        with mux_fixture(True) as f, mock.patch.object(routes, 'MUX_QUALIFICATION',
-                replace(f.qualification, peer_cmdline_digest='0'*64)):
+        with mux_fixture(True) as f:
+            f.installation_factory._manifest['installations'][0]['muxPeerArgv']=['/wrong/peer']
             self.assertEqual(self.lifecycle(True)['result'], 'blocked')
             self.assertEqual(f.commands, [])
 
@@ -425,7 +432,7 @@ class MuxActualPeerTests(unittest.TestCase):
 
     def test_socket_replacement_does_not_reuse_peer_capability(self):
         with mux_fixture(True) as f:
-            route = base.daemon.resolve_hermes_mux_route('catbody', 'hermes.profile.lifecycle', 'boot:fixture')
+            route = base.daemon.resolve_hermes_mux_route('catbody', 'hermes.profile.lifecycle', base.daemon.current_host_generation())
             f.qualification.socket_path.unlink()
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as replacement:
                 replacement.bind(str(f.qualification.socket_path)); f.qualification.socket_path.chmod(0o600)
