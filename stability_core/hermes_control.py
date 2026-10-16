@@ -73,6 +73,9 @@ def query_readonly(socket_path: Path, verb: str, *, expected_uid: int, timeout: 
     path = Path(socket_path)
     if not path.is_absolute() or '..' in path.parts: raise ValueError('absolute canonical socket required')
     identity = lambda info: (info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_ctime_ns)
+    # Directory child activity changes ctime without changing this route. Bind
+    # directory identity/authority, while retaining full socket inode fencing.
+    parent_identity = lambda info: (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
     ancestors = []
     for parent in path.parents:
         info = parent.lstat()
@@ -80,13 +83,13 @@ def query_readonly(socket_path: Path, verb: str, *, expected_uid: int, timeout: 
             raise ValueError('socket ancestor refused')
         if info.st_uid not in {0, expected_uid} or info.st_mode & 0o022:
             raise ValueError('socket ancestor permissions refused')
-        ancestors.append((parent, identity(info)))
+        ancestors.append((parent, parent_identity(info)))
     before = path.lstat()
     if not stat.S_ISSOCK(before.st_mode) or before.st_uid != expected_uid or before.st_mode & 0o077:
         raise ValueError('socket identity refused')
     def unchanged():
         return (identity(path.lstat()) == identity(before)
-                and all(identity(parent.lstat()) == expected for parent, expected in ancestors))
+                and all(parent_identity(parent.lstat()) == expected for parent, expected in ancestors))
     deadline = time.monotonic() + timeout
     wall_started = time.time()
     mono_started = time.monotonic()

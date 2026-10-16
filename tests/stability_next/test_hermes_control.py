@@ -151,6 +151,11 @@ class HermesSocketTransportTests(unittest.TestCase):
                             return
                         result = {'protocol': 1, 'pid': os.getpid()} if verb == 'identify' else {
                             'protocol': 1, 'answering_pid': os.getpid(), 'answered_at': time.time()}
+                        if mode == 'sibling': (path.parent / 'unrelated-child').write_bytes(b'fixture')
+                        if mode == 'parent-mode': path.parent.chmod(0o500)
+                        if mode == 'parent-symlink':
+                            os.rename(directory, directory + '-moved')
+                            os.symlink(directory + '-moved', directory)
                         if mode == 'wrong-pid': result['pid'] += 1
                         if mode == 'old-status': result['answered_at'] -= 60
                         if mode == 'future-status': result['answered_at'] += 60
@@ -169,7 +174,7 @@ class HermesSocketTransportTests(unittest.TestCase):
             worker = threading.Thread(target=serve)
             worker.start()
             try:
-                if mode == 'ok':
+                if mode in {'ok', 'sibling'}:
                     observed = query_readonly(path, verb, expected_uid=os.getuid())
                     self.assertEqual(observed.peer_pid, os.getpid())
                     self.assertFalse(observed.action_authorized)
@@ -179,12 +184,20 @@ class HermesSocketTransportTests(unittest.TestCase):
                                        timeout=0.05 if mode == 'timeout' else 2)
             finally:
                 worker.join(3)
+                if mode == 'parent-symlink' and Path(directory).is_symlink():
+                    Path(directory).unlink()
+                    os.rename(directory + '-moved', directory)
+                Path(directory).chmod(0o700)
                 listener.close()
             self.assertFalse(worker.is_alive())
             self.assertEqual(failures, [])
 
     def test_actual_identify(self): self.fixture('ok')
     def test_actual_status(self): self.fixture('ok', 'status')
+    def test_actual_sibling_churn_identify(self): self.fixture('sibling')
+    def test_actual_sibling_churn_status(self): self.fixture('sibling', 'status')
+    def test_actual_parent_permission_change(self): self.fixture('parent-mode')
+    def test_actual_parent_symlink_retarget(self): self.fixture('parent-symlink')
     def test_actual_timeout(self): self.fixture('timeout')
     def test_actual_oversize(self): self.fixture('oversize')
     def test_actual_peer_mismatch(self): self.fixture('wrong-pid')
