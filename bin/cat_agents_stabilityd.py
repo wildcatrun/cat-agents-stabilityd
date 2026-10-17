@@ -6456,12 +6456,12 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
     if timing is not None:
         hermers_restart_history = [{'tsEpoch':now_s-RESTART_WINDOW_SECONDS+(ms+999)//1000, 'profile':''}
                                   for ms in timing['history'].get('hermes.gateway.history',[])]
-        waiting = [timing['windows'].get('hermes.gateway:'+item['profile'],0)
+        waiting = [timing['windows'].get('hermes.gateway:'+item['profile'].casefold(),0)
                    for item in hermers_gateway_restart_profiles]
         hermers_cooldown_active = bool(waiting and all(ms>0 for ms in waiting))
         hermers_cooldown_until = now_s+(min(waiting)+999)//1000 if hermers_cooldown_active else 0
         hermers_gateway_restart_profiles = [item for item in hermers_gateway_restart_profiles
-                                           if timing['windows'].get('hermes.gateway:'+item['profile'],0)==0]
+                                           if timing['windows'].get('hermes.gateway:'+item['profile'].casefold(),0)==0]
     hermers_restart_storm = len(hermers_restart_history) >= MAX_RESTARTS_PER_WINDOW
     hermers_restart_candidate = bool(hermers_gateway_restart_profiles and hot(streaks, "hermers_gateway_service_down"))
     hermers_restart_remaining = max(0, MAX_RESTARTS_PER_WINDOW - len(hermers_restart_history))

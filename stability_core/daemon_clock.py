@@ -12,6 +12,7 @@ from .clock_discipline import ClockDiscipline, ClockRefused
 TOLERANCE_MS = 2000
 RECOVERY_STABLE_MS = 60000
 MAX_HISTORY = 4096
+PROFILE = re.compile(r'[A-Za-z0-9_-]{1,64}')
 
 
 def linux_sample():
@@ -61,9 +62,9 @@ class DaemonClock:
             value = json.loads(raw)
             scope = None
             if key == 'stabilityd_last_gateway_restart_at': scope, duration = 'openclaw.gateway', self.restart_ms
-            elif re.fullmatch(r'hermers_gateway_restart:[a-z][a-z0-9_-]{0,63}', key): scope, duration = 'hermes.gateway:'+key.split(':',1)[1], self.restart_ms
+            elif re.fullmatch(r'hermers_gateway_restart:[A-Za-z0-9_-]{1,64}', key): scope, duration = 'hermes.gateway:'+key.split(':',1)[1].casefold(), self.restart_ms
             elif re.fullmatch(r'session_reset:sha256:[a-f0-9]{64}', key): scope, duration = 'openclaw.session:'+key.rsplit(':',1)[1], self.session_ms
-            elif re.fullmatch(r'hermers_profile_mode:[a-z][a-z0-9_-]{0,63}:(?:hot|hibernate)', key): scope, duration = 'hermes.lifecycle:'+key.split(':',1)[1], self.lifecycle_ms
+            elif re.fullmatch(r'hermers_profile_mode:[A-Za-z0-9_-]{1,64}:(?:hot|hibernate)', key): scope, duration = 'hermes.lifecycle:'+key.split(':',1)[1].casefold(), self.lifecycle_ms
             elif key in ('stabilityd_gateway_restart_history', 'stabilityd_hermers_gateway_restart_history'):
                 if type(value) is not list or len(value)>MAX_HISTORY:
                     raise ClockRefused('clock-legacy-history-invalid')
@@ -89,16 +90,16 @@ class DaemonClock:
         if kind == 'openclaw.gateway.restart': return 'openclaw.gateway', self.restart_ms, 'openclaw.gateway.history'
         if kind == 'hermes.gateway.restart':
             profile = data.get('profile')
-            if not isinstance(profile,str) or not re.fullmatch('[a-z][a-z0-9_-]{0,63}',profile): raise ClockRefused('clock-profile-invalid')
-            return 'hermes.gateway:'+profile, self.restart_ms, 'hermes.gateway.history'
+            if not isinstance(profile,str) or PROFILE.fullmatch(profile) is None: raise ClockRefused('clock-profile-invalid')
+            return 'hermes.gateway:'+profile.casefold(), self.restart_ms, 'hermes.gateway.history'
         if kind == 'openclaw.session.reset':
             digest = data.get('sessionKeyDigest')
             if not isinstance(digest,str) or not re.fullmatch('[a-f0-9]{64}',digest): raise ClockRefused('clock-session-invalid')
             return 'openclaw.session:'+digest, self.session_ms, 'openclaw.session.history'
         if kind == 'hermes.profile.lifecycle':
             profile, mode = data.get('profile'), data.get('targetMode')
-            if not isinstance(profile,str) or not re.fullmatch('[a-z][a-z0-9_-]{0,63}',profile) or mode not in ('hot','hibernate'): raise ClockRefused('clock-profile-invalid')
-            return 'hermes.lifecycle:'+profile+':'+mode, self.lifecycle_ms, 'hermes.lifecycle.history'
+            if not isinstance(profile,str) or PROFILE.fullmatch(profile) is None or mode not in ('hot','hibernate'): raise ClockRefused('clock-profile-invalid')
+            return 'hermes.lifecycle:'+profile.casefold()+':'+mode, self.lifecycle_ms, 'hermes.lifecycle.history'
         raise ClockRefused('clock-action-outside-scope')
 
     def check(self, spec, epoch=None):

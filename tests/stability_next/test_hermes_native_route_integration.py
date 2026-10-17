@@ -65,6 +65,8 @@ def fixture():
                       mock.patch.object(daemon, 'recent_hermers_gateway_restart_history', return_value=[]),
                       mock.patch.object(daemon, 'record_hermers_gateway_restart_time')):
                 stack.enter_context(p)
+            from clock_fixture_support import clock_fixture_context
+            stack.enter_context(clock_fixture_context(daemon, root/'actuation.lock'))
             yield SimpleNamespace(root=root, code=code, unit=unit, home=home, q=q, effects=effects, state=state, registry=registry, reply=reply)
 
 class NativeIntegrationTests(unittest.TestCase):

@@ -3,7 +3,7 @@
   "boundary": "V18 finite clock projection only; exact full-policy and repair-gate oracle; no execution authority",
   "v1FixtureSha256": "95235070b2921efd7c96260450b62cade904eaec2a4d3e51a3eb1f7353e0f5fc",
   "candidate": {
-    "sourceSha256": "dade1b6cde1f9b422b9ae0dd7fdcb59cd951a654e83e0e83c37c37d8c1d335ec",
+    "sourceSha256": "a73d25075be8aa9147ab08c55dcbfa5b5cd22989140676820f4757be93cef5cf",
     "functions": {
       "resource_pressure_active": "7b273e61dc2a698846e31126cc9d95433b4078ecce551573a81bace2319baca7",
       "max_severity": "888d3f29e901da76e93cab0e3288b526385b6635c69af0560e159fb90c3377cb",
@@ -11,7 +11,7 @@
       "hot": "18e667f832e979b3e25b701477912336ee5c811b2f6f01330cd1c586aaabf1e8",
       "sustained": "f23b77b2c54813093f2f58ac241038df0371c89ffbb3fc1a554ca877d397cfb5",
       "build_lane_policy": "29bd8b61a8ff78909dda26cc6f16117e4ae6123e991cdd19abe70308bcd2d079",
-      "policy_from_findings": "baed7c444411471a7c0ceb21917a355fb183226bfaddfc2947956810197442bc",
+      "policy_from_findings": "136783645d34318d2e1bd6af65459ef8e2be18baef949eba0af2eb8a52c80238",
       "build_repair_gate_from_policy": "f8de589254290cf855f5ec908f22ca2af10e879a2a98a564e5d95d2a90b0700e"
     }
   },

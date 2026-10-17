@@ -148,6 +148,11 @@ class DaemonClockBridgeTests(unittest.TestCase):
         with sqlite3.connect(self.path) as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM stability_clock_history WHERE scope='hermes.gateway.history'").fetchone()[0],2)
 
+    def test_existing_numeric_and_case_alias_profiles_share_cooldown(self):
+        self.assertEqual(self.execute('hermes.gateway.restart', 'numeric', profile='1Cat').record.state, 'succeeded')
+        self.assertEqual(self.execute('hermes.gateway.restart', 'case-alias', profile='1cat').record.state, 'blocked')
+        self.assertEqual(len(self.effects), 1)
+
     def test_historical_receipt_requires_no_new_clock_or_authorizer(self):
         first=self.execute('openclaw.gateway.restart')
         with (mock.patch.object(m,'daemon_clock',side_effect=AssertionError('no clock read')),

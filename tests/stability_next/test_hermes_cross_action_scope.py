@@ -53,6 +53,8 @@ def fixture(profile="catbody"):
                       mock.patch.object(m,'systemctl_user_show',return_value={'ActiveState':'inactive','SubState':'dead'}),
                       mock.patch.object(m,'run_hermes_profile_gateway_cmd',side_effect=command)):
             stack.enter_context(patch)
+        from clock_fixture_support import clock_fixture_context
+        stack.enter_context(clock_fixture_context(m, Path(temporary)/'actuation.lock'))
         yield path,effects
 
 def entry(kind, profile="catbody"):
@@ -129,11 +131,17 @@ class CrossActionTests(unittest.TestCase):
     def test_two_real_entry_connections_race_without_double_effect(self):
         with fixture() as (path,effects):
             ActionLedger(path).close()
-            barrier=threading.Barrier(2);original=ActionLedger.plan_action;results=[];errors=[];contender_refused=threading.Event()
-            def synchronized(ledger,**kwargs):
+            # Timed entries now share the actual actuation lock before planning;
+            # forcing both contenders inside plan_action would deadlock the test.
+            barrier=threading.Barrier(2);results=[];errors=[];contender_refused=threading.Event()
+            original_entry=m.execute_governed_effect
+            original_enter=m.ActuationLock.__enter__
+            def synchronized(*args,**kwargs):
                 barrier.wait(timeout=10)
-                try:return original(ledger,**kwargs)
-                except ActionConflict:
+                return original_entry(*args,**kwargs)
+            def observe_lock(lock):
+                try:return original_enter(lock)
+                except m.ActuationBusy:
                     contender_refused.set();raise
             original_command=m.run_hermes_profile_gateway_cmd.side_effect
             def held_command(profile,verb,timeout=60):
@@ -143,7 +151,8 @@ class CrossActionTests(unittest.TestCase):
             def invoke(kind):
                 try:results.append(entry(kind))
                 except BaseException as error:errors.append(error)
-            with mock.patch.object(ActionLedger,'plan_action',synchronized), \
+            with mock.patch.object(m,'execute_governed_effect',side_effect=synchronized), \
+                 mock.patch.object(m.ActuationLock,'__enter__',observe_lock), \
                  mock.patch.object(m,'run_hermes_profile_gateway_cmd',side_effect=held_command):
                 threads=[threading.Thread(target=invoke,args=(kind,)) for kind in ('restart','start')]
                 for thread in threads:thread.start()

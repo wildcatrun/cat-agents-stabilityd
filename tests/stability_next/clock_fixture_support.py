@@ -1,4 +1,6 @@
 """Declared test-only Linux-clock stand-in; production admission is unchanged."""
+import contextlib
+import unittest
 from stability_core.daemon_clock import DaemonClock
 from stability_core.action_ledger import ActionLedger
 
@@ -38,3 +40,13 @@ def install_clock_fixture(testcase, module, lock_path):
                   mock.patch.object(module,'daemon_clock',side_effect=factory),
                   mock.patch.object(module,'ACTUATION_LOCK_PATH',lock_path)):
         patch.start();testcase.addCleanup(patch.stop)
+
+
+@contextlib.contextmanager
+def clock_fixture_context(module, lock_path):
+    owner = unittest.TestCase()
+    try:
+        install_clock_fixture(owner, module, lock_path)
+        yield
+    finally:
+        owner.doCleanups()

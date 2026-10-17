@@ -58,6 +58,8 @@ class GatewayCapabilityIntegrationTests(unittest.TestCase):
             mock.patch.object(m, 'record_restart_time')]
         for patch in patches:
             patch.start(); self.addCleanup(patch.stop)
+        from clock_fixture_support import install_clock_fixture
+        install_clock_fixture(self, m, self.root/'actuation.lock')
 
     def call(self):
         now = m.epoch()
