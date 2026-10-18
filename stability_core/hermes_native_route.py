@@ -73,6 +73,7 @@ class NativeQualification:
     provenance_ref: str
     target_profile: str = ''  # Qualification scope, not a member registry.
     semantics: str = 'reviewed-hermes-profile-standalone-source-window-v1'
+    environment_sha256s: tuple = ()  # Immutable reviewed alternatives; never measured admission.
 
 
 # Shared adapter installation context, deliberately no per-agent member list.
@@ -84,6 +85,23 @@ def _digest(raw):
     if type(raw) is not str or len(raw.encode()) > 32768:
         raise ValueError('native environment observation budget')
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _environment_digests(qualification):
+    """One legacy digest or a finite reviewed set, never ambient approval."""
+    single, alternatives = qualification.environment_sha256, qualification.environment_sha256s
+    valid = lambda value: type(value) is str and re.fullmatch('[0-9a-f]{64}', value) is not None
+    if type(alternatives) is not tuple:
+        raise ValueError('native environment digest set refused')
+    if alternatives:
+        if (single != '' or not 1 <= len(alternatives) <= 16
+                or any(not valid(value) for value in alternatives)
+                or len(set(alternatives)) != len(alternatives)):
+            raise ValueError('native environment digest set refused')
+        return alternatives
+    if not valid(single):
+        raise ValueError('native environment digest refused')
+    return (single,)
 
 
 def _source_scope(source):
@@ -132,6 +150,7 @@ class NativeRoute:
                 or type(q.sources) is not tuple or not q.sources
                 or type(q.absent_sources) is not tuple):
             raise ValueError('native qualification unavailable')
+        self._approved_environment_digests = _environment_digests(q)
         validate_profile_argv(q.argv, profile)
         if not {'main.py', 'profiles.py', 'gateway_multiplex_mode.py'} <= {p.name for p, _ in q.sources}:
             raise ValueError('native profile and standalone source window missing')
@@ -146,7 +165,7 @@ class NativeRoute:
         manager_before = self._manager()
         environment_before = self._environment(self.unit)
         if (_digest(manager_before) != q.manager_sha256
-                or _digest(environment_before) != q.environment_sha256):
+                or _digest(environment_before) not in self._approved_environment_digests):
             raise ValueError('native effective launch environment unqualified')
         properties = dict(line.split('=', 1) for line in environment_before.splitlines())
         home = q.runtime_root / 'profiles' / self.profile
@@ -226,7 +245,8 @@ class NativeRoute:
                 or not _same_live_scope(_live_scope(live), _live_scope(final_live))):
             raise ValueError('native closing unit or profile window drift')
         return (binding_identity(binding), tuple(sources), tuple(_source_scope(s) for s in absent),
-                tuple(_source_scope(s) for s in environment_files), config, _live_scope(final_live))
+                tuple(_source_scope(s) for s in environment_files), config,
+                _digest(environment_before), _live_scope(final_live))
 
     def verify(self):
         observed = self._observe()

@@ -20,7 +20,7 @@ from .hermes_profile_config import read_profile_config
 from .session_api_capability import SessionApiQualification, SessionSdkQualification
 
 PACKAGED_MANIFEST = Path(__file__).with_name('qualified_installations_v1.json')
-PACKAGED_MANIFEST_SHA256 = '12b6b6e9c0eba48528dda5bb3160936f1a8606c1f36f866f4d3440a23beb1414'
+PACKAGED_MANIFEST_SHA256 = 'ab5fa79911278eaf1087095947d9c4edb112a4247e4fda89525c429e48d28025'
 PROFILE = re.compile(r'[A-Za-z0-9_-]{1,64}')
 SHA = re.compile(r'[0-9a-f]{64}')
 
@@ -195,13 +195,25 @@ class InstallationFactory:
             common=dict(owner_uid=item['ownerUid'],runtime_root=root,target_profile=profile,
                         sources=sources,provenance_ref='evidence://installation-contract/'+contract['id'])
             if kind=='native':
+                alternatives = ()
+                if 'unitEnvironmentSha256s' in item:
+                    raw_digests = item['unitEnvironmentSha256s']
+                    if (type(raw_digests) is not list or not 1 <= len(raw_digests) <= 16
+                            or 'unitEnvironmentSha256' in item or 'unitEnvironmentTemplate' in item):
+                        raise ValueError('installation environment digest set refused')
+                    alternatives = tuple(_digest(value) for value in raw_digests)
+                    if len(set(alternatives)) != len(alternatives):
+                        raise ValueError('installation environment digest duplicate')
+                    environment_digest = ''
+                else:
+                    environment_digest = (_digest(item['unitEnvironmentSha256']) if 'unitEnvironmentSha256' in item else
+                        hashlib.sha256(render(item['unitEnvironmentTemplate']).encode()).hexdigest())
                 q=NativeQualification(**common,unit_roots=tuple(_path(p) for p in item['unitRoots']),
                     argv=tuple(render(v) for v in item['nativeArgv']),
                     executable_sha256=_digest(item['interpreterSha256']),
                     absent_sources=tuple(_path(render(p)) for p in item['absentSources']),
                     manager_sha256=_digest(item['managerSha256']),
-                    environment_sha256=(_digest(item['unitEnvironmentSha256']) if 'unitEnvironmentSha256' in item else
-                        hashlib.sha256(render(item['unitEnvironmentTemplate']).encode()).hexdigest()))
+                    environment_sha256=environment_digest, environment_sha256s=alternatives)
             else:
                 # Expected command bytes come from approved launch shape. Boot
                 # is current kernel instance evidence, not semantic approval.

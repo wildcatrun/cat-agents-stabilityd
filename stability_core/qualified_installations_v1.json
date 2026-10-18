@@ -21,10 +21,25 @@
           "path": "hermes_cli/gateway_multiplex_mode.py",
           "sha256": "d61d2a27d92fa70a113f80ab248991f3ae363f66bcec940ea3f581305cd608de",
           "bytes": 16973
+        },
+        {
+          "path": "hermes_cli/env_loader.py",
+          "sha256": "f33feafb58da3bd1e19eb3c97fdfc461c570ed3823fb56dd84f8e95357d2e7b9",
+          "bytes": 34896
+        },
+        {
+          "path": "hermes_cli/managed_scope.py",
+          "sha256": "692289b37fa3ce547b37d8fc20baf12f0e1a8358689ebdc48e51d06250e91037",
+          "bytes": 6977
+        },
+        {
+          "path": ".env",
+          "sha256": "b9ba9647c11c348d6b3fe5dfa07eedfb77c23f5cfd311d43df56b20ebc688f37",
+          "bytes": 22899
         }
       ],
       "status": "reviewed",
-      "reviewRef": "hermes-launch-source/manifest.json + standalone-route-source-manifest-20261015.json"
+      "reviewRef": "hermes-launch-source/manifest.json + standalone-route-source-manifest-20261015.json; development-server deployment 2026-10-19: closed env projections and reviewed loader/managed absence contracts"
     },
     {
       "id": "hermes-installed-mux-source-v1",
@@ -136,7 +151,7 @@
       "family": "hermes",
       "nodeId": "VM-4-17-ubuntu",
       "ownerUid": 1002,
-      "status": "layout-metadata-pending",
+      "status": "qualified",
       "codeRoot": "/home/flashcat/hermes-agent",
       "runtimeRoot": "/home/flashcat/.hermes",
       "unitRoots": [
@@ -147,7 +162,7 @@
         "mux": "hermes-installed-mux-source-v1"
       },
       "nativeArgv": [
-        "/home/flashcat/hermes-agent/venv/bin/python",
+        "/home/flashcat/hermes-agent/venv-python312/bin/python",
         "-m",
         "hermes_cli.main",
         "--profile",
@@ -160,13 +175,7 @@
       "cliEntry": "/home/flashcat/.local/bin/hermes",
       "cliSha256": "694d14bc27ebbda855b6ff66169521903b0c85a1ee0d70399b192650bf510647",
       "missingQualificationInputs": [
-        "native manager/env projection approved expected digests and source absence contract",
-        "mux explicit host launch/home/socket layout approval"
-      ],
-      "observedAdmissionBlocks": [
-        "source-root-and-unit-root-mode-0775",
-        "source-files-mode-0664",
-        "permissions-not-changed-by-this-candidate"
+        "mux host launch/home/socket/peer bindings absent; topology change remains unknown"
       ],
       "observedLaunchMetadata": {
         "digestEvidence": "installation-environment-digests-20261017.json",
@@ -175,27 +184,38 @@
         "importKeysPresent": [
           "LD_LIBRARY_PATH"
         ],
-        "approved": false
-      }
+        "approved": true
+      },
+      "historicalAdmissionBlocks": [
+        "source-root-and-unit-root-mode-0775",
+        "source-files-mode-0664",
+        "permissions-not-changed-by-this-candidate"
+      ],
+      "reviewRef": "2026-10-19-deployment: explicit installation authorization, finite permission rollback, actual source/unit metadata review; runtime postchecks mandatory",
+      "managerSha256": "80322c323f2f1ec3d8eace51b0d639ba586a70490a72ed165a8dea34805b7547",
+      "unitEnvironmentSha256s": [
+        "3b646b2c13f077d946ee1182d3bf89d88919174999bf65d05ed02986be3d7fe3",
+        "6f385f5e1e04f9628f96a78906f0e8ac65e8c520df0c775e9d083d317491a8eb",
+        "904e6d800df656018ee3f7719a260aa50e76b948065e0622a95ee60955b67a59",
+        "a76dc597765befa77f56fdaf8c830da847d2b1a5507b7b9dcb1d66a0385a8f78",
+        "aab2a89e38cfd8829b0e42fe46d77782673fea72ca7927c82616cd07028d1d36",
+        "e5831d3f3a5e64f2b2069e94bee20985ae52f476d11ca3e7e4890d1d38381e9c"
+      ],
+      "absentSources": [
+        "{home}/.op.env",
+        "/etc/hermes/.env"
+      ],
+      "qualifiedScope": "current standalone source/launch binding; no mux host installation approval"
     },
     {
       "id": "dev-openclaw",
       "family": "openclaw",
       "nodeId": "VM-4-17-ubuntu",
       "ownerUid": 1002,
-      "status": "layout-metadata-pending",
+      "status": "qualified",
       "codeRoot": "/home/flashcat/.local/lib/node_modules/openclaw",
       "contract": "openclaw-installed-session-sdk-v1",
-      "missingQualificationInputs": [
-        "finite script alias route installation admission and owned permissions",
-        "reviewed RPC environment and source closure",
-        "permission hardening installation approval and post-check"
-      ],
-      "observedAdmissionBlocks": [
-        "source-root-mode-0775",
-        "source-files-mode-0664",
-        "permissions-not-changed-by-this-candidate"
-      ],
+      "missingQualificationInputs": [],
       "observedUnitMetadata": {
         "manager": "system",
         "unitRoots": [
@@ -204,8 +224,58 @@
         "cliEntry": "/usr/lib/node_modules/openclaw/dist/index.js",
         "cliRelative": "dist/index.js",
         "endpointPort": 23466,
-        "approved": false
-      }
+        "approved": true
+      },
+      "historicalAdmissionBlocks": [
+        "source-root-mode-0775",
+        "source-files-mode-0664",
+        "permissions-not-changed-by-this-candidate"
+      ],
+      "reviewRef": "2026-10-19-deployment: explicit installation authorization, finite permission rollback, actual source/unit metadata review; runtime postchecks mandatory",
+      "cliEntry": "/usr/lib/node_modules/openclaw/dist/index.js",
+      "cliRelative": "dist/index.js",
+      "unitRoots": [
+        "/etc/systemd/system"
+      ],
+      "endpointPort": 23466,
+      "rpcEnvironment": [
+        [
+          "HOME",
+          "/home/flashcat"
+        ],
+        [
+          "USER",
+          "flashcat"
+        ],
+        [
+          "LOGNAME",
+          "flashcat"
+        ],
+        [
+          "OPENCLAW_CONFIG_PATH",
+          "/home/flashcat/.openclaw/openclaw.json"
+        ],
+        [
+          "OPENCLAW_STATE_DIR",
+          "/home/flashcat/.openclaw"
+        ],
+        [
+          "HTTP_PROXY",
+          "http://127.0.0.1:7890"
+        ],
+        [
+          "HTTPS_PROXY",
+          "http://127.0.0.1:7890"
+        ],
+        [
+          "ALL_PROXY",
+          "socks5://127.0.0.1:7890"
+        ],
+        [
+          "NO_PROXY",
+          "127.0.0.1,localhost,::1"
+        ]
+      ]
     }
   ]
 }

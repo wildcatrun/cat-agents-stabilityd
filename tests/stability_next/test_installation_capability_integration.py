@@ -150,8 +150,14 @@ class InstallationCapabilityIntegrationTests(unittest.TestCase):
         self.assertEqual({c['family'] for c in catalog['sourceContracts']},{'hermes','openclaw'})
         self.assertEqual({c['kind'] for c in catalog['sourceContracts']},{'native','mux','session'})
         self.assertTrue(all(c['files'] for c in catalog['sourceContracts']))
-        self.assertTrue(all(i['missingQualificationInputs'] for i in catalog['installations']))
-        self.assertTrue(all(i['observedAdmissionBlocks'] for i in catalog['installations']))
+        # This deployment artifact binds the reviewed host installation.
+        # Qualification remains an input to fresh route checks, never authority.
+        self.assertTrue(all(i['status'] == 'qualified' for i in catalog['installations']))
+        self.assertTrue(all(i.get('actionAuthorized', False) is False for i in catalog['installations']))
+        hermes = next(i for i in catalog['installations'] if i['family'] == 'hermes')
+        self.assertTrue(hermes['missingQualificationInputs'])  # no fabricated mux host
+        self.assertTrue(hermes['unitEnvironmentSha256s'])
+        self.assertIn('{home}/.op.env', hermes['absentSources'])
         text=installation.PACKAGED_MANIFEST.read_text()
         for member in ('catbody','catears','cateyes','catheart','catnose','catpenclaw'):
             self.assertNotIn(member,text)
