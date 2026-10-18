@@ -1788,20 +1788,51 @@ def workflow_runtime_registry_records() -> Dict[str, Any]:
         ).fetchall()
         payload["records"] = [dict(row) for row in rows]
         identities = [str(item.get("agent_id") or "").strip() for item in payload["records"]]
+        def closed_historical_row(item):
+            return (
+                item.get("status") in {"retired", "inactive", "dormant"}
+                and all(item.get(key) in (0, False) for key in (
+                    "can_receive_dispatch", "can_start_workflow", "gateway_proxy_allowed"
+                ))
+            )
+
+        payload["observationOnlyHistoricalRows"] = [
+            {"agent_key": item.get("agent_key"), "agent_id": item.get("agent_id"), "runtime": item.get("runtime")}
+            for item in payload["records"] if closed_historical_row(item)
+        ]
         complete_rows = all(
             str(item.get("agent_id") or "").strip()
             and str(item.get("runtime") or "").strip()
             and str(item.get("status") or "").strip()
             and str(item.get("platform") or "").strip()
             and str(item.get("execution_adapter") or "").strip()
-            and str(item.get("endpoint_ref") or "").strip()
+            and (str(item.get("endpoint_ref") or "").strip() or closed_historical_row(item))
             and all(item.get(key) in (0, 1, False, True) for key in (
                 "can_receive_dispatch", "can_start_workflow", "gateway_proxy_allowed"
             ))
             for item in payload["records"]
         )
-        payload["duplicateAgentIds"] = sorted({value for value in identities if value and identities.count(value) > 1})
-        payload["writeEligible"] = not missing_required and complete_rows and not payload["duplicateAgentIds"]
+        # Official registry identity is runtime-scoped; legacy flat schemas
+        # retain their stricter agent_id uniqueness contract.
+        composite_identity = "agent_key" in columns
+        keys = [item.get("agent_key") for item in payload["records"]]
+        payload["identitySchema"] = "runtime-composite" if composite_identity else "legacy-flat"
+        payload["duplicateAgentIds"] = [] if composite_identity else sorted({
+            value for value in identities if value and identities.count(value) > 1
+        })
+        payload["duplicateAgentKeys"] = sorted({
+            value for value in keys if isinstance(value, str) and value and keys.count(value) > 1
+        }) if composite_identity else []
+        identity_rows_valid = not composite_identity or all(
+            isinstance(item.get("agent_key"), str)
+            and bool(item["agent_key"].strip())
+            and item["agent_key"] == str(item.get("runtime") or "") + ":" + str(item.get("agent_id") or "")
+            for item in payload["records"]
+        )
+        payload["writeEligible"] = (
+            not missing_required and complete_rows and identity_rows_valid
+            and not payload["duplicateAgentIds"] and not payload["duplicateAgentKeys"]
+        )
         payload["health"] = "healthy" if payload["writeEligible"] else "incomplete"
         if not payload["writeEligible"]:
             payload["error"] = "runtime_agents schema or records are incomplete for lifecycle scope"
