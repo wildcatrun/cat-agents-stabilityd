@@ -3321,20 +3321,59 @@ def hermers_collect(
     profile_registry, registry_meta = hermers_profiles_from_runtime_registry(findings)
     for profile in sorted(profile_registry):
         unit = f"hermes-gateway-{profile}.service"
-        service = systemctl_user_show(unit)
-        active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
-        pid = int(service.get("MainPID") or 0)
+        topology = "unknown"
+        residency = "unknown"
+        observation_error = None
+        try:
+            decision = hermes_installation_decision(profile, "hermes.gateway.restart", current_host_generation())
+            if decision.status == "supported-mux":
+                from stability_core.hermes_native_route import MuxRoute
+                from stability_core.effect_capability import EffectRequest, EffectOperation
+                request = EffectRequest("hermes.gateway.restart", EffectOperation.HERMES_CLI,
+                    "hermes-gateway:" + profile, platform.node(), current_host_generation())
+                route = MuxRoute(decision.qualification, request, profile)
+                route.verify()
+                residency = route.last_residency
+                if residency not in {"served", "unserved", "parked"}:
+                    raise ValueError("mux-residency-unknown")
+                topology = "mux"
+                pid = int(route.peer_identity["pid"])
+                if pid <= 0:
+                    raise ValueError("mux-peer-pid-unavailable")
+                active = residency == "served"
+                unit = None  # Logical membership, not a per-profile systemd unit.
+                service = {"ActiveState": "active" if active else "inactive",
+                    "SubState": "running" if active else "dead", "MainPID": pid,
+                    "observationSource": "qualified-mux-membership", "residency": residency}
+            elif decision.status == "supported-native":
+                topology = "native"
+                service = systemctl_user_show(unit)
+                active = service.get("ActiveState") == "active" and service.get("SubState") == "running"
+                pid = int(service.get("MainPID") or 0)
+            else:
+                raise ValueError("hermes-installation-unqualified")
+        except Exception as exc:
+            topology, active, pid = "unknown", False, 0
+            service = {"ActiveState": "unknown", "SubState": "unknown", "MainPID": 0,
+                "observationSource": "installation-unavailable"}
+            observation_error = type(exc).__name__
+            add_finding(findings, "hermers_gateway_observation_unknown", "high", "hermers",
+                "Hermers runtime installation or logical membership could not be verified",
+                profile=profile, errorClass=observation_error)
         state_path = HERMES_HOME / "profiles" / profile / "gateway_state.json"
         state = load_json(state_path, {}) or {}
         state_pid = int(state.get("pid") or 0) if isinstance(state, dict) else 0
         procs = hermers_gateway_processes(rows, profile)
-        if not active:
+        if topology != "unknown" and not active:
             down.append({"profile": profile, "unit": unit, "service": service})
-        if active and state_pid and pid and state_pid != pid:
+        if topology == "native" and active and state_pid and pid and state_pid != pid:
             pid_mismatches.append({"profile": profile, "servicePid": pid, "statePid": state_pid, "statePath": str(state_path)})
         profiles[profile] = {
             "unit": unit,
             "service": service,
+            "topology": topology,
+            "residency": residency,
+            "observationQualified": topology != "unknown",
             "active": active,
             "pid": pid,
             "statePath": str(state_path),
@@ -3368,6 +3407,12 @@ def hermers_collect(
         lsp_processes = []
     workflow_activity = hermers_profile_workflow_activity(profile_registry)
     profile_modes = build_hermers_profile_modes(conn, profiles, acp_workers, workflow_activity, profile_registry, registry_meta)
+    for profile, snapshot in profiles.items():
+        if not snapshot["observationQualified"]:
+            mode = (profile_modes.get("profiles") or {}).get(profile)
+            if isinstance(mode, dict):
+                mode.update(lifecycleActionAllowed=False, lifecycleAllowedByStabilityd=False,
+                    managed=False, reason="runtime-observation-unknown")
     orphan_workers = [
         item for item in acp_workers
         if item.get("orphan") and int(item.get("ageSeconds") or 0) >= HERMERS_ACP_ORPHAN_MIN_SECONDS
