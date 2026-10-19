@@ -69,6 +69,7 @@ def qualified_session_fixture(stabilityd):
         (process / 'cgroup').write_text('0::/system.slice/openclaw-gateway.service\n')
         (process / 'exe').symlink_to(node)
         (proc / 'net').mkdir()
+        (proc / 'net/tcp6').write_text('header\n')
         (proc / 'net/tcp').write_text('header\n0: 0100007F:4965 00000000:0000 0A 0:0 0:0 0 '
                                     + str(os.getuid()) + ' 0 12345\n')
         (process / 'fd').mkdir()

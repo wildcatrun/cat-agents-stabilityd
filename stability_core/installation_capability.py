@@ -20,7 +20,7 @@ from .hermes_profile_config import read_profile_config
 from .session_api_capability import SessionApiQualification, SessionSdkQualification
 
 PACKAGED_MANIFEST = Path(__file__).with_name('qualified_installations_v1.json')
-PACKAGED_MANIFEST_SHA256 = 'ab5fa79911278eaf1087095947d9c4edb112a4247e4fda89525c429e48d28025'
+PACKAGED_MANIFEST_SHA256 = 'c2f5af4169e685caabe6d13222e9bb4b22c30f760fa2c67ddbcb419b95c6e95f'
 PROFILE = re.compile(r'[A-Za-z0-9_-]{1,64}')
 SHA = re.compile(r'[0-9a-f]{64}')
 
@@ -264,9 +264,13 @@ class InstallationFactory:
                 ('openclaw',),('sessions.describe','sessions.reset'),('sessions.describe','sessions.reset'),(),((digest,cli_sha),))
             sdk=SessionSdkQualification(_relative(contract['sdkEntry']),self._plugin_root/'session_sdk_bridge.mjs',
                 _digest(contract['wrapperSha256']),contract['serverVersion'],contract['serverBuildId'])
+            listener_address=item.get('listenerAddress','127.0.0.1')
+            if type(listener_address) is not str or listener_address not in {'127.0.0.1','0.0.0.0'}:
+                raise ValueError('installation listener address refused')
             q=SessionApiQualification(spec,adapter,_path(item.get('cliEntry',str(root/cli_relative))),cli_relative,'',item['ownerUid'],
                 'evidence://session-api-qualification/installation/'+contract['id'],item['endpointPort'],
-                tuple(_path(p) for p in item['unitRoots']),proc_root=_path(item.get('procRoot','/proc')),rpc_environment=tuple(tuple(v) for v in item['rpcEnvironment']),sdk=sdk)
+                tuple(_path(p) for p in item['unitRoots']),proc_root=_path(item.get('procRoot','/proc')),rpc_environment=tuple(tuple(v) for v in item['rpcEnvironment']),sdk=sdk,
+                listener_address=listener_address)
             return InstallationDecision('supported-session','reviewed-installation-contract',q,contract['id'])
         except (ValueError,KeyError,TypeError,OSError,StopIteration) as exc:
             return InstallationDecision('unknown',_unknown_reason(exc))

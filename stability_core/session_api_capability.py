@@ -199,6 +199,7 @@ class SessionApiQualification:
     proc_root: Path = Path('/proc')
     rpc_environment: tuple = ()
     sdk: SessionSdkQualification | None = None
+    listener_address: str = '127.0.0.1'
 
 
 @dataclass(frozen=True)
@@ -299,25 +300,40 @@ def _kernel_executable_identity(proc_root, pid, executable):
     finally:
         os.close(fd)
 
-def _endpoint_identity(proc_root, pid, port, uid):
-    # Closed IPv4-loopback listener subset, tied to this PID's kernel sockets.
+def _endpoint_identity(proc_root, pid, port, uid, listener_address='127.0.0.1'):
+    # A reviewed wildcard bind can serve the same fixed loopback SDK target.
+    # Never infer permission from the observed address. Reject overlapping
+    # listeners, including IPv6 whose dual-stack behavior is not qualified.
+    addresses = {'127.0.0.1': '0100007F', '0.0.0.0': '00000000'}
+    if type(listener_address) is not str or listener_address not in addresses:
+        raise ValueError('session listener address qualification unavailable')
     # Never infer ownership from a successful TCP connect or a unit name.
     with (proc_root / 'net/tcp').open('rb') as handle:
         raw = handle.read(1048577)
     if len(raw) > 1048576: raise ValueError('session listener budget')
+    with (proc_root / 'net/tcp6').open('rb') as handle:
+        ipv6 = handle.read(1048577)
+    if len(ipv6) > 1048576: raise ValueError('session listener budget')
+    for line in ipv6.decode('ascii').splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 4 and fields[1].endswith(f':{port:04X}') and fields[3] == '0A':
+            raise ValueError('session IPv6 listener scope unqualified')
     matches = []
     for line in raw.decode('ascii').splitlines()[1:]:
         fields = line.split()
-        if len(fields) >= 10 and fields[1] == f'0100007F:{port:04X}' and fields[3] == '0A':
+        if len(fields) >= 10 and fields[1] in {f'{address}:{port:04X}' for address in addresses.values()} and fields[3] == '0A':
             if fields[7] != str(uid) or not fields[9].isdigit():
                 raise ValueError('session listener owner unknown')
-            matches.append(fields[9])
+            matches.append((fields[1], fields[9]))
     if len(matches) != 1: raise ValueError('session listener scope unknown')
+    address, inode = matches[0]
+    if address != f'{addresses[listener_address]}:{port:04X}':
+        raise ValueError('session listener address mismatch')
     names = os.listdir(proc_root / str(pid) / 'fd')
     if len(names) > 4096: raise ValueError('session socket descriptor budget')
-    owned = [name for name in names if os.readlink(proc_root / str(pid) / 'fd' / name) == 'socket:[' + matches[0] + ']']
+    owned = [name for name in names if os.readlink(proc_root / str(pid) / 'fd' / name) == 'socket:[' + inode + ']']
     if not owned: raise ValueError('session listener not owned by Gateway')
-    return matches[0], tuple(sorted(owned))
+    return address, inode, tuple(sorted(owned))
 
 
 def make_session_api_capability(request, *, qualification, clock_ms, node_reader,
@@ -380,7 +396,7 @@ def make_session_api_capability(request, *, qualification, clock_ms, node_reader
             raise ValueError('session Gateway launch identity unknown')
         if hashlib.sha256(command).hexdigest() != process.get('cmdlineDigest'):
             raise ValueError('session Gateway command drift')
-        endpoint = _endpoint_identity(q.proc_root, pid, q.endpoint_port, q.runtime_uid)
+        endpoint = _endpoint_identity(q.proc_root, pid, q.endpoint_port, q.runtime_uid, q.listener_address)
         wrapper_identity=_wrapper_identity(q.sdk.wrapper_entry,q.runtime_uid,q.sdk.wrapper_sha256)
         sources=tuple((str(q.code.root/relative),digest) for relative,digest,_size in measurement.records)
         probe_payload=dict(schema=1,mode='probe',sdkEntry=str(q.code.root/q.sdk.entry_relative),
@@ -397,7 +413,7 @@ def make_session_api_capability(request, *, qualification, clock_ms, node_reader
                 or gateway_state_reader() != service
                 or _kernel_executable_identity(q.proc_root, pid, unit.executable) != kernel_image
                 or measure_content_artifact(q.code) != measurement
-                or _endpoint_identity(q.proc_root, pid, q.endpoint_port, q.runtime_uid) != endpoint
+                or _endpoint_identity(q.proc_root, pid, q.endpoint_port, q.runtime_uid, q.listener_address) != endpoint
                 or _wrapper_identity(q.sdk.wrapper_entry,q.runtime_uid,q.sdk.wrapper_sha256)!=wrapper_identity
                 or _code_identity(q.code) != code_identity
                 or binding_identity(read_unit_binding(current, unit='openclaw-gateway.service',
