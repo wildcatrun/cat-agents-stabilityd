@@ -92,6 +92,31 @@ class RegistryCompositeIdentityTests(unittest.TestCase):
         self.assertFalse(result["writeEligible"])
         self.assertIsNone(result["records"][0]["can_receive_dispatch"])
 
+    def test_official_builtin_inboxes_need_no_fabricated_endpoint(self):
+        rows = [self.row(agent_key=runtime + ":inbox", agent_id="inbox", runtime=runtime,
+                         platform=runtime, execution_adapter="adapter", workflow_ingress_adapter="adapter",
+                         endpoint_ref="") for runtime in ("codex", "local_codex")]
+        result = self.read_rows(rows, columns=("agent_key", "workflow_ingress_adapter") + REQUIRED_COLUMNS)
+        self.assertTrue(result["writeEligible"])
+        self.assertEqual(len(result["builtinInboxRows"]), 2)
+        self.assertTrue(all(r["runtimeActuationEligible"] is False for r in result["builtinInboxRows"]))
+        self.assertEqual(stabilityd.active_openclaw_agent_ids_from_registry(result), [])
+        self.assertTrue(all(r["endpoint_ref"] == "" for r in result["records"]))
+
+    def test_builtin_inbox_exception_does_not_admit_conflicting_or_unknown_routes(self):
+        cases = ({"platform": "openclaw"}, {"execution_adapter": "native"},
+                 {"workflow_ingress_adapter": None}, {"gateway_proxy_allowed": 1},
+                 {"can_receive_dispatch": None}, {"runtime": "other", "agent_key": "other:inbox", "platform": "other"})
+        for index, overrides in enumerate(cases):
+            with self.subTest(overrides=overrides):
+                db = self.root / ("inbox-" + str(index) + ".db")
+                with unittest.mock.patch.object(self, "db", db), unittest.mock.patch.object(stabilityd, "WORKFLOW_DB", db):
+                    row = self.row(agent_key="codex:inbox", agent_id="inbox", runtime="codex", platform="codex",
+                                   execution_adapter="adapter", workflow_ingress_adapter="adapter", endpoint_ref="")
+                    row.update(overrides)
+                    result = self.read_rows([row], columns=("agent_key", "workflow_ingress_adapter") + REQUIRED_COLUMNS)
+                self.assertFalse(result["writeEligible"])
+
 
 if __name__ == "__main__":
     unittest.main()

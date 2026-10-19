@@ -1796,6 +1796,23 @@ def workflow_runtime_registry_records() -> Dict[str, Any]:
                 ))
             )
 
+        def builtin_inbox_row(item):
+            # Workflow's codex adapters deliver durable control-plane inbox
+            # receipts without an endpoint. This is not runtime actuation.
+            return (
+                item.get("runtime") in {"codex", "local_codex"}
+                and item.get("platform") == item.get("runtime")
+                and item.get("execution_adapter") == "adapter"
+                and item.get("workflow_ingress_adapter") == "adapter"
+                and item.get("gateway_proxy_allowed") in (0, False)
+            )
+
+        payload["builtinInboxRows"] = [
+            {"agent_key": item.get("agent_key"), "agent_id": item.get("agent_id"),
+             "runtime": item.get("runtime"), "runtimeActuationEligible": False}
+            for item in payload["records"] if builtin_inbox_row(item)
+        ]
+
         payload["observationOnlyHistoricalRows"] = [
             {"agent_key": item.get("agent_key"), "agent_id": item.get("agent_id"), "runtime": item.get("runtime")}
             for item in payload["records"] if closed_historical_row(item)
@@ -1806,7 +1823,8 @@ def workflow_runtime_registry_records() -> Dict[str, Any]:
             and str(item.get("status") or "").strip()
             and str(item.get("platform") or "").strip()
             and str(item.get("execution_adapter") or "").strip()
-            and (str(item.get("endpoint_ref") or "").strip() or closed_historical_row(item))
+            and (str(item.get("endpoint_ref") or "").strip()
+                 or closed_historical_row(item) or builtin_inbox_row(item))
             and all(item.get(key) in (0, 1, False, True) for key in (
                 "can_receive_dispatch", "can_start_workflow", "gateway_proxy_allowed"
             ))
