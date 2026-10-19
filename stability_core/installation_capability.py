@@ -20,7 +20,7 @@ from .hermes_profile_config import read_profile_config
 from .session_api_capability import SessionApiQualification, SessionSdkQualification
 
 PACKAGED_MANIFEST = Path(__file__).with_name('qualified_installations_v1.json')
-PACKAGED_MANIFEST_SHA256 = 'c2f5af4169e685caabe6d13222e9bb4b22c30f760fa2c67ddbcb419b95c6e95f'
+PACKAGED_MANIFEST_SHA256 = 'aaa892a451e64d006b9e6035effb19f9569812309b6cf041a1bc0aeaefb07361'
 PROFILE = re.compile(r'[A-Za-z0-9_-]{1,64}')
 SHA = re.compile(r'[0-9a-f]{64}')
 
@@ -226,7 +226,9 @@ class InstallationFactory:
                 if (not 1<=len(peer_argv)<=64 or any(type(v) is not str or not v
                         or len(v)>65536 or '\x00' in v for v in peer_argv)):
                     raise ValueError('installation peer argv refused')
-                q=MuxQualification(**common,interpreter_entry=_path(item['interpreterEntry']),
+                from .hermes_native_route import freeze_mux_pm_binding
+                pm_binding=freeze_mux_pm_binding(item.get('pmBinding'))
+                q=MuxQualification(**common,pm_binding=pm_binding,interpreter_entry=_path(item['interpreterEntry']),
                     interpreter_sha256=_digest(item['interpreterSha256']),cli_entry=_path(item['cliEntry']),
                     cli_sha256=_digest(item['cliSha256']),
                     environment=tuple((key,render(value)) for key,value in item['muxEnvironment']),cwd=home,

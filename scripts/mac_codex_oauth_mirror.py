@@ -4,7 +4,8 @@
 The Mac Codex auth file remains the only refresh-token owner. Remote runtime
 stores receive the current access token, the current id token when present, and
 a non-secret dummy refresh marker so they can use valid access tokens but cannot
-rotate refresh tokens.
+rotate refresh tokens. OAuth mirrors keep no credential or database backups;
+reauthorization is the recovery path. Only redacted operation evidence is retained.
 """
 
 from __future__ import annotations
@@ -303,7 +304,7 @@ def apply_codex_cli(payload, artifact, dry_run):
     if path != root / "auth.json":
         raise ValueError("invalid-remote-codex-auth-path")
     path = safe_target_path(root, path, "codex-auth")
-    backup = None if dry_run else backup_file(path, artifact / "backups", "codex-cli.auth.json")
+    backup = None  # OAuth is recoverable by reauthorization; never persist credential backups.
     existing = read_json(path, {})
     mirrored = {
         "auth_mode": "chatgpt",
@@ -364,7 +365,7 @@ def apply_hermers(payload, artifact, dry_run):
         path = safe_target_path(profiles_root, profile_dir / "auth.json", "hermes-profile")
         if not profile_dir.is_dir() or not path.is_file():
             raise ValueError("missing-hermes-profile-auth")
-        backup = None if dry_run else backup_file(path, artifact / "backups", f"hermers-{profile}.auth.json")
+        backup = None  # Do not retain OAuth credentials in artifacts.
         auth = read_json(path, {"version": 1})
         if not isinstance(auth, dict):
             auth = {"version": 1}
@@ -441,7 +442,7 @@ def apply_openclaw(payload, artifact, dry_run):
         if not db_path.exists():
             results.append({"target": f"openclaw:{agent_id}", "missing": True, "path": str(db_path)})
             continue
-        backups = [] if dry_run else backup_sqlite(str(db_path), artifact / "backups", f"openclaw-{agent_id}.sqlite")
+        backups = []  # Update only the auth rows transactionally; never copy the agent database.
         conn = sqlite3.connect(str(db_path), timeout=30)
         try:
             row = conn.execute(
@@ -537,6 +538,7 @@ def execute_mirror_payload(payload, artifact, dry_run):
         "source": payload.get("source"),
         "targets": sorted(targets),
         "tokenValuesRedacted": True,
+        "backupPolicy": "none-reauthorize-on-auth-failure",
         "refreshOwner": "mac-codex",
         "remoteRefreshTokenStored": False,
         "stabilityActionIds": [
@@ -565,7 +567,6 @@ def main():
         raise ValueError("invalid-mirror-artifact-id")
     artifact = artifact_root / f"{artifact_id}-mac-codex-oauth-mirror"
     ensure_dir(artifact / "logs")
-    ensure_dir(artifact / "backups")
     lock_path = artifact / ".mirror-operation.lock"
     if lock_path.is_symlink():
         raise ValueError("symlink-mirror-operation-lock")
@@ -627,6 +628,7 @@ def inspect_codex_auth(path: pathlib.Path) -> dict[str, Any]:
             "path": str(path),
             "errorType": type(exc).__name__,
             "tokenValuesRedacted": True,
+        "backupPolicy": "none-reauthorize-on-auth-failure",
         }
     tokens = data.get("tokens") if isinstance(data, dict) else None
     if not isinstance(tokens, dict):
@@ -644,6 +646,7 @@ def inspect_codex_auth(path: pathlib.Path) -> dict[str, Any]:
             "path": str(path),
             "errorType": type(exc).__name__,
             "tokenValuesRedacted": True,
+        "backupPolicy": "none-reauthorize-on-auth-failure",
         }
     id_exp = 0
     id_remaining = None
@@ -678,6 +681,7 @@ def inspect_codex_auth(path: pathlib.Path) -> dict[str, Any]:
         "refreshOwner": "mac-codex" if refresh_present else None,
         "remoteRefreshTokenStored": False,
         "tokenValuesRedacted": True,
+        "backupPolicy": "none-reauthorize-on-auth-failure",
     }
 
 
@@ -843,6 +847,7 @@ def run_remote(args: argparse.Namespace, payload: dict[str, Any]) -> int:
                         "fallbackAttempted": False,
                         "fallbackAvailable": index + 1 < len(servers),
                         "tokenValuesRedacted": True,
+        "backupPolicy": "none-reauthorize-on-auth-failure",
                     }
                 ),
                 file=sys.stderr,
@@ -873,6 +878,7 @@ def run_remote(args: argparse.Namespace, payload: dict[str, Any]) -> int:
                         "failedServer": server,
                         "nextServer": servers[index + 1],
                         "tokenValuesRedacted": True,
+        "backupPolicy": "none-reauthorize-on-auth-failure",
                     }
                 ),
                 file=sys.stderr,
@@ -944,6 +950,7 @@ def main() -> int:
         "refreshOwner": "mac-codex",
         "remoteRefreshTokenStored": False,
         "tokenValuesRedacted": True,
+        "backupPolicy": "none-reauthorize-on-auth-failure",
     }
     if local_preflight:
         print(json.dumps(local_summary, ensure_ascii=False, indent=2))

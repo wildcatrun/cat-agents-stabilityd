@@ -2,47 +2,7 @@
   "schemaVersion": 1,
   "sourceContracts": [
     {
-      "id": "hermes-installed-profile-standalone-v1",
-      "family": "hermes",
-      "kind": "native",
-      "semantics": "reviewed-hermes-profile-standalone-source-window-v1",
-      "files": [
-        {
-          "path": "hermes_cli/main.py",
-          "sha256": "3b89b46e67f35398ba0af6b3441172490469702cd0e4e0381ff7e45ea78b2eef",
-          "bytes": 152342
-        },
-        {
-          "path": "hermes_cli/profiles.py",
-          "sha256": "47d01aff498b302905ce887e4b0a90907f107f32cbcdff380cf1ed5f01e3e23b",
-          "bytes": 113182
-        },
-        {
-          "path": "hermes_cli/gateway_multiplex_mode.py",
-          "sha256": "d61d2a27d92fa70a113f80ab248991f3ae363f66bcec940ea3f581305cd608de",
-          "bytes": 16973
-        },
-        {
-          "path": "hermes_cli/env_loader.py",
-          "sha256": "f33feafb58da3bd1e19eb3c97fdfc461c570ed3823fb56dd84f8e95357d2e7b9",
-          "bytes": 34896
-        },
-        {
-          "path": "hermes_cli/managed_scope.py",
-          "sha256": "692289b37fa3ce547b37d8fc20baf12f0e1a8358689ebdc48e51d06250e91037",
-          "bytes": 6977
-        },
-        {
-          "path": ".env",
-          "sha256": "b9ba9647c11c348d6b3fe5dfa07eedfb77c23f5cfd311d43df56b20ebc688f37",
-          "bytes": 22899
-        }
-      ],
-      "status": "reviewed",
-      "reviewRef": "hermes-launch-source/manifest.json + standalone-route-source-manifest-20261015.json; development-server deployment 2026-10-19: closed env projections and reviewed loader/managed absence contracts"
-    },
-    {
-      "id": "hermes-installed-mux-source-v1",
+      "id": "hermes-installed-mux-v0222-pm-v1",
       "family": "hermes",
       "kind": "mux",
       "semantics": "reviewed-hermes-mux-cli-logical-membership-v1",
@@ -50,47 +10,97 @@
       "files": [
         {
           "path": "hermes_cli/__init__.py",
-          "sha256": "d05c98cd44e22781497a20cd968af0d9b8962406b909f1889168c624545b229e",
-          "bytes": 1843
+          "sha256": "6a4ab05b8621ec1cd66a5abbe30fa32ed5bddddea95903036da01f0af1af94ce",
+          "bytes": 3600
         },
         {
           "path": "hermes_cli/main.py",
-          "sha256": "3b89b46e67f35398ba0af6b3441172490469702cd0e4e0381ff7e45ea78b2eef",
-          "bytes": 152342
+          "sha256": "88a7fc166d3bfaac082d44bbfc36c93b53c50f7508ca96e32206dc3f1edfaa82",
+          "bytes": 151085
         },
         {
           "path": "hermes_cli/gateway.py",
-          "sha256": "d8cdbd900dbebcbaffc0406442711bbd592f292614e1d59578f9b4c163c379f3",
-          "bytes": 240576
+          "sha256": "a6ca31202bc461a145f9e6df3b80daed2ea435599cf176ac86e9b98f118ff899",
+          "bytes": 273396
         },
         {
           "path": "hermes_cli/profiles.py",
-          "sha256": "47d01aff498b302905ce887e4b0a90907f107f32cbcdff380cf1ed5f01e3e23b",
-          "bytes": 113182
+          "sha256": "f65320d57dfe6bd670c139b5b2c394eb6150cf67b9536b8a82e95f0ea0180f14",
+          "bytes": 122835
         },
         {
           "path": "hermes_cli/gateway_profile_lifecycle.py",
-          "sha256": "e6953b4b98c843cf02c799a23fdb73c8104cd15fa0e213e61744beb66c8b3a1b",
-          "bytes": 4719
+          "sha256": "b04baf9d336ddec9f42eacc7cc302588616a3cfbf829b220dc0fb06b1fc14179",
+          "bytes": 5786
         },
         {
           "path": "hermes_constants.py",
-          "sha256": "3dd95a77b1a4956280f146e3b065789ca5d82921f69e6e2cae06d49a13f82405",
-          "bytes": 73638
+          "sha256": "8d55a41452b625061f1f2e2f507a7e7ffb2a396e711afcc7aee28b03a6e8fa9d",
+          "bytes": 64061
         },
         {
           "path": "gateway/__init__.py",
-          "sha256": "8920ead12b3b78cc727b2c6257192e954bc790717676484ad66b3238e511b95e",
-          "bytes": 574
+          "sha256": "c69d534d5d7acdd52b71bf168c09071402feb7352a0dca58c2f9efd0175fcded",
+          "bytes": 898
         },
         {
           "path": "gateway/control_socket.py",
-          "sha256": "9dbdb691f1bab69340be5131f50d6b0b62ffa6b80341b601a3948f5ff3998ef3",
-          "bytes": 19628
+          "sha256": "47c042a6707beb7b2279c45c73e7926d228d593a1d8e30ea61c4aa1abf83ba29",
+          "bytes": 20336
+        },
+        {
+          "path": "hermes_bootstrap.py",
+          "sha256": "f242036b2d35b92283b9a7e97c7059e537607fc4b02026f657a6d00cb4683f69",
+          "bytes": 29373
+        },
+        {
+          "path": "hermes_cli/_early_recovery.py",
+          "sha256": "8b2b34d513562844280f5b3ceb2c738c4aa9ef729c9bedbe59555a89448345a7",
+          "bytes": 72806
+        },
+        {
+          "path": "hermes_cli/venv_sync.py",
+          "sha256": "6de0d12b3de57f4425279589be5d2f39e02e2bec98ba04ef8169e1e9d2b982e9",
+          "bytes": 30305
+        },
+        {
+          "path": "hermes_cli/runtime_state.py",
+          "sha256": "95927323553bc0b5e62b9a56ae1d45ecf367b22887491ea6c767b48d83e4b805",
+          "bytes": 10649
+        },
+        {
+          "path": "pm/__init__.py",
+          "sha256": "67adcba1f0e4db2b2967d07e6b630aca4214b1fac9bd8649dcf221b4bf3fcfac",
+          "bytes": 2293
+        },
+        {
+          "path": "pm/environments.py",
+          "sha256": "ac5a9f09bc622a60aa616880be0906b07bec95bb8ad934924e931aa28dc8b777",
+          "bytes": 27614
+        },
+        {
+          "path": "pyproject.toml",
+          "sha256": "ff41b097147124ff2eb51a437d5f44eddea35104900c1c79c7edfb8b7352d901",
+          "bytes": 43035
+        },
+        {
+          "path": "uv.lock",
+          "sha256": "16300cf807347b7fcfa3c19963f5fe950913fdb3e41e3c649ea724bc7dc997da",
+          "bytes": 1202425
+        },
+        {
+          "path": "pm/lock.json",
+          "sha256": "49b79259220160f147255078a19af541a5f328d3871c8041cc1eb909d19eb549",
+          "bytes": 33804
+        },
+        {
+          "path": "install-stamp.json",
+          "sha256": "693fe7f2d26c211c47751873b83ac2c7ec0aba80fe45bd288a6bc0b3f784d580",
+          "bytes": 391
         }
       ],
-      "bridgeSha256": "154b649b19bb7ce30f843a56ea671b395ef60f56cee4b4658c1615cb95a70650",
-      "reviewRef": "installation-initializer-source-review-20261017.md; existing official control/lifecycle snapshots"
+      "bridgeSha256": "6495ba1d4dde3eb666dcb028d50d145a281d9bac35dafff0d8edc68be3b04fde",
+      "reviewRef": "2026-10-19-hermes-upgrade/mux-installation-contract-provenance.md"
     },
     {
       "id": "openclaw-installed-session-sdk-v1",
@@ -152,60 +162,61 @@
       "nodeId": "VM-4-17-ubuntu",
       "ownerUid": 1002,
       "status": "qualified",
-      "codeRoot": "/home/flashcat/hermes-agent",
+      "codeRoot": "/home/flashcat/multi-agent-hedge-fund-framework/runtimes/hermes/releases/v0.22.2-d923a5eb",
       "runtimeRoot": "/home/flashcat/.hermes",
-      "unitRoots": [
-        "/home/flashcat/.config/systemd/user"
-      ],
       "contracts": {
-        "native": "hermes-installed-profile-standalone-v1",
-        "mux": "hermes-installed-mux-source-v1"
+        "mux": "hermes-installed-mux-v0222-pm-v1"
       },
-      "nativeArgv": [
-        "/home/flashcat/hermes-agent/venv-python312/bin/python",
-        "-m",
-        "hermes_cli.main",
-        "--profile",
-        "{profile}",
+      "interpreterEntry": "/home/flashcat/.hermes/installs/468d86607482afb9/environments/8f26645abc7140aa972dbc6c45f294b4/venv/bin/python",
+      "interpreterSha256": "8dfa9757a52b9c3edf1dedaaa2a7a8c40ea4beb058f20e90bdd47b48f3b1b176",
+      "cliEntry": "/home/flashcat/multi-agent-hedge-fund-framework/runtimes/hermes/releases/v0.22.2-d923a5eb/hermes",
+      "cliSha256": "6e1adae1e73ce67121d4ec380a5b66b8fb84f02dd8004b3a9988c39660139417",
+      "pmBinding": {
+        "dependencyStamp": "82f94f27767f22077c39ff6792a13e5545a14fbb8b1bf8427de4fc444cd3aa51",
+        "factsSha256": "1c95a7cacfc38961c363b50281b304ae1f31dc28d7d2ff46a6ed7ec7d5ec0a24",
+        "installState": "/home/flashcat/.hermes/installs/468d86607482afb9",
+        "interpreter": "/home/flashcat/.hermes/installs/468d86607482afb9/environments/8f26645abc7140aa972dbc6c45f294b4/venv/bin/python",
+        "interpreterSha256": "8dfa9757a52b9c3edf1dedaaa2a7a8c40ea4beb058f20e90bdd47b48f3b1b176",
+        "ownerHome": "/home/flashcat/.hermes",
+        "receiptPath": "/home/flashcat/.hermes/profiles/catbody/logs/update_receipts/pm_20261019T085827Z-sync-2664241-9880f73aaec54df7a5fa057a94470fa7.json",
+        "receiptSha256": "695e7e9529b46492395d0f9ec060062e30dc3ee73db77f253432bec0a954f7ff",
+        "selectedVenv": "/home/flashcat/.hermes/installs/468d86607482afb9/environments/8f26645abc7140aa972dbc6c45f294b4/venv",
+        "semantics": "reviewed-hermes-pm-bootstrap-v1"
+      },
+      "muxPeerArgv": [
+        "/home/flashcat/.hermes/tools/python-3.14.7+20260901-linux-x64/bin/python3",
+        "-I",
+        "-c",
+        "import os, re, sys\nimport contextlib, hashlib, io, pathlib, shutil, subprocess\nos.environ.pop('PYTHONHOME', None)\nos.environ.pop('PYTHONPATH', None)\nsys.path.insert(0, '/home/flashcat/multi-agent-hedge-fund-framework/runtimes/hermes/releases/v0.22.2-d923a5eb')\ndef _hermes_closure_repair():\n    import contextlib, hashlib, io, shutil, subprocess\n    from pathlib import Path\n    root = Path('/home/flashcat/multi-agent-hedge-fund-framework/runtimes/hermes/releases/v0.22.2-d923a5eb')\n    git = root / '.git'\n    try:\n        if git.is_file():\n            text = git.read_text(encoding='utf-8-sig').strip()\n            git = root / text[7:].strip() if text.startswith('gitdir:') else git\n        fields = dict(line.partition('=')[::2] for line in (git / 'hermes-update-pull').read_text(encoding='utf-8-sig').splitlines())\n    except OSError:\n        return\n    pre = fields.get('pre', '').strip()\n    if not re.fullmatch('[0-9a-f]{40}|[0-9a-f]{64}', pre):\n        return\n    closure = git / 'hermes-update-recovery' / pre\n    files = (*('hermes_cli/_early_recovery.py', 'hermes_cli/update_lock.py', 'hermes_cli/update_custody.py'), 'hermes_cli/__init__.py')\n\n    def blob_id(data):\n        return hashlib.new('sha1' if len(pre) == 40 else 'sha256', b'blob %d\\0' % len(data) + data).hexdigest()\n\n    def verified():\n        try:\n            listed = dict(line.split(' ', 1)[::-1] for line in (closure / 'MANIFEST').read_text(encoding='utf-8-sig').splitlines())\n            return (set(listed) == set(files) and listed['hermes_cli/__init__.py'] == blob_id(b'')\n                    and all(blob_id((closure / rel).read_bytes()) == oid for rel, oid in listed.items()))\n        except (OSError, ValueError):\n            return False\n\n    if not verified():\n        exe = fields.get('git', '').strip()\n        if not (os.path.isabs(exe) and os.path.isfile(exe)):\n            names = ('git.exe',) if os.name == 'nt' else ('git',)\n            exe = next((os.path.join(d, n) for d in os.environ.get('PATH', '').split(os.pathsep) if os.path.isabs(d)\n                        for n in names if os.path.isfile(os.path.join(d, n))), '')\n        if not exe:\n            return\n\n        def git_out(*args):\n            done = subprocess.run([exe, '--no-replace-objects', '-C', str(root), *args], capture_output=True, timeout=60,\n                                  stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))\n            if done.returncode != 0:\n                raise OSError(done.stderr)\n            return done.stdout\n\n        staging = closure.with_name('.%s.%d.launch' % (pre, os.getpid()))\n        try:\n            ids = {}\n            for entry in git_out('ls-tree', '-z', '--full-tree', pre, '--', *('hermes_cli/_early_recovery.py', 'hermes_cli/update_lock.py', 'hermes_cli/update_custody.py')).split(b'\\0'):\n                meta, _, rel = entry.decode('utf-8', 'replace').partition('\\t')\n                if meta.split()[1:2] == ['blob']:\n                    ids[rel] = meta.split()[2]\n            blobs = {'hermes_cli/__init__.py': b''}\n            for rel in ('hermes_cli/_early_recovery.py', 'hermes_cli/update_lock.py', 'hermes_cli/update_custody.py'):\n                blobs[rel] = git_out('cat-file', 'blob', ids[rel])\n                if blob_id(blobs[rel]) != ids[rel]:  # an object that inflates to bytes pre never had\n                    raise OSError('%s does not hash to %s' % (rel, ids[rel]))\n            blobs['MANIFEST'] = ''.join('%s %s\\n' % (blob_id(data), rel) for rel, data in blobs.items()).encode('utf-8')\n            for rel, data in blobs.items():\n                (staging / rel).parent.mkdir(parents=True, exist_ok=True)\n                (staging / rel).write_bytes(data)\n            shutil.rmtree(closure, ignore_errors=True)\n            os.replace(staging, closure)\n        except (OSError, KeyError, subprocess.SubprocessError):\n            pass\n        finally:\n            shutil.rmtree(staging, ignore_errors=True)\n        if not verified():\n            return\n    for name in [n for n in sys.modules if n.split('.')[0] in ('hermes_cli', 'hermes_bootstrap', 'hermes_constants', 'pm')]:\n        del sys.modules[name]\n    tree = os.path.normcase(os.path.realpath(root))\n    sys.path[:] = [str(closure)] + [p for p in sys.path if p and os.path.normcase(os.path.realpath(p)) != tree\n                                    and not os.path.normcase(os.path.realpath(p)).startswith(tree + os.sep)]\n    sys.dont_write_bytecode = True\n    said = io.StringIO()\n    restored = False\n    try:\n        with contextlib.redirect_stderr(said):\n            from hermes_cli import _early_recovery\n            restored = _early_recovery.restore_interrupted_pull(root)\n    except Exception as exc:\n        said.write('hermes: the checkout cannot start after an interrupted `hermes update`, and it was not '\n                   'repaired: %s\\n' % (exc,))\n    if restored:\n        sys.stderr.write('hermes: the checkout could not start after an interrupted `hermes update`; '\n                         'repaired it with the recovery code saved before the update.\\n' + said.getvalue())\n        _early_recovery.relaunch_after_restore()\n    sys.stderr.write(said.getvalue() or 'hermes: the checkout cannot start after an interrupted `hermes update`; '\n                     'launch again once the update that owns it finishes.\\n')\n    raise SystemExit(1)\nif sys.argv[1:2] == ['--print-runtime-command']:\n    sys.dont_write_bytecode = True\n    from pathlib import Path\n    try:\n        from hermes_cli import _early_recovery\n    except Exception as exc:\n        if _hermes_closure_repair() or not isinstance(exc, ImportError):\n            raise\n        _early_recovery = None  # a tree without the repair: the imports below report real damage\n    if _early_recovery is not None and _early_recovery.restore_interrupted_pull(Path('/home/flashcat/multi-agent-hedge-fund-framework/runtimes/hermes/releases/v0.22.2-d923a5eb')):\n        _early_recovery.relaunch_after_restore()\n    from hermes_constants import get_default_hermes_root\n    os.environ['HERMES_HOME'] = os.environ.get('HERMES_HOME') or str(get_default_hermes_root())\n    from hermes_cli._launchers import print_runtime_command\n    print_runtime_command(Path('/home/flashcat/multi-agent-hedge-fund-framework/runtimes/hermes/releases/v0.22.2-d923a5eb'), sys.argv[2:])\n    sys.exit(0)\nsys._hermes_pin_default_home = True\ntry:\n    import hermes_bootstrap\nexcept Exception:\n    _hermes_closure_repair()\n    raise\nif not os.environ.get('HERMES_HOME'):\n    from hermes_constants import get_default_hermes_root\n    os.environ['HERMES_HOME'] = str(get_default_hermes_root())\nif sys.argv[1:2] == ['--run-module']:\n    import runpy\n    if len(sys.argv) < 3: sys.exit('hermes: --run-module needs a module')\n    module = sys.argv.pop(2)\n    del sys.argv[1]\n    runpy.run_module(module, run_name='__main__', alter_sys=True)\n    sys.exit(0)\nfrom hermes_cli.main import main\nsys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\nsys.exit(main())\n",
         "gateway",
         "run"
       ],
-      "interpreterEntry": "/home/flashcat/hermes-agent/venv/bin/python",
-      "interpreterSha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
-      "cliEntry": "/home/flashcat/.local/bin/hermes",
-      "cliSha256": "694d14bc27ebbda855b6ff66169521903b0c85a1ee0d70399b192650bf510647",
-      "missingQualificationInputs": [
-        "mux host launch/home/socket/peer bindings absent; topology change remains unknown"
-      ],
-      "observedLaunchMetadata": {
-        "digestEvidence": "installation-environment-digests-20261017.json",
-        "managerSha256": "80322c323f2f1ec3d8eace51b0d639ba586a70490a72ed165a8dea34805b7547",
-        "environmentFilesPresent": true,
-        "importKeysPresent": [
-          "LD_LIBRARY_PATH"
+      "muxEnvironment": [
+        [
+          "HOME",
+          "/home/flashcat"
         ],
-        "approved": true
-      },
-      "historicalAdmissionBlocks": [
-        "source-root-and-unit-root-mode-0775",
-        "source-files-mode-0664",
-        "permissions-not-changed-by-this-candidate"
+        [
+          "USER",
+          "flashcat"
+        ],
+        [
+          "LOGNAME",
+          "flashcat"
+        ],
+        [
+          "PATH",
+          "/usr/bin:/bin"
+        ],
+        [
+          "HERMES_HOME",
+          "{home}"
+        ]
       ],
-      "reviewRef": "2026-10-19-deployment: explicit installation authorization, finite permission rollback, actual source/unit metadata review; runtime postchecks mandatory",
-      "managerSha256": "80322c323f2f1ec3d8eace51b0d639ba586a70490a72ed165a8dea34805b7547",
-      "unitEnvironmentSha256s": [
-        "3b646b2c13f077d946ee1182d3bf89d88919174999bf65d05ed02986be3d7fe3",
-        "6f385f5e1e04f9628f96a78906f0e8ac65e8c520df0c775e9d083d317491a8eb",
-        "904e6d800df656018ee3f7719a260aa50e76b948065e0622a95ee60955b67a59",
-        "a76dc597765befa77f56fdaf8c830da847d2b1a5507b7b9dcb1d66a0385a8f78",
-        "aab2a89e38cfd8829b0e42fe46d77782673fea72ca7927c82616cd07028d1d36",
-        "e5831d3f3a5e64f2b2069e94bee20985ae52f476d11ca3e7e4890d1d38381e9c"
-      ],
-      "absentSources": [
-        "{home}/.op.env",
-        "/etc/hermes/.env"
-      ],
-      "qualifiedScope": "current standalone source/launch binding; no mux host installation approval"
+      "socketPath": "/home/flashcat/.hermes/gateway.sock",
+      "hostHome": "/home/flashcat/.hermes",
+      "reviewRef": "2026-10-19-hermes-upgrade/mux-installation-contract-provenance.md",
+      "qualifiedScope": "reviewed fixed-source and PM-selected mux installation; registry-derived profiles only; all runtime/ledger/policy gates remain required; standalone has no approved fallback"
     },
     {
       "id": "dev-openclaw",

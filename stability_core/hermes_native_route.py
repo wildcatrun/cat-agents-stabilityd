@@ -300,6 +300,28 @@ class MuxQualification:
     bridge_sha256: str = ''
     protocol: int = 1
     semantics: str = 'reviewed-hermes-mux-cli-logical-membership-v1'
+    pm_binding: tuple = ()
+
+
+MUX_PM_BINDING_FIELDS = frozenset({
+    'semantics', 'ownerHome', 'installState', 'selectedVenv', 'interpreter',
+    'interpreterSha256', 'factsSha256', 'receiptPath', 'receiptSha256', 'dependencyStamp',
+})
+
+
+def freeze_mux_pm_binding(value):
+    """Validate a reviewed declaration without manufacturing live approval."""
+    if (type(value) is not dict or set(value) != MUX_PM_BINDING_FIELDS
+            or any(type(v) is not str or not v or len(v) > 4096 or '\x00' in v for v in value.values())
+            or value['semantics'] != 'reviewed-hermes-pm-bootstrap-v1'):
+        raise ValueError('mux PM binding declaration refused')
+    for key in ('interpreterSha256', 'factsSha256', 'receiptSha256'):
+        if re.fullmatch(r'[0-9a-f]{64}', value[key]) is None:
+            raise ValueError('mux PM binding digest refused')
+    for key in ('ownerHome', 'installState', 'selectedVenv', 'interpreter', 'receiptPath'):
+        if not Path(value[key]).is_absolute() or '..' in Path(value[key]).parts:
+            raise ValueError('mux PM binding route refused')
+    return tuple(sorted(value.items()))
 
 
 MUX_QUALIFICATION = None
@@ -386,6 +408,8 @@ class MuxRoute:
         bridge = _read_program_source(q.bridge_entry, owner_uid=q.owner_uid)
         if bridge[1] != q.bridge_sha256:
             raise ValueError('mux governed bridge changed')
+        pm_guard = self._pm_guard(required=False)
+        pm_identity = pm_guard.initial if pm_guard is not None else None
         sources = []
         for path, expected in q.sources:
             measured = _read_program_source(path, owner_uid=q.owner_uid)
@@ -419,7 +443,9 @@ class MuxRoute:
             raise ValueError('mux source or launcher window drift')
         # Process identity includes birth/starttime, boot, UID, cmdline and cgroup.
         stable = (str(executable), interpreter_route, str(cli), cli_route, tuple(sources),
-                  config, second.process_identity, image, socket_before, bridge, origins, _live_scope(final_live))
+                  config, second.process_identity, image, socket_before, bridge, origins, pm_identity, _live_scope(final_live))
+        if pm_guard is not None:
+            pm_guard.fence()
         self.peer_identity = dict(second.process_identity)
         return stable, membership['residency']
 
@@ -438,11 +464,33 @@ class MuxRoute:
         self.last_residency = residency
         return 'evidence://hermes-mux-route/sha256/' + hashlib.sha256(repr((observed, residency)).encode()).hexdigest()
 
+    def _pm_guard(self, *, required):
+        value = self.q.pm_binding
+        if not value:
+            if required:
+                raise ValueError('mux PM execution binding unavailable')
+            return None  # Old objects remain inspectable, never executable.
+        if type(value) is not tuple or any(type(pair) is not tuple or len(pair) != 2 for pair in value):
+            raise ValueError('mux PM immutable binding refused')
+        declaration = dict(value)
+        if freeze_mux_pm_binding(declaration) != value:
+            raise ValueError('mux PM immutable binding refused')
+        if (declaration['interpreter'] != str(self.q.interpreter_entry)
+                or declaration['interpreterSha256'] != self.q.interpreter_sha256
+                or declaration['ownerHome'] != str(self.q.runtime_root)):
+            raise ValueError('mux PM declaration and launcher differ')
+        from .hermes_mux_bridge import PmBootstrapGuard
+        return PmBootstrapGuard(dict(codeRoot=str(self.q.code_root),
+            home=str(self.q.runtime_root / 'profiles' / self.profile),
+            sourcePins=[(str(path), digest) for path, digest in self.q.sources],
+            pmBinding=declaration), running_interpreter=False)
+
     def command(self, verb):
         import json
         if verb not in {'start', 'stop', 'restart'}:
             raise ValueError('mux profile operation refused')
-        payload = dict(profile=self.profile, verb=verb,
+        pm_guard = self._pm_guard(required=True)
+        payload = dict(profile=self.profile, verb=verb, pmBinding=dict(self.q.pm_binding),
             home=str(self.q.runtime_root / 'profiles' / self.profile),
             hostHome=str(self.q.host_home), socket=str(self.q.socket_path), peer=self.peer_identity,
             homeIdentity=self._pin[-1][str(self.q.runtime_root / 'profiles' / self.profile)],

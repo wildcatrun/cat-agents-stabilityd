@@ -52,5 +52,6 @@ def mux_artifact(q, path, *, node_id, peer_argv):
         codeRoot=str(q.code_root),runtimeRoot=str(q.runtime_root),contracts=dict(mux=contract['id']),
         interpreterEntry=str(q.interpreter_entry),interpreterSha256=q.interpreter_sha256,
         cliEntry=str(q.cli_entry),cliSha256=q.cli_sha256,muxPeerArgv=list(peer_argv),
-        muxEnvironment=[[key,template(value)] for key,value in q.environment],socketPath=str(q.socket_path),hostHome=str(q.host_home))
+        muxEnvironment=[[key,template(value)] for key,value in q.environment],socketPath=str(q.socket_path),hostHome=str(q.host_home),
+        pmBinding=dict(q.pm_binding))
     return artifact(path,[contract],[layout],boot=q.peer_boot_id)

@@ -21,7 +21,7 @@ import test_hermes_native_route_integration as base
 from stability_core import hermes_native_route as routes
 from stability_core.process_identity import read_process_identity
 
-BRIDGE_SHA256 = '154b649b19bb7ce30f843a56ea671b395ef60f56cee4b4658c1615cb95a70650'
+BRIDGE_SHA256 = '6495ba1d4dde3eb666dcb028d50d145a281d9bac35dafff0d8edc68be3b04fde'
 
 
 OFFICIAL_LIFECYCLE = '"""Named-profile lifecycle inside the host gateway, never a service-manager action."""\nfrom __future__ import annotations\n\nfrom hermes_constants import get_hermes_home, get_default_hermes_root\nfrom hermes_cli.profiles import parked_marker_path, profile_is_parked, profile_is_standalone, profiles_to_serve\n\n\ndef _confirmed(answer, key, name):\n    return isinstance(answer, dict) and answer.get(key) == name and not answer.get("error")\n\n\ndef _failure(answer):\n    if isinstance(answer, dict):\n        return answer.get("error") or "host operation is still pending"\n    return "host control socket did not answer"\n\n\ndef profile_lifecycle(command: str, args) -> bool:\n    """True when a named-profile command was handled (including an unconfirmed request)."""\n    from hermes_cli import gateway as gw\n    from gateway.control_socket import request_unserve_profile, request_serve_profile_hot\n\n    name = gw._current_profile_name()\n    if not name or name == "default" or getattr(args, "all", False) or getattr(args, "force", False):\n        return False\n    home = get_hermes_home()\n    if profile_is_standalone(home):\n        # gateway.standalone wins: the host never serves (or parks) an opted-out profile, so its\n        # verbs keep addressing its own gateway process even while a stale host record lists it.\n        return False\n    marker = parked_marker_path(home)\n    if command == "start":\n        if not profile_is_parked(home):\n            return False\n        marker.unlink()\n        owner = gw._host_multiplexer_for_all_verb()\n        if owner is None:\n            from hermes_cli.gateway_multiplex_served import live_default_gateway_pid\n            if live_default_gateway_pid() is None:\n                return False  # Unpark even when today\'s normal start path must start the host first.\n        host_home = owner.home if owner is not None else get_default_hermes_root()\n        answer = request_serve_profile_hot(host_home, name)\n        if _confirmed(answer, "served", name):\n            print(f"Profile \'{name}\' served by the host gateway.")\n        else:\n            print(f"Profile \'{name}\' unparked, but serving was not confirmed: {_failure(answer)}.")\n            print("The host retries on its next rescan (within 30s). Check gateway status.")\n        return True\n\n    # A separate --force gateway still owns its normal process/service lifecycle.\n    if gw.find_gateway_pids():\n        return False\n    owner = gw._served_by_another_host_gateway()\n    if owner is None and not gw.named_profile_served_by_running_multiplexer():\n        return False\n    host_home = owner.home if owner is not None else get_default_hermes_root()\n    if command == "stop":\n        # Persist intent BEFORE teardown: the periodic rescan must not re-add this profile.\n        marker.touch()\n        answer = request_unserve_profile(host_home, name)\n        if _confirmed(answer, "unserved", name):\n            print(f"Profile \'{name}\' parked; its bots and cron are stopped. "\n                  f"Start again with: hermes -p {name} gateway start")\n        else:\n            print(f"Profile \'{name}\' parked, but immediate stop was not confirmed: {_failure(answer)}.")\n            print("The host drops it on its next rescan (within 30s).")\n        return True\n\n    answer = request_unserve_profile(host_home, name)\n    if not _confirmed(answer, "unserved", name):\n        print(f"Profile \'{name}\' restart was not confirmed: {_failure(answer)}.")\n        return True\n    answer = request_serve_profile_hot(host_home, name)\n    if _confirmed(answer, "served", name):\n        print(f"Profile \'{name}\' restarted by the host gateway.")\n    else:\n        print(f"Profile \'{name}\' stopped, but serving was not confirmed: {_failure(answer)}.")\n        print("The host retries on its next rescan (within 30s). Check gateway status.")\n    return True\n\n\ndef print_parked_status() -> bool:\n    """A parked satellite is still installed, but is not a running gateway."""\n    from hermes_cli import gateway as gw\n    name = gw._current_profile_name()\n    if name and name != "default" and profile_is_parked(get_hermes_home()):\n        print(f"Profile \'{name}\': parked (hermes -p {name} gateway start)")\n        return True\n    if not name or name == "default":\n        parked = [profile for profile, home in profiles_to_serve(True, include_parked=True)\n                  if profile != "default" and profile_is_parked(home)]\n        if parked:\n            owner = gw.host_multiplexer_serving()\n            if owner is not None:\n                print(f"Served profiles: {\', \'.join(owner.profiles)}")\n            for profile in parked:\n                print(f"Profile \'{profile}\': parked (hermes -p {profile} gateway start)")\n    return False\n'
@@ -31,9 +31,19 @@ ACTUAL_DISCOVERY = 'def _served_by_another_host_gateway(profile_name: str | None
 
 
 @contextlib.contextmanager
+def private_fixture_umask():
+    previous = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+@contextlib.contextmanager
 def mux_fixture(served=True, with_socket=True, discovery_absent=False):
-    with base.fixture() as f:
+    with private_fixture_umask(), base.fixture() as f:
         (f.home / 'config.yaml').write_text('gateway:\n  standalone: false\n')
+        (f.home / 'logs').mkdir(mode=0o700)
         cli = f.root / 'main.py'; cli.chmod(0o700)
         socket_temp = tempfile.TemporaryDirectory(prefix='mx-', dir=os.environ.get('TEST_SOCKET_ROOT', str(Path.home())))
         path = Path(socket_temp.name) / 's'
@@ -123,13 +133,42 @@ def mux_fixture(served=True, with_socket=True, discovery_absent=False):
         bridge = private_core / 'hermes_mux_bridge.py'
         if hashlib.sha256(bridge.read_bytes()).hexdigest() != BRIDGE_SHA256:
             raise AssertionError('fixture bridge differs from reviewed candidate')
+        # Real PM facts/receipt and an actual stdlib venv; no version or guard
+        # substitution. Linux peer positives require running this suite on 3.14.
+        from stability_core.hermes_mux_bridge import PM_BOOTSTRAP_SOURCES
+        state_root = f.q.runtime_root / 'installs' / hashlib.sha256(str(f.root).encode()).hexdigest()[:16]
+        selected = state_root / 'environments' / 'fixture-generation' / 'venv'
+        subprocess.run([sys.executable, '-m', 'venv', '--symlinks', '--without-pip', str(selected)], check=True, timeout=30,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        interpreter = selected / 'bin' / 'python'
+        facts = state_root / 'facts.json'
+        facts.write_text(json.dumps({'packages':{'venv':{'environment':str(selected),
+            'stamp':'fixture-approved-dependencies','extras':['all']}}}))
+        receipt = f.q.runtime_root / 'logs/update_receipts/fixture-sync.json'
+        receipt.parent.mkdir(parents=True,exist_ok=True)
+        receipt.write_text(json.dumps({'schema':1,'kind':'sync','outcome':'ok','exit_code':0,
+                                      'finished_at':'2026-10-19T00:00:00Z'}))
+        (state_root / '.install.lock').touch(mode=0o600)
+        (f.root / '.git').mkdir()
+        for name in PM_BOOTSTRAP_SOURCES:
+            source = f.root / name
+            source.parent.mkdir(parents=True,exist_ok=True)
+            source.write_text('# synthetic finite PM source: '+name+'\n')
+        (f.root/'install-stamp.json').write_text(json.dumps({'schemaVersion':2,'updateMechanism':'external',
+            'source':'local','dirty':True,'commit':'a'*40}))
+        pm_sources = tuple((f.root/name,hashlib.sha256((f.root/name).read_bytes()).hexdigest()) for name in PM_BOOTSTRAP_SOURCES)
+        binding = dict(semantics='reviewed-hermes-pm-bootstrap-v1',ownerHome=str(f.q.runtime_root),
+            installState=str(state_root),selectedVenv=str(selected),interpreter=str(interpreter),
+            interpreterSha256=hashlib.sha256(interpreter.resolve().read_bytes()).hexdigest(),
+            factsSha256=hashlib.sha256(facts.read_bytes()).hexdigest(),receiptPath=str(receipt),
+            receiptSha256=hashlib.sha256(receipt.read_bytes()).hexdigest(),dependencyStamp='fixture-approved-dependencies')
         identity = read_process_identity(os.getpid())
-        q = routes.MuxQualification(os.getuid(), f.q.runtime_root, 'catbody', Path(f.q.argv[0]),
-            f.q.executable_sha256, cli, hashlib.sha256(base.SOURCES['main.py'].encode()).hexdigest(), f.q.sources + extra_sources,
+        q = routes.MuxQualification(os.getuid(), f.q.runtime_root, 'catbody', interpreter,
+            f.q.executable_sha256, cli, hashlib.sha256(base.SOURCES['main.py'].encode()).hexdigest(), f.q.sources + extra_sources + pm_sources,
             (('HOME', str(Path.home())), ('HERMES_HOME', str(f.home)), ('PATH', '/usr/bin:/bin'), ('PYTHONPATH', str(f.root)), ('FIXTURE_HOST_HOME', str(f.q.runtime_root)), ('FIXTURE_DISCOVERY_ABSENT', '1' if discovery_absent else '0')),
             f.home, path, f.q.runtime_root, identity.get('cmdlineDigest',''), identity.get('bootId',''),
             'evidence://reviewed-installed-source-fixture/mux-protocol1', code_root=f.root, bridge_entry=bridge,
-            bridge_sha256=BRIDGE_SHA256)
+            bridge_sha256=BRIDGE_SHA256, pm_binding=routes.freeze_mux_pm_binding(binding))
         from stability_core import installation_capability as installation
         from installation_fixture_support import mux_artifact
         # Real peer argv is fixture process routing metadata. Its permitted
@@ -146,11 +185,15 @@ def mux_fixture(served=True, with_socket=True, discovery_absent=False):
                     return True
             return real_access(path, mode, *args, **kwargs)
         commands = []
+        # The inherited declared synthetic clock has fixed mono=100000; hold
+        # its synthetic wall sample fixed too, independent of QA machine load.
+        fixture_epoch = base.daemon.epoch()
         def effect(route, verb, timeout):
             argv, env, cwd = route.command(verb); commands.append((argv, env, cwd))
             return subprocess.run(list(argv), env=env, cwd=str(cwd), timeout=timeout, text=True, capture_output=True)
         try:
-            with mock.patch.object(installation, 'load_packaged_installations', return_value=factory), \
+            with mock.patch.object(base.daemon, 'epoch', return_value=fixture_epoch), \
+                 mock.patch.object(installation, 'load_packaged_installations', return_value=factory), \
                  mock.patch.object(base.daemon, 'current_host_generation', return_value=base.daemon.platform.node()+':'+identity.get('bootId','')), \
                  mock.patch('os.access', side_effect=fixture_access), \
                  mock.patch.object(base.daemon, 'run_hermes_mux_command', side_effect=effect), \
@@ -227,7 +270,9 @@ class MuxScopeTests(unittest.TestCase):
              mock.patch.object(sys, 'meta_path', list(sys.meta_path)):
             origins = prepare_runtime_imports(f.root, f.qualification.sources)
             self.assertEqual(sys.path[0], str(f.root))
-            self.assertEqual(len(origins), len(routes.MUX_RUNTIME_MODULES))
+            self.assertEqual(set(origins), set(routes.MUX_RUNTIME_MODULES) | {
+                'hermes_bootstrap','hermes_cli._early_recovery','hermes_cli.venv_sync',
+                'hermes_cli.runtime_state','pm','pm.environments'})
 
     def test_valid_malicious_pyc_never_executes_for_finite_modules(self):
         from stability_core.hermes_mux_bridge import prepare_runtime_imports, FixedSourceLoader

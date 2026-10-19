@@ -148,19 +148,19 @@ class InstallationCapabilityIntegrationTests(unittest.TestCase):
                 factory=installation.load_packaged_installations()
         catalog=factory._manifest
         self.assertEqual({c['family'] for c in catalog['sourceContracts']},{'hermes','openclaw'})
-        self.assertEqual({c['kind'] for c in catalog['sourceContracts']},{'native','mux','session'})
+        self.assertEqual({c['kind'] for c in catalog['sourceContracts']},{'mux','session'})
         self.assertTrue(all(c['files'] for c in catalog['sourceContracts']))
         # This deployment artifact binds the reviewed host installation.
         # Qualification remains an input to fresh route checks, never authority.
         self.assertTrue(all(i['status'] == 'qualified' for i in catalog['installations']))
         self.assertTrue(all(i.get('actionAuthorized', False) is False for i in catalog['installations']))
         hermes = next(i for i in catalog['installations'] if i['family'] == 'hermes')
-        self.assertTrue(hermes['missingQualificationInputs'])  # no fabricated mux host
-        self.assertTrue(hermes['unitEnvironmentSha256s'])
-        self.assertIn('{home}/.op.env', hermes['absentSources'])
-        text=installation.PACKAGED_MANIFEST.read_text()
-        for member in ('catbody','catears','cateyes','catheart','catnose','catpenclaw'):
-            self.assertNotIn(member,text)
+        self.assertEqual(set(hermes['contracts']), {'mux'})
+        self.assertEqual(hermes['pmBinding']['semantics'], 'reviewed-hermes-pm-bootstrap-v1')
+        self.assertEqual(len(next(c for c in catalog['sourceContracts'] if c['family']=='hermes')['files']),18)
+        self.assertEqual(hermes['muxPeerArgv'][-2:],['gateway','run'])
+        self.assertNotIn('nativeArgv',hermes)
+        self.assertNotIn('profiles',hermes)  # receipt provenance is not a target roster
 
     def test_manifest_pin_and_first_observation_unsafe_routes_are_refused(self):
         with assembled_fixture() as (f,factory,path):
