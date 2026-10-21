@@ -969,7 +969,7 @@ class MirrorAccountIdentityTests(unittest.TestCase):
                         mirror_cli.load_codex_auth(auth_path, min_ttl_seconds=60)
 
     def test_remote_openclaw_mirror_overwrites_stale_profile_account_id(self):
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = pathlib.Path(temp_dir)
             agents_root = temp_root / "agents"
             agent_state = agents_root / "main" / "agent"

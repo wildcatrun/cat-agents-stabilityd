@@ -23,6 +23,7 @@ def make_jwt(exp: int, iat: int | None = None) -> str:
         "aud": ["https://api.openai.com/v1"],
         "iat": iat or int(time.time()),
         "exp": exp,
+        "https://api.openai.com/auth": {"chatgpt_account_id": "fixture-account"},
     }
 
     def enc(obj: dict) -> str:
