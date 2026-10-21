@@ -53,7 +53,7 @@ OAuth auth targets are derived from active `trading-agents-workflow.runtime_agen
 
 `cat-agents-stability auth-maintenance --dry-run --action-id codex_cli_mirror_required` shows the maintenance decision without side effects. The server-side `--execute` path does not acquire or refresh credentials. The mac-codex adapter consumes only actions marked `localAutomation.eligible`, with no Human Gate, then writes redacted status and validation evidence. OAuth credentials and whole-agent databases must not be backed up. It pushes only access/id tokens plus the non-secret refresh placeholder to development-server runtime stores.
 
-The active Mac adapter and its existing local changes remain the refresh authority. Older packaged mirror code must be checked for no-backup parity before any apply qualification; documentation does not qualify a stale implementation.
+The active Mac adapter remains the refresh authority. This candidate preserves its existing account-selector and CLI argument validation fixes without replacing the Mac checkout or changing live authorization. Credential and agent-database backups remain disabled; reauthorization is recovery.
 
 ### mac-codex OAuth Source
 

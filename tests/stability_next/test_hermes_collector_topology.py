@@ -24,7 +24,10 @@ class HermesCollectorTopologyTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             for name,value in patches.items(): stack.enter_context(mock.patch.object(d,name,return_value=value))
             unit=stack.enter_context(mock.patch.object(d,'systemctl_user_show',return_value={'ActiveState':'active','SubState':'running','MainPID':123}))
-            stack.enter_context(mock.patch('stability_core.hermes_native_route.MuxRoute',return_value=route))
+            def construct(*_args):
+                route.verify()  # Real MuxRoute verifies before returning.
+                return route
+            stack.enter_context(mock.patch('stability_core.hermes_native_route.MuxRoute',side_effect=construct))
             result=d.hermers_collect(None,findings,persist_cache=False)
         return result,findings,unit,route
 

@@ -9,6 +9,7 @@ resulting access/id tokens to the development server.
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import json
 import os
@@ -1180,6 +1181,9 @@ def emit_summary(summary: Dict[str, Any], previous: Optional[Dict[str, Any]]) ->
 
 
 def main() -> int:
+    argparse.ArgumentParser(
+        description="Run the governed local Codex OAuth refresh and mirror maintenance cycle."
+    ).parse_args()
     os.umask(0o077)
     LOG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not acquire_lock():

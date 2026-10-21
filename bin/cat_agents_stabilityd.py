@@ -1129,6 +1129,14 @@ def accept_inspection_worker_state(state: Any, component: str) -> None:
     if component in {"gateway", "input"}:
         _inspection_cache = copy.deepcopy(cache)
         _inspection_gateway_context = (context[0], context[1])
+    if component == "config":
+        if tuple(context) != _inspection_gateway_context:
+            raise ValueError("config cache gateway generation mismatch")
+        # Only plugin metadata belongs to this worker. It cannot replace the
+        # Gateway's health/version observations or the cron retry window.
+        _inspection_cache.pop("plugins", None)
+        if "plugins" in cache:
+            _inspection_cache["plugins"] = copy.deepcopy(cache["plugins"])
     if component in {"cron", "input"}:
         _cron_rpc_retry_after = time.monotonic() + min(300, max(0, retry - time.time())) if retry else 0
 
@@ -1540,6 +1548,13 @@ def db_record_event(conn: sqlite3.Connection, event: Dict[str, Any], *,
 
 
 def db_record_action(conn: sqlite3.Connection, action: Dict[str, Any]) -> None:
+    # No external effect occurred. Keep a bounded counter instead of growing
+    # two unbounded histories for an identical ordinary sample every round.
+    if action.get("action") == "none" and action.get("result") == "ok" and action.get("reason") == "no-actionable-streak":
+        previous = db_get(conn, "ordinary_no_action_summary", {}) or {}
+        db_set(conn, "ordinary_no_action_summary", {"count": int(previous.get("count") or 0) + 1,
+            "lastSeenEpoch": epoch(), "reason": "no-actionable-streak", "externalEffectExecuted": False})
+        return
     conn.execute(
         "INSERT INTO actions(ts_epoch, action_id, action, result, payload) VALUES(?, ?, ?, ?, ?)",
         (
@@ -1727,7 +1742,8 @@ def workflow_runtime_registry_records() -> Dict[str, Any]:
         fallback["exists"] = False
         return fallback
     try:
-        conn = sqlite3.connect(str(WORKFLOW_DB))
+        conn = sqlite3.connect(WORKFLOW_DB.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
+        conn.execute("PRAGMA query_only=ON")
         conn.row_factory = sqlite3.Row
         table = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='runtime_agents'"
@@ -3210,6 +3226,8 @@ def build_hermers_profile_modes(
             "workerCount": len(profile_workers),
             "observedMode": observed_mode,
             "readinessObservation": observed_mode,
+            "modeObservationScope": "residency-and-recorded-workflow-evidence",
+            "activityCoverage": "confirmed-work" if active_work else "runtime-attested-idle" if safe_to_hibernate else "unknown",
             "targetMode": observed_mode,
             "expectedActive": expected_active,
             "safeToHibernate": bool(safe_to_hibernate),
@@ -3334,8 +3352,10 @@ def hermers_collect(
                 from stability_core.effect_capability import EffectRequest, EffectOperation
                 request = EffectRequest("hermes.gateway.restart", EffectOperation.HERMES_CLI,
                     "hermes-gateway:" + profile, platform.node(), current_host_generation())
+                # Constructor performs the full qualified observation and pins
+                # peer/source identity. This collector has no subsequent effect:
+                # repeating verify immediately would duplicate the same probes.
                 route = MuxRoute(decision.qualification, request, profile)
-                route.verify()
                 residency = route.last_residency
                 if residency not in {"served", "unserved", "parked"}:
                     raise ValueError("mux-residency-unknown")
@@ -8739,10 +8759,14 @@ def resource_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy:
     actions: List[Dict[str, Any]] = []
     trigger_keys = resource_trigger_keys(snapshot)
     if not trigger_keys:
+        db_set(conn, "resource_condition_digest", "")
         return actions
+    from stability_core.condition_evidence import resource_condition_fingerprint
+    condition_digest = resource_condition_fingerprint(trigger_keys, (snapshot.get("gateway") or {}).get("pid"))
+    condition_changed = db_get(conn, "resource_condition_digest", "") != condition_digest
     now_s = epoch()
     last_capture = int(db_get(conn, "resource_evidence_last_capture_at", 0) or 0)
-    capture_due = not last_capture or now_s - last_capture >= RESOURCE_EVIDENCE_CAPTURE_SECONDS
+    capture_due = condition_changed or not last_capture or now_s - last_capture >= RESOURCE_EVIDENCE_CAPTURE_SECONDS
     incident_active = "gateway_resource_incident" in trigger_keys or bool(RESOURCE_INCIDENT_IMMEDIATE_KEYS & set(trigger_keys))
     evidence_meta: Optional[Dict[str, Any]] = None
     if capture_due:
@@ -8765,7 +8789,7 @@ def resource_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy:
         }
     if incident_active:
         last_gate = int(db_get(conn, "resource_human_gate_last_prepare_at", 0) or 0)
-        if not last_gate or now_s - last_gate >= RESOURCE_HUMAN_GATE_REFRESH_SECONDS:
+        if condition_changed or not last_gate:
             package = write_resource_human_gate_package(snapshot, policy, trigger_keys, evidence_meta)
             db_set(conn, "resource_human_gate_last_prepare_at", now_s)
             actions.append(
@@ -8777,6 +8801,7 @@ def resource_actuate(conn: sqlite3.Connection, snapshot: Dict[str, Any], policy:
                     **package,
                 }
             )
+    db_set(conn, "resource_condition_digest", condition_digest)
     return actions
 
 
@@ -9739,7 +9764,7 @@ def _component_probe_worker(argv: List[str]) -> int:
             return 2
         raw_inspection = os.environ.get(_INSPECTION_WORKER_ENV)
         if raw_inspection is not None:
-            if name not in {"gateway", "cron"} or len(raw_inspection.encode("utf-8")) > _INSPECTION_STATE_MAX_BYTES:
+            if name not in {"gateway", "cron", "config"} or len(raw_inspection.encode("utf-8")) > _INSPECTION_STATE_MAX_BYTES:
                 return 2
             inspection = json.loads(raw_inspection)
             accept_inspection_worker_state(inspection, "input")
@@ -9780,7 +9805,7 @@ def _component_probe_worker(argv: List[str]) -> int:
 
 
 def collect_snapshot(
-    conn: sqlite3.Connection, *, component_probe_runner: Any = None, round_budget: Any = None,
+    conn: sqlite3.Connection, *, component_probe_runner: Any = None, round_budget: Any = None, critical_observer: Any = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
     if round_budget is None:
         round_budget = RoundBudget(parse_round_budget_config(os.environ), clock=time.monotonic)
@@ -9842,18 +9867,19 @@ def collect_snapshot(
             json.dumps(requested_profiles, ensure_ascii=False, separators=(",", ":")),
         ]
         child_env = dict(worker_env)
-        if _inspection_cache_enabled and name in {"gateway", "cron"}:
+        if _inspection_cache_enabled and name in {"gateway", "cron", "config"}:
             child_env[_INSPECTION_WORKER_ENV] = json.dumps(
                 inspection_worker_state(), allow_nan=False, separators=(",", ":"))
         if component_probe_runner is None:
             child_env[_COMPONENT_PROBE_PARENT_PID_ENV] = str(os.getpid())
+        observer_args = {"observer_tick": critical_observer.tick} if critical_observer is not None and component_probe_runner is None else {}
         result = runner(
             name, command, fallback, source="cat-agents-stabilityd",
             max_output_bytes=COLLECTOR_OUTPUT_MAX_BYTES, budget_ms=budget_ms,
-            env=child_env,
+            env=child_env, **observer_args,
         )
         probes[name] = result["probe"]
-        if _inspection_cache_enabled and name in {"gateway", "cron"}:
+        if _inspection_cache_enabled and name in {"gateway", "cron", "config"}:
             returned_state = result.get("data", {}).pop(_INSPECTION_WORKER_FIELD, None)
             try:
                 if result["probe"]["status"] != "ok":
@@ -9864,6 +9890,8 @@ def collect_snapshot(
                 if name == "gateway":
                     _inspection_cache.clear()
                     _inspection_gateway_context = (0, False)
+                elif name == "config":
+                    _inspection_cache.pop("plugins", None)
                 else:
                     _cron_rpc_retry_after = time.monotonic() + 300
                 if result["probe"]["status"] == "ok":
@@ -9906,6 +9934,8 @@ def collect_snapshot(
             if _inspection_cache_enabled and name == "gateway":
                 _inspection_cache.clear()
                 _inspection_gateway_context = (0, False)
+            elif _inspection_cache_enabled and name == "config":
+                _inspection_cache.pop("plugins", None)
             elif _inspection_cache_enabled and name == "cron":
                 _cron_rpc_retry_after = time.monotonic() + 300
             add_finding(
@@ -9985,10 +10015,15 @@ def collect_snapshot(
         data = snapshot.get("desiredState" if component == "desired_state" else component) or {}
         contract = observation_contract(component, data, probe)
         probe.update(contract)
+        probe["freshness"] = {"collectedAtEpoch": snapshot["checkedAtEpoch"],
+                              "status": "source-dependent; inspect cached source timestamps"}
         probe["legacyCoverageMeaning"] = "probe-protocol-success; see scopeComplete"
         if contract["scopeComplete"] is False:
             probe["coverage"] = False
     snapshot["collectorProbes"] = probes
+    if critical_observer is not None:
+        critical_observer.tick()
+        snapshot["criticalObservation"] = critical_observer.evidence()
     if pending_cache_updates and not collector_failed:
         try:
             persist_component_cache_updates(conn, pending_cache_updates)
@@ -10025,6 +10060,13 @@ def collect_snapshot(
     policy = policy_from_findings(conn, findings, snapshot, streaks)
     snapshot["policy"] = policy
     snapshot["authMaintenance"] = build_auth_maintenance_plan(snapshot.get("auth") if isinstance(snapshot.get("auth"), dict) else {}, findings)
+    from stability_core.evolution_readiness import environment_report, delivery_metadata
+    from stability_core.dependency_health import collect_dependency_health
+    registry = workflow_runtime_registry_records() if component_probe_runner is None else {"source": "fixture", "records": [], "writeEligible": False}
+    snapshot["nodeId"] = os.environ.get("CAT_AGENTS_STABILITY_NODE_ID", platform.node())
+    snapshot["evolution"] = environment_report(snapshot, registry, now=epoch(), node_id=snapshot["nodeId"],
+        python_version=platform.python_version(), dependencies_observed=collect_dependency_health() if component_probe_runner is None else {})
+    snapshot["deliveryReadiness"] = delivery_metadata(WORKFLOW_DB, now=epoch()) if component_probe_runner is None else {"coverage": "fixture-no-external-query", "authorityGranted": False}
     return snapshot, findings, policy
 
 
@@ -10146,7 +10188,12 @@ def _run_once_body(conn: sqlite3.Connection, no_action: bool = False) -> Dict[st
     round_budget = RoundBudget(parse_round_budget_config(os.environ), clock=time.monotonic)
     ensure_dirs()
     drain_event_exports(conn)
-    snapshot, findings, policy = collect_snapshot(conn, round_budget=round_budget)
+    from stability_core.critical_observation import CriticalObservation
+    critical_observer = None
+    if os.environ.get("CAT_AGENTS_STABILITY_CRITICAL_OBSERVATION_ENABLED", "1") == "1":
+        critical_observer = CriticalObservation(STABILITY_DIR / "critical-health-latest.json", PORT)
+        critical_observer.tick(force=True)
+    snapshot, findings, policy = collect_snapshot(conn, round_budget=round_budget, critical_observer=critical_observer)
     generation_id = uuid.uuid4().hex
     snapshot["generationId"] = generation_id
     policy["generationId"] = generation_id
@@ -10160,14 +10207,36 @@ def _run_once_body(conn: sqlite3.Connection, no_action: bool = False) -> Dict[st
     else:
         actions = actuate_collected_snapshot(conn, snapshot, policy, no_action=no_action)
     snapshot["actions"] = actions
+    # Only our finite ordinary-counter producer is eligible. Legacy event,
+    # incident, action and recovery histories remain untouched.
+    from stability_core.ordinary_telemetry import maintain as maintain_ordinary_telemetry
+    try:
+        last_retention = int(db_get(conn, "ordinary_telemetry_last_maintain", 0) or 0)
+        if epoch() - last_retention >= 3600:
+            counters = db_get(conn, "ordinary_no_action_summary", {}) or {}
+            retention = maintain_ordinary_telemetry(STABILITY_DIR, now=epoch(), no_action_count=int(counters.get("count") or 0))
+            db_set(conn, "ordinary_telemetry_last_maintain", epoch())
+            db_set(conn, "ordinary_telemetry_retention", retention)
+        snapshot["evidenceRetention"] = db_get(conn, "ordinary_telemetry_retention", {})
+    except Exception as exc:
+        snapshot["evidenceRetention"] = {"coverage": "unknown", "errorClass": type(exc).__name__, "protectedHistoryTouched": False}
     snapshot["completedAt"] = ts()
     snapshot["completedAtEpoch"] = epoch()
     v2_events, v2_event_keys = [], []
+    current_event_keys = sorted(str(f.get("key")) for f in findings)
+    previous_event_keys = db_get(conn, "event_current_condition_keys", []) or []
+    for absent_key in set(previous_event_keys) - set(current_event_keys):
+        db_set(conn, "event:" + absent_key + ":fingerprint", "")
+    if current_event_keys != previous_event_keys:
+        db_set(conn, "event_current_condition_keys", current_event_keys)
     for finding_seq, finding in enumerate(findings):
         if SEVERITY_RANK.get(str(finding.get("severity")), 0) >= SEVERITY_RANK["high"]:
             event_key = f"event:{finding.get('key')}"
             last_event_at = int(db_get(conn, event_key, 0) or 0)
-            if last_event_at and snapshot["checkedAtEpoch"] - last_event_at < 300:
+            from stability_core.condition_evidence import condition_fingerprint
+            fingerprint = condition_fingerprint(finding)
+            if (db_get(conn, event_key + ":fingerprint", "") == fingerprint and last_event_at
+                    and snapshot["checkedAtEpoch"] - last_event_at < 86400):
                 continue
             event = {
                 "ts": snapshot["checkedAt"],
@@ -10182,18 +10251,20 @@ def _run_once_body(conn: sqlite3.Connection, no_action: bool = False) -> Dict[st
             }
             if EVENT_OUTBOX_V2_ENABLED:
                 v2_events.append(event)
-                v2_event_keys.append(event_key)
+                v2_event_keys.append((event_key, fingerprint))
                 continue
             if EVENT_OUTBOX_ENABLED:
                 db_record_event(conn, event, generation=generation_id, seq=finding_seq)
             else:
                 db_record_event(conn, event)
             db_set(conn, event_key, snapshot["checkedAtEpoch"])
+            db_set(conn, event_key + ":fingerprint", fingerprint)
     if EVENT_OUTBOX_V2_ENABLED:
         try:
             event_pipeline_v2(conn).record(v2_events)
-            for event_key in v2_event_keys:
+            for event_key, fingerprint in v2_event_keys:
                 db_set(conn, event_key, snapshot["checkedAtEpoch"])
+                db_set(conn, event_key + ":fingerprint", fingerprint)
         except EventOutboxError:
             snapshot["eventPipelineError"] = {"scope": "local-export-receipts", "coverage": "unknown",
                                               "errorClass": "EventOutboxError"}
@@ -10253,6 +10324,8 @@ def actuate_collected_snapshot(
 ) -> List[Dict[str, Any]]:
     if snapshot.get("collectorFatal") is True:
         return [{"action": "none", "result": "blocked", "reason": "collector-cache-commit-failed"}]
+    if (snapshot.get("criticalObservation") or {}).get("publicationFailed") is True:
+        return [{"action": "none", "result": "blocked", "reason": "critical-observation-publication-failed"}]
     return actuate(conn, snapshot, policy, no_action=no_action)
 
 
@@ -10428,6 +10501,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     once_p = sub.add_parser("once")
     once_p.add_argument("--no-action", action="store_true")
     sub.add_parser("status")
+    upgrade_p = sub.add_parser("upgrade-check")
+    upgrade_p.add_argument("--baseline-report", default="", help="compare a prior redacted upgrade-check report; no upgrade or action")
     sub.add_parser("snapshot")
     sub.add_parser("policy")
     sub.add_parser("lanes")
@@ -10506,10 +10581,35 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "severity": latest.get("severity"),
                 "mode": policy.get("mode"),
                 "policyAgeSeconds": policy_age,
+                "criticalObservation": load_json(STABILITY_DIR / "critical-health-latest.json", {}),
+                "evolution": latest.get("evolution"),
+                "deliveryReadiness": latest.get("deliveryReadiness"),
                 "findingCount": len(latest.get("findings") or []),
                 "lastActions": latest.get("actions"),
             }
         )
+    if cmd == "upgrade-check":
+        from stability_core.evolution_readiness import environment_report, delivery_metadata
+        from stability_core.dependency_health import collect_dependency_health
+        latest = load_json(LATEST_PATH, {}) or {}
+        report = environment_report(latest, workflow_runtime_registry_records(), now=epoch(),
+            node_id=str(latest.get("nodeId") or os.environ.get("CAT_AGENTS_STABILITY_NODE_ID", platform.node())),
+            python_version=platform.python_version(), dependencies_observed=collect_dependency_health())
+        if args.baseline_report:
+            from stability_core.evolution_readiness import compare_reports
+            baseline_path = Path(args.baseline_report)
+            try:
+                if baseline_path.is_symlink() or not baseline_path.is_file() or baseline_path.stat().st_size > 1_000_000:
+                    raise ValueError("invalid-baseline-report")
+                baseline = json.loads(baseline_path.read_text())
+                if not isinstance(baseline, dict) or "schemaFingerprint" not in baseline:
+                    raise ValueError("invalid-baseline-report")
+                report["comparison"] = compare_reports(baseline, report)
+            except (OSError, ValueError):
+                report["comparison"] = {"status": "unknown", "reason": "baseline-report-unavailable", "authorityGranted": False}
+        report["deliveryReadiness"] = delivery_metadata(WORKFLOW_DB, now=epoch())
+        report["criticalObservation"] = load_json(STABILITY_DIR / "critical-health-latest.json", {})
+        return print_json(report)
     if cmd == "snapshot":
         return print_json(read_json_or_empty(LATEST_PATH))
     if cmd == "policy":

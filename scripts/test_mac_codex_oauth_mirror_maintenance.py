@@ -10,7 +10,10 @@ import tempfile
 import json
 import os
 import sqlite3
+import base64
+import time
 import importlib.util
+import io
 from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -904,6 +907,184 @@ class MirrorDecisionTests(unittest.TestCase):
                 },
             )
         )
+
+
+class MirrorAccountIdentityTests(unittest.TestCase):
+    @staticmethod
+    def jwt(account_id, exp):
+        payload = {
+            "exp": exp,
+            "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+        }
+        encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+        return f"header.{encoded}.signature"
+
+    def write_auth(self, path, access_account_id, id_account_id):
+        exp = int(time.time()) + 3600
+        path.write_text(
+            json.dumps(
+                {
+                    "tokens": {
+                        "access_token": self.jwt(access_account_id, exp),
+                        "id_token": self.jwt(id_account_id, exp),
+                        "refresh_token": "LOCAL_REFRESH_TOKEN_FIXTURE",
+                    },
+                    "last_refresh": "2026-10-02T00:00:00Z",
+                }
+            )
+        )
+
+    def test_local_auth_loads_matching_account_claim_for_mirror(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            auth_path = pathlib.Path(temp_dir) / "auth.json"
+            self.write_auth(auth_path, "account-current", "account-current")
+            loaded = mirror_cli.load_codex_auth(auth_path, min_ttl_seconds=60)
+        self.assertEqual(loaded["accountId"], "account-current")
+
+    def test_local_auth_rejects_access_and_id_tokens_from_different_accounts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            auth_path = pathlib.Path(temp_dir) / "auth.json"
+            self.write_auth(auth_path, "account-access", "account-id-token")
+            with self.assertRaisesRegex(SystemExit, "account identifiers do not match"):
+                mirror_cli.load_codex_auth(auth_path, min_ttl_seconds=60)
+
+    def test_local_auth_rejects_missing_or_oversized_account_claims(self):
+        exp = int(time.time()) + 3600
+        for access_account_id in (None, "x" * 257):
+            with self.subTest(account_id_length=len(access_account_id or "")):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    auth_path = pathlib.Path(temp_dir) / "auth.json"
+                    auth_path.write_text(
+                        json.dumps(
+                            {
+                                "tokens": {
+                                    "access_token": self.jwt(access_account_id, exp),
+                                    "id_token": self.jwt("account-current", exp),
+                                    "refresh_token": "LOCAL_REFRESH_TOKEN_FIXTURE",
+                                }
+                            }
+                        )
+                    )
+                    with self.assertRaisesRegex(SystemExit, "missing a valid chatgpt_account_id"):
+                        mirror_cli.load_codex_auth(auth_path, min_ttl_seconds=60)
+
+    def test_remote_openclaw_mirror_overwrites_stale_profile_account_id(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temp_dir:
+            temp_root = pathlib.Path(temp_dir)
+            agents_root = temp_root / "agents"
+            agent_state = agents_root / "main" / "agent"
+            agent_state.mkdir(parents=True)
+            db_path = agent_state / "openclaw-agent.sqlite"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "create table auth_profile_store (store_key text primary key, store_json text, updated_at integer)"
+                )
+                conn.execute(
+                    "create table auth_profile_state (state_key text primary key, state_json text, updated_at integer)"
+                )
+                conn.execute(
+                    "insert into auth_profile_store values (?, ?, ?)",
+                    (
+                        "primary",
+                        json.dumps({
+                            "version": 1,
+                            "profiles": {
+                                "openai:mac-codex": {
+                                    "provider": "openai",
+                                    "accountId": "stale-account",
+                                    "access": "STALE_ACCESS_FIXTURE",
+                                }
+                            },
+                        }),
+                        1,
+                    ),
+                )
+                conn.execute(
+                    "insert into auth_profile_state values (?, ?, ?)",
+                    (
+                        "primary",
+                        json.dumps({"version": 1, "order": {}, "lastGood": {}, "usageStats": {}}),
+                        1,
+                    ),
+                )
+
+            replacement = f"pathlib.Path({str(agents_root)!r})"
+            receiver = mirror_cli.REMOTE_RECEIVER.replace(
+                'pathlib.Path("/home/flashcat/.openclaw/agents")', replacement
+            )
+            payload = {
+                "schemaVersion": 1,
+                "dryRun": False,
+                "targets": ["openclaw"],
+                "openclawTargets": [{"agentId": "main", "profileKind": "openai"}],
+                "tokens": {
+                    "access_token": "FRESH_ACCESS_FIXTURE",
+                    "id_token": "FRESH_ID_FIXTURE",
+                },
+                "openaiAccountId": "account-current",
+                "accessExpiresMs": 1_800_000_000_000,
+                "accessExpiresAt": "2027-01-15T08:00:00Z",
+                "generatedAt": "2026-10-02T00:00:00Z",
+                "source": {"host": "test", "role": "mac-codex"},
+                "artifactRoot": str(temp_root / "artifacts"),
+                "artifactId": "account-id-test",
+            }
+            proc = subprocess.run(
+                [sys.executable, "-c", receiver],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            summary = json.loads(proc.stdout)
+            with sqlite3.connect(db_path) as conn:
+                store_json = conn.execute(
+                    "select store_json from auth_profile_store where store_key='primary'"
+                ).fetchone()[0]
+            profile = json.loads(store_json)["profiles"]["openai:mac-codex"]
+            self.assertEqual(profile["accountId"], "account-current")
+            self.assertEqual(profile["access"], "FRESH_ACCESS_FIXTURE")
+            self.assertEqual(profile["refresh"], mirror_cli.DUMMY_REFRESH)
+            self.assertEqual(summary["results"][0]["backups"], [])
+            self.assertEqual(summary["backupPolicy"], "none-reauthorize-on-auth-failure")
+            self.assertFalse((temp_root / "artifacts" / "account-id-test-mac-codex-oauth-mirror" / "backups").exists())
+
+            payload["openaiAccountId"] = " "
+            payload["artifactId"] = "invalid-account-id-test"
+            invalid = subprocess.run(
+                [sys.executable, "-c", receiver],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertNotEqual(invalid.returncode, 0)
+            self.assertIn("invalid-openai-account-id", invalid.stderr)
+            with sqlite3.connect(db_path) as conn:
+                after_invalid_json = conn.execute(
+                    "select store_json from auth_profile_store where store_key='primary'"
+                ).fetchone()[0]
+            self.assertEqual(
+                json.loads(after_invalid_json)["profiles"]["openai:mac-codex"]["accountId"],
+                "account-current",
+            )
+
+
+class MaintenanceCliArgumentTests(unittest.TestCase):
+    def test_help_and_unknown_arguments_exit_before_maintenance_side_effects(self):
+        for argument, expected_code in (("--help", 0), ("--unexpected", 2)):
+            with self.subTest(argument=argument):
+                with mock.patch.object(sys, "argv", ["maintenance", argument]), \
+                     mock.patch.object(sys, "stdout", io.StringIO()), \
+                     mock.patch.object(sys, "stderr", io.StringIO()), \
+                     mock.patch.object(maintenance, "LOG_DIR") as log_dir, \
+                     mock.patch.object(maintenance, "acquire_lock") as acquire_lock:
+                    with self.assertRaises(SystemExit) as raised:
+                        maintenance.main()
+                    self.assertEqual(raised.exception.code, expected_code)
+                    log_dir.mkdir.assert_not_called()
+                    acquire_lock.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -211,6 +211,7 @@ def run_component_probe_hard(
     budget_ms: int = 60_000,
     terminate_grace_ms: int = 250,
     env: Mapping[str, str] | None = None,
+    observer_tick: Callable[[], Any] | None = None,
 ) -> dict[str, Any]:
     """Run a fresh, POSIX process-group worker with a hard wall-clock deadline.
 
@@ -222,6 +223,12 @@ def run_component_probe_hard(
     does not make arbitrary inherited Python callables interruptible.
     """
     started = time.monotonic()
+    observer_error = None
+    def observe():
+        nonlocal observer_error
+        if observer_tick is not None:
+            try: observer_tick()
+            except Exception as exc: observer_error = type(exc).__name__
 
     def result(status: str, error_class: str, duration_ms: int, *, data: Mapping[str, Any] | None = None,
                findings: list[Any] | None = None, fatal: bool = False,
@@ -232,6 +239,7 @@ def run_component_probe_hard(
             "cacheUpdates": dict(cache_updates or {}) if data is not None else {},
             "probe": {
                 "component": name, "status": status, "source": source,
+                "observerErrorClass": observer_error,
                 "coverage": status == "ok", "durationMs": duration_ms,
                 "budgetMs": budget_ms, "maxOutputBytes": max_output_bytes,
                 "errorClass": None if status == "ok" else error_class,
@@ -279,6 +287,7 @@ def run_component_probe_hard(
     leader_succeeded = False
     try:
         while selector.get_map():
+            observe()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 error_class = "ProbeTimeout"
@@ -303,6 +312,7 @@ def run_component_probe_hard(
             # reserved lets finally clean descendants even if they closed both
             # inherited pipes before the worker exited.
             while time.monotonic() < deadline:
+                observe()
                 available, child_pid, exit_code, exit_status = _waitid_unreaped(proc.pid)
                 if not available:
                     error_class = "SafeWaitUnavailable"

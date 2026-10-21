@@ -104,7 +104,7 @@ def parse_json_output(result: dict[str, Any], fallback: Any) -> Any:
 
 
 def stability_cli_args(action: str, args: dict[str, Any]) -> list[str]:
-    allowed = {"status", "snapshot", "policy", "lanes", "nodes", "surfaces", "preflight", "recovery", "action-classes", "profile-modes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook", "auth-readiness", "auth-maintenance", "auth-mirror", "doctor", "repair", "once"}
+    allowed = {"status", "upgrade-check", "snapshot", "policy", "lanes", "nodes", "surfaces", "preflight", "recovery", "action-classes", "profile-modes", "desired-state", "drift", "findings", "workflow-evidence", "actions", "events", "runbook", "auth-readiness", "auth-maintenance", "auth-mirror", "doctor", "repair", "once"}
     if action not in allowed:
         raise ValueError(f"unsupported stability action: {action}")
     cmd = [action]
@@ -168,6 +168,10 @@ def stability_call(args: dict[str, Any]) -> dict[str, Any]:
 
 def status(args: dict[str, Any]) -> dict[str, Any]:
     return stability_call({**args, "action": "status"})
+
+
+def upgrade_check(args: dict[str, Any]) -> dict[str, Any]:
+    return stability_call({**args, "action": "upgrade-check"})
 
 
 def findings(args: dict[str, Any]) -> dict[str, Any]:
@@ -300,6 +304,11 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": "Return cat-agents-stability status from local or remote stabilityd.",
         "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
     },
+    "stability_upgrade_check": {
+        "description": "Read current platform/adapter capabilities, dependency coverage and bounded delivery metadata; never upgrades, writes workflow state or grants authority.",
+        "annotations": {"readOnlyHint": True, "destructiveHint": False},
+        "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
+    },
     "stability_findings": {
         "description": "Return current cat-agents-stability findings.",
         "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["local", "remote"]}}, "additionalProperties": False},
@@ -427,6 +436,8 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
         try:
             if name == "stability_status":
                 payload = status(arguments)
+            elif name == "stability_upgrade_check":
+                payload = upgrade_check(arguments)
             elif name == "stability_findings":
                 payload = findings(arguments)
             elif name == "stability_lanes":

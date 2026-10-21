@@ -411,6 +411,14 @@ def apply_hermers(payload, artifact, dry_run):
 
 def apply_openclaw(payload, artifact, dry_run):
     results = []
+    account_id = payload.get("openaiAccountId")
+    if (
+        not isinstance(account_id, str)
+        or not account_id
+        or account_id != account_id.strip()
+        or len(account_id) > 256
+    ):
+        raise ValueError("invalid-openai-account-id")
     agents_root = pathlib.Path("/home/flashcat/.openclaw/agents")
     if agents_root.is_symlink():
         raise ValueError("symlink-openclaw-agents-root")
@@ -472,7 +480,7 @@ def apply_openclaw(payload, artifact, dry_run):
                 profile["refresh"] = DUMMY_REFRESH
                 profile["expires"] = payload["accessExpiresMs"]
                 profile.setdefault("email", "mac-codex")
-                profile.setdefault("accountId", "mac-codex")
+                profile["accountId"] = account_id
                 profile.setdefault("chatgptPlanType", "pro")
                 profile["macCodexMirror"] = {
                     "source": payload["source"],
@@ -616,6 +624,20 @@ def inspect_jwt_expiry(token: str, label: str) -> tuple[int, int]:
     return exp, exp - int(time.time())
 
 
+def openai_account_id(token: str, label: str) -> str:
+    """Extract profile metadata from the trusted local Codex auth token.
+
+    Codex owns token verification. This function only reads the matching
+    account selector for remote profile metadata; it does not authenticate JWTs.
+    """
+    claims = decode_jwt(token, label)
+    auth_claims = claims.get("https://api.openai.com/auth")
+    account_id = auth_claims.get("chatgpt_account_id") if isinstance(auth_claims, dict) else None
+    if not isinstance(account_id, str) or not account_id or account_id != account_id.strip() or len(account_id) > 256:
+        raise SystemExit(f"Codex {label} is missing a valid chatgpt_account_id claim")
+    return account_id
+
+
 def inspect_codex_auth(path: pathlib.Path) -> dict[str, Any]:
     """Return local mac-codex token timing without exposing token values."""
     if not path.exists():
@@ -705,12 +727,17 @@ def load_codex_auth(path: pathlib.Path, min_ttl_seconds: int) -> dict[str, Any]:
         raise SystemExit("Codex auth file contains the mirror refresh placeholder; this host is not the mac-codex refresh owner")
     access_exp, access_remaining = require_fresh_jwt(access_token, "access_token", min_ttl_seconds)
     id_exp, id_remaining = inspect_jwt_expiry(id_token, "id_token")
+    access_account_id = openai_account_id(access_token, "access_token")
+    id_account_id = openai_account_id(id_token, "id_token")
+    if access_account_id != id_account_id:
+        raise SystemExit("Codex access_token and id_token account identifiers do not match")
     return {
         "auth": data,
         "tokens": {
             "access_token": access_token,
             "id_token": id_token,
         },
+        "accountId": access_account_id,
         "accessExpiresEpoch": access_exp,
         "accessExpiresAt": iso_from_epoch(access_exp),
         "accessExpiresMs": access_exp * 1000,
@@ -783,6 +810,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         "dryRun": not args.apply,
         "targets": targets,
         "tokens": source["tokens"],
+        "openaiAccountId": source["accountId"],
         "lastRefresh": source["lastRefresh"],
         "accessExpiresAt": source["accessExpiresAt"],
         "accessExpiresMs": source["accessExpiresMs"],

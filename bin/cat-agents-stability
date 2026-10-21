@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_BIN="${CAT_AGENTS_STABILITY_PYTHON:-}"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  CONTROL_PYTHON="${HOME}/multi-agent-hedge-fund-framework/runtimes/python/environments/control-3.14.7/bin/python3"
+  if [[ -x "${CONTROL_PYTHON}" ]]; then PYTHON_BIN="${CONTROL_PYTHON}"; else PYTHON_BIN="$(command -v python3)"; fi
+fi
 if [[ "${1-}" == "auth-maintenance-local" ]]; then
   shift
-  exec /usr/bin/python3 "${SCRIPT_DIR}/../scripts/mac_codex_oauth_mirror_maintenance.py" "$@"
+  exec "${PYTHON_BIN}" "${SCRIPT_DIR}/../scripts/mac_codex_oauth_mirror_maintenance.py" "$@"
 fi
-exec /usr/bin/python3 "${SCRIPT_DIR}/cat_agents_stabilityd.py" "$@"
+exec "${PYTHON_BIN}" "${SCRIPT_DIR}/cat_agents_stabilityd.py" "$@"
