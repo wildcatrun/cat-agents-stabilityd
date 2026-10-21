@@ -22,8 +22,10 @@ def commit_pressure_corroboration(context: Mapping[str, Any], available_bytes: i
                                   available_warn_bytes: int) -> dict[str, Any]:
     """Reservations alone and since-boot OOM/swap counters are not current pressure."""
     psi = context.get('psi')
-    some = finite_number(((psi or {}).get('some') or {}).get('avg10')) if isinstance(psi, dict) else None
-    full = finite_number(((psi or {}).get('full') or {}).get('avg10')) if isinstance(psi, dict) else None
+    some_line = psi.get('some') if isinstance(psi, Mapping) else None
+    full_line = psi.get('full') if isinstance(psi, Mapping) else None
+    some = finite_number(some_line.get('avg10')) if isinstance(some_line, Mapping) else None
+    full = finite_number(full_line.get('avg10')) if isinstance(full_line, Mapping) else None
     psi_high = ((some is not None and some >= PSI_SOME_AVG10_PERCENT)
                 or (full is not None and full >= PSI_FULL_AVG10_PERCENT))
     low_available = 0 < available_bytes <= available_warn_bytes
@@ -39,13 +41,13 @@ def observation_contract(name: str, data: Mapping[str, Any], probe: Mapping[str,
     complete = None
     if name == 'auth':
         section = data.get('openclaw') or {}
-        complete = section.get('scopeComplete') is True
+        complete = isinstance(section, Mapping) and section.get('scopeComplete') is True
         hermers = data.get('hermers') or {}
         if isinstance(hermers, dict) and hermers.get('scopeComplete') is False:
             complete = False
     elif name == 'hermers':
         registry = data.get('profileRegistry') or {}
-        complete = registry.get('scopeComplete')
+        complete = registry.get('scopeComplete') if isinstance(registry, Mapping) else False
         if complete not in (True, False):
             complete = None
     if not transport:

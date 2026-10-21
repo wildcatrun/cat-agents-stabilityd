@@ -1,10 +1,12 @@
 """S1 regressions for registered scope, pressure evidence and local impact."""
 from __future__ import annotations
 import importlib.util
+import contextlib
 import os
 import pathlib
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -32,7 +34,7 @@ class GovernanceEvolutionTests(unittest.TestCase):
     def policy(self, findings, snapshot=None):
         snapshot=snapshot or {'gateway':{'active':True,'portOk':True,'healthOk':True},'cron':{'storageStatus':{'storage':'sqlite'}}}
         streaks={f['key']:{'count':100,'firstSeen':d.epoch()-3600,'lastSeen':d.epoch()} for f in findings}
-        with d.init_memory_kv_db() as conn, mock.patch.object(d,'mechanical_timing_projection',return_value=None):
+        with contextlib.closing(d.init_memory_kv_db()) as conn, mock.patch.object(d,'mechanical_timing_projection',return_value=None):
             return d.policy_from_findings(conn,findings,snapshot,streaks)
 
     def test_native_registry_scope_and_legacy_adapter(self):
@@ -104,7 +106,7 @@ class GovernanceEvolutionTests(unittest.TestCase):
     def test_resource_collect_keeps_capacity_warning_without_incident(self):
         context={'psi':{'some':{'avg10':0.0},'full':{'avg10':0.0}},'overcommitMode':0,'commitInterpretation':'fixture'}
         mem={'MemTotal':8*1024**3,'MemAvailable':3*1024**3,'SwapTotal':8*1024**3,'SwapFree':8*1024**3,'CommitLimit':12*1024**3,'Committed_AS':int(11.9*1024**3)}
-        with mock.patch.object(d,'backup_disk_summary',return_value={}),mock.patch.object(d,'meminfo_bytes',return_value=mem),mock.patch.object(d,'memory_pressure_context',return_value=context):
+        with mock.patch.object(d.os,'statvfs',return_value=types.SimpleNamespace(f_bavail=80,f_frsize=1,f_blocks=100)), mock.patch.object(d,'backup_disk_summary',return_value={}),mock.patch.object(d,'meminfo_bytes',return_value=mem),mock.patch.object(d,'memory_pressure_context',return_value=context):
             findings=[];resource=d.resource_collect(findings)
         item=next(f for f in findings if f['key']=='system_commit_pressure')
         self.assertEqual(item['severity'],'warning');self.assertFalse(resource['memory']['commitCorroboration']['corroborated'])
