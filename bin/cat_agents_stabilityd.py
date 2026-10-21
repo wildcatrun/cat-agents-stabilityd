@@ -61,6 +61,10 @@ from stability_core.config import (
     parse_restart_actuator_settings, parse_hermers_gateway_restart_limit, startup_grace_active,
 )
 from stability_core.action_ledger import ActionLedger, IdempotencyConflict
+from stability_core.governance_decisions import (
+    CRON_PRESSURE_KEYS, COMMIT_RUNTIME_PRESSURE_KEY, commit_pressure_corroboration,
+    finding_classification, observation_contract,
+)
 from stability_core.event_outbox import EventOutbox, EventOutboxError
 from stability_core.action_classes import classify_action_types, classify_commands
 from stability_core.preflight_recovery import (
@@ -424,9 +428,8 @@ RESOURCE_PRESSURE_KEYS = {
     "system_memory_pressure",
     "system_swap_saturation",
     "system_swap_pressure",
-    "system_commit_saturation",
-    "system_commit_pressure",
     "disk_pressure",
+    COMMIT_RUNTIME_PRESSURE_KEY,
 }
 
 RESOURCE_INCIDENT_IMMEDIATE_KEYS = {
@@ -434,8 +437,8 @@ RESOURCE_INCIDENT_IMMEDIATE_KEYS = {
     "gateway_swap_saturation",
     "system_memory_saturation",
     "system_swap_saturation",
-    "system_commit_saturation",
     "disk_pressure",
+    COMMIT_RUNTIME_PRESSURE_KEY,
 }
 
 RESOURCE_INCIDENT_SUSTAINED_KEYS = {
@@ -444,7 +447,7 @@ RESOURCE_INCIDENT_SUSTAINED_KEYS = {
     "gateway_memory_growth",
     "system_memory_pressure",
     "system_swap_pressure",
-    "system_commit_pressure",
+    COMMIT_RUNTIME_PRESSURE_KEY,
 }
 
 
@@ -3558,7 +3561,7 @@ def openclaw_auth_scope_from_registry(registry: Dict[str, Any]) -> Tuple[List[st
             continue
         if (str(record.get("runtime") or "").strip() != "openclaw"
                 or str(record.get("platform") or "").strip() != "openclaw"
-                or str(record.get("execution_adapter") or "").strip() != "openclaw"):
+                or str(record.get("execution_adapter") or "").strip() not in {"native", "openclaw"}):
             continue
         if _snapshot_bool(record.get("can_receive_dispatch")) != 1:
             continue
@@ -5887,7 +5890,7 @@ def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
         add_finding(
             findings,
             "system_commit_saturation",
-            "critical",
+            "warning",
             "resource",
             "system committed memory exceeds safe commit headroom",
             committedBytes=committed_as,
@@ -5900,7 +5903,7 @@ def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
         add_finding(
             findings,
             "system_commit_pressure",
-            "high",
+            "warning",
             "resource",
             "system committed memory is near commit limit",
             committedBytes=committed_as,
@@ -5909,6 +5912,12 @@ def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
             overcommitMode=pressure_context["overcommitMode"],
             interpretation=pressure_context["commitInterpretation"],
         )
+    corroboration = commit_pressure_corroboration(pressure_context, mem_available, SYSTEM_MEMORY_AVAILABLE_WARN_BYTES)
+    if commit_limit and commit_ratio >= SYSTEM_COMMIT_WARN_RATIO and corroboration["corroborated"]:
+        add_finding(findings, COMMIT_RUNTIME_PRESSURE_KEY,
+                    "critical" if commit_ratio >= SYSTEM_COMMIT_CRIT_RATIO else "high",
+                    "resource", "commit reservation risk corroborated by memory pressure and low available memory",
+                    commitRatio=commit_ratio, corroboration=corroboration)
     return {
         "diskFreeBytes": free,
         "diskTotalBytes": total,
@@ -5925,6 +5934,7 @@ def resource_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
             "commitLimitBytes": commit_limit,
             "commitRatio": commit_ratio,
             "pressureContext": pressure_context,
+            "commitCorroboration": corroboration,
         },
     }
 
@@ -6199,7 +6209,7 @@ def build_lane_policy(
 ) -> Dict[str, Any]:
     gateway_unavailable = mode == "gateway-unreachable" or not gateway.get("active") or not gateway.get("portOk")
     resource_pressure = resource_pressure_active(keys) or mode == "resource-pressure"
-    cron_pressure = bool({"cron_stale_running_state", "cron_expired_leases", "gateway_congestion_logs", "cron_heartbeat_unhealthy"} & keys)
+    cron_pressure = bool(CRON_PRESSURE_KEYS & keys)
     session_pressure = "session_problem_backlog" in keys
     channel_pressure = bool(
         {"telegram_provider_network_errors", "telegram_channel_restart_limited", "telegram_channel_restart_churn"} & keys
@@ -6227,7 +6237,7 @@ def build_lane_policy(
         cron_max_concurrency = CRON_MAX_CONCURRENCY_DEGRADED
     elif should_pause_cron or resource_pressure:
         cron_max_concurrency = CRON_MAX_CONCURRENCY_DEGRADED
-    elif severity in {"high", "critical"}:
+    elif severity in {"high", "critical"} and (cron_pressure or session_pressure or channel_pressure or resource_pressure):
         cron_max_concurrency = CRON_MAX_CONCURRENCY_DEGRADED
     else:
         cron_max_concurrency = CRON_MAX_CONCURRENCY_NORMAL
@@ -6243,7 +6253,7 @@ def build_lane_policy(
 
     session_reset_allowed = bool(can_reset_session)
     main_session_reset_allowed = session_reset_allowed and not ("session_problem_backlog" in keys and severity == "critical")
-    cron_evidence = sorted(k for k in keys if k in {"cron_stale_running_state", "cron_expired_leases", "gateway_congestion_logs", "cron_heartbeat_unhealthy"})
+    cron_evidence = sorted(k for k in keys if k in CRON_PRESSURE_KEYS)
     cron_observations = sorted(
         k
         for k in keys
@@ -6494,7 +6504,7 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         mode = "delivery-failing"
     elif "cron_stale_running_state" in keys or "cron_expired_leases" in keys:
         mode = "cron-state-corrupt"
-    elif "gateway_congestion_logs" in keys or "cron_heartbeat_unhealthy" in keys:
+    elif "gateway_congestion_logs" in keys:
         mode = "cron-congested"
     elif "session_problem_backlog" in keys:
         mode = "session-stuck"
@@ -6607,13 +6617,12 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
                 or sustained(streaks, "gateway_swap_saturation", SOFT_RESCUE_STREAK_THRESHOLD)
                 or sustained(streaks, "system_memory_saturation", SOFT_RESCUE_STREAK_THRESHOLD)
                 or sustained(streaks, "system_swap_saturation", SOFT_RESCUE_STREAK_THRESHOLD)
-                or sustained(streaks, "system_commit_saturation", SOFT_RESCUE_STREAK_THRESHOLD)
+                or sustained(streaks, COMMIT_RUNTIME_PRESSURE_KEY, SOFT_RESCUE_STREAK_THRESHOLD)
                 or sustained(streaks, "disk_pressure", SOFT_RESCUE_STREAK_THRESHOLD)
             )
             cron_blocked = (
                 sustained(streaks, "cron_stale_running_state", SOFT_RESCUE_STREAK_THRESHOLD)
                 or sustained(streaks, "cron_expired_leases", SOFT_RESCUE_STREAK_THRESHOLD)
-                or sustained(streaks, "cron_heartbeat_unhealthy", SOFT_RESCUE_STREAK_THRESHOLD)
                 or sustained(streaks, "cron_audit_high_findings", SOFT_RESCUE_STREAK_THRESHOLD)
             )
             session_blocked = sustained(streaks, "session_problem_backlog", SOFT_RESCUE_STREAK_THRESHOLD)
@@ -6661,7 +6670,7 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         and mode not in {"gateway-unreachable", "channel-stalled", "resource-pressure", "restart-storm"}
     )
     can_reset_session = SESSION_RESET_ENABLED and not restart_storm and mode not in {"gateway-unreachable", "resource-pressure", "restart-storm"}
-    should_pause_cron = mode in {"channel-stalled", "delivery-failing", "cron-congested", "hermers-unavailable", "hermers-degraded", "resource-pressure", "cooldown", "restart-storm"}
+    should_pause_cron = mode in {"channel-stalled", "delivery-failing", "cron-congested", "resource-pressure", "cooldown", "restart-storm"}
     should_defer_control_plane_heavy = mode in {"cooldown", "cron-congested", "resource-pressure", "restart-storm"} or (
         severity == "critical" and "session_problem_backlog" in keys
     )
@@ -6678,7 +6687,7 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
         conn,
         now_s,
         {
-            "cron": bool({"cron_stale_running_state", "cron_expired_leases", "gateway_congestion_logs", "cron_heartbeat_unhealthy"} & keys) or gateway_unavailable,
+            "cron": bool(CRON_PRESSURE_KEYS & keys) or gateway_unavailable,
             "session": "session_problem_backlog" in keys,
             "channel": bool(
                 {"telegram_provider_network_errors", "telegram_channel_restart_limited", "telegram_channel_restart_churn"} & keys
@@ -6714,6 +6723,8 @@ def policy_from_findings(conn: sqlite3.Connection, findings: List[Dict[str, Any]
     )
     policy = {
         "schemaVersion": 1,
+        "decisionEvidence": {"schemaVersion": 1, "classifications": [finding_classification(f) for f in findings],
+                             "heartbeatFailureImpliesCongestion": False, "rawCommitRatioGrantsAuthority": False},
         "clockDiscipline": {"state": "available" if timing is not None else "unavailable-or-quarantined",
                             "epoch": timing['epoch'] if timing is not None else None,
                             "executionFence": "required-for-time-dependent-effects"},
@@ -9970,6 +9981,13 @@ def collect_snapshot(
         "desired_state",
         {"ok": False, "drifts": [], "observations": [], "status": "unknown"}
     )
+    for component, probe in probes.items():
+        data = snapshot.get("desiredState" if component == "desired_state" else component) or {}
+        contract = observation_contract(component, data, probe)
+        probe.update(contract)
+        probe["legacyCoverageMeaning"] = "probe-protocol-success; see scopeComplete"
+        if contract["scopeComplete"] is False:
+            probe["coverage"] = False
     snapshot["collectorProbes"] = probes
     if pending_cache_updates and not collector_failed:
         try:

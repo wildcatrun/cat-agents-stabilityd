@@ -30,7 +30,7 @@ Hermers agents framework
 - Do not implement a second workflow scheduler.
 - Do not directly rewrite workflow SQLite internals.
 - Do not make the stability plugin the only liveness proof for itself.
-- Do not use local Codex as an agent return inbox.
+- Governed local Codex inbox may receive structured handoff/evidence through workflow routing; it is not a semantic runtime, human confirmation, or final user-visible delivery.
 
 ## Component Ownership
 

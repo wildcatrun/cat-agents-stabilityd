@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "version": "2026-05-20T15:00:00+08:00",
-  "enforcementPhase": "pre-hermers-im-cutover",
+  "version": "2026-10-22",
+  "enforcementPhase": "post-hermes-unified-gateway-observe-and-validate",
   "purpose": "Single desired-state registry for cat-agents-stability as the companion governance package for trading-agents-workflow.",
   "packageSurfaces": {
     "requiredFiles": [
@@ -30,9 +30,9 @@
     ],
     "forbiddenRoles": [
       "workflow-runtime",
-      "agent-return-inbox",
       "parallel-scheduler"
-    ]
+    ],
+    "governedInbox": "structured handoff/evidence via workflow routing; receipt is not semantic output, Human Gate, or final delivery"
   },
   "workflowBoundary": {
     "companionTo": "trading-agents-workflow",
