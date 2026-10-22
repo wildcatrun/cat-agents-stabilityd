@@ -41,6 +41,7 @@ class GovernanceEvolutionTests(unittest.TestCase):
         ids=['main','cat_claw','cat_voice','cat_tail','cat_gunclaw','cat_swordclaw','cat_shieldclaw']
         result,rejected=d.openclaw_auth_scope_from_registry({'records':[row(a) for a in ids]})
         self.assertEqual(result,sorted(ids));self.assertEqual(rejected,[])
+        self.assertEqual(d.active_openclaw_agent_ids_from_registry({'records':[row(a) for a in ids]}),sorted(ids))
         self.assertEqual(d.openclaw_auth_scope_from_registry({'records':[row(adapter='openclaw') ]})[0],['main'])
 
     def test_invalid_legacy_shell_unknown_adapter_and_endpoint_remain_excluded(self):
@@ -48,6 +49,7 @@ class GovernanceEvolutionTests(unittest.TestCase):
               row(endpoint_ref='openclaw-agent:other'),row(can_receive_dispatch=0),row(status='retired')]
         selected,rejected=d.openclaw_auth_scope_from_registry({'records':rows})
         self.assertEqual(selected,[]);self.assertEqual(len(rejected),1)
+        self.assertEqual(d.active_openclaw_agent_ids_from_registry({'records':rows}),[])
 
     def test_empty_registry_never_invents_targets(self):
         self.assertEqual(d.openclaw_auth_scope_from_registry({}),([],[]))

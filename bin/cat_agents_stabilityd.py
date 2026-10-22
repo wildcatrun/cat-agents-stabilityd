@@ -3551,28 +3551,9 @@ def hermers_collect(
 
 
 def active_openclaw_agent_ids_from_registry(registry: Dict[str, Any]) -> List[str]:
-    records = registry.get("records") if isinstance(registry.get("records"), list) else []
-    agent_ids = set()
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        status = str(record.get("status") or "").strip()
-        runtime = str(record.get("runtime") or "").strip()
-        platform = str(record.get("platform") or "").strip()
-        adapter = str(record.get("execution_adapter") or "").strip()
-        can_receive = _snapshot_bool(record.get("can_receive_dispatch"))
-        if status != "active":
-            continue
-        if "openclaw_route_shell" in runtime_record_adapter_values(record):
-            continue
-        if runtime != "openclaw" or platform != "openclaw" or adapter != "openclaw":
-            continue
-        if can_receive != 1:
-            continue
-        agent_id = str(record.get("agent_id") or "").strip()
-        if agent_id:
-            agent_ids.add(agent_id)
-    return sorted(agent_ids)
+    # All OpenClaw observers share the reviewed registry/endpoint selector.
+    # This is not an actuator grant: action prechecks and protection still apply.
+    return openclaw_auth_scope_from_registry(registry)[0]
 
 
 def openclaw_auth_scope_from_registry(registry: Dict[str, Any]) -> Tuple[List[str], List[Dict[str, Any]]]:
