@@ -44,6 +44,8 @@ class CollectorDefaultEntryTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(m, "policy_from_findings", return_value={"mode": "synthetic"}))
                 stack.enter_context(mock.patch.object(m, "build_auth_maintenance_plan", return_value={}))
                 stack.enter_context(mock.patch.object(m, "run_cmd", side_effect=AssertionError("runtime command forbidden")))
+                stack.enter_context(mock.patch('stability_core.dependency_health.collect_dependency_health',return_value={}))
+                stack.enter_context(mock.patch('stability_core.evolution_readiness.delivery_metadata',return_value={'coverage':'fixture'}))
                 result = m.collect_snapshot(conn)  # Deliberately no injected runner argument.
             return result, calls
         finally:
@@ -54,7 +56,13 @@ class CollectorDefaultEntryTests(unittest.TestCase):
         names = [row[0] for row in calls]
         self.assertEqual(names, ["gateway", "cron", "session", "channel", "hermers", "auth", "resource", "config", "desired_state"])
         self.assertEqual(set(snapshot["collectorProbes"]), set(names))
-        self.assertTrue(all(probe["coverage"] for probe in snapshot["collectorProbes"].values()))
+        self.assertTrue(all(probe["transportSuccess"] for probe in snapshot["collectorProbes"].values()))
+        self.assertFalse(snapshot['collectorProbes']['auth']['scopeComplete'])
+        self.assertFalse(snapshot['collectorProbes']['auth']['coverage'])
+        registries=[__import__('json').loads(row[2]['env']['CAT_AGENTS_STABILITY_COMPONENT_REGISTRY']) for row in calls]
+        self.assertEqual(len({r['collectionId'] for r in registries}),1)
+        self.assertTrue(all(r['observationOnly'] for r in registries))
+        self.assertIsNone(m._component_registry_observation)
         for name, command, kwargs in calls:
             self.assertEqual(command[:3], [sys.executable, str(ROOT / "bin/cat_agents_stabilityd.py"), "__component_probe_v1"])
             self.assertEqual(command[3], name)
