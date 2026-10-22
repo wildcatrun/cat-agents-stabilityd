@@ -50,6 +50,9 @@ def observation_contract(name: str, data: Mapping[str, Any], probe: Mapping[str,
         complete = registry.get('scopeComplete') if isinstance(registry, Mapping) else False
         if complete not in (True, False):
             complete = None
+    elif name == 'session':
+        scope = data.get('scope')
+        complete = isinstance(scope, Mapping) and scope.get('scopeComplete') is True
     if not transport:
         complete = False
     return {'transportSuccess': transport, 'scopeComplete': complete,

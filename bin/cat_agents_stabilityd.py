@@ -5565,12 +5565,44 @@ def find_session_entry(session_key: str, agent_ids: Optional[Iterable[str]] = No
     return None, None
 
 
+def native_session_inventory(agent_ids: List[str]) -> Dict[str, Any]:
+    try:
+        command, node = shutil.which('openclaw'), shutil.which('node')
+        if not command or not node or not agent_ids:
+            raise ValueError('session-inventory-source-unavailable')
+        root = next((p for p in Path(command).resolve().parents
+                     if (p / 'package.json').is_file() and load_json(p / 'package.json', {}).get('name') == 'openclaw'), None)
+        if root is None:
+            raise ValueError('session-inventory-source-unavailable')
+        result = run_cmd([node, str(PACKAGE_ROOT / 'scripts/gateway_sessions_readonly.mjs'), str(root),
+                          json.dumps(agent_ids, separators=(',', ':'))], timeout=8)
+        payload, _, _ = extract_json_payload(result.stdout)
+        if (result.returncode or not isinstance(payload, dict) or payload.get('schemaVersion') != 1
+                or payload.get('available') is not True or payload.get('authorityGranted') is not False
+                or payload.get('expectedAgentIds') != agent_ids):
+            raise ValueError('session-inventory-schema-unavailable')
+        return payload
+    except Exception as exc:
+        return {'available': False, 'scopeComplete': False, 'source': 'gateway-sdk-read-only',
+                'errorClass': type(exc).__name__, 'authorityGranted': False}
+
+
 def session_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     registry = workflow_runtime_registry_records()
     registry_records = registry.get("records") if isinstance(registry.get("records"), list) else []
     scope_available = registry.get("source") == "db" and bool(registry.get("writeEligible"))
     active_openclaw_agent_ids = active_openclaw_agent_ids_from_registry(registry) if scope_available else []
     stores = iter_session_store_paths(active_openclaw_agent_ids if scope_available else [])
+    observed_legacy_ids = {session_store_agent_id(p) for p in stores}
+    legacy_scope_complete = bool(scope_available and active_openclaw_agent_ids
+                                 and set(active_openclaw_agent_ids) <= observed_legacy_ids)
+    native_inventory = native_session_inventory(active_openclaw_agent_ids) if scope_available and not legacy_scope_complete else {}
+    scope_complete = legacy_scope_complete or native_inventory.get('scopeComplete') is True
+    if not scope_complete:
+        add_finding(findings, 'session_inventory_scope_incomplete', 'warning', 'session',
+                    'session inventory does not establish complete registered scope; reset eligibility remains unconfirmed',
+                    expectedAgentIds=active_openclaw_agent_ids, observedLegacyAgentIds=sorted(observed_legacy_ids),
+                    nativeErrorClass=native_inventory.get('errorClass'), coverage=False)
     total_entries = 0
     stale_entries = []
     for store_path in stores:
@@ -5672,6 +5704,8 @@ def session_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "storeCount": len(stores),
         "entryCount": total_entries,
+        "nativeInventory": native_inventory,
+        "activityCoverage": "legacy-transcript-where-present; native active-run metadata is not idle/reset proof",
         "scope": {
             "source": registry.get("source") or "",
             "dbFile": registry.get("dbFile") or "",
@@ -5680,6 +5714,8 @@ def session_collect(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
             "registryRecordCount": len(registry_records),
             "activeOpenClawAgentIds": active_openclaw_agent_ids,
             "scopedByRuntimeAgents": scope_available,
+            "scopeComplete": bool(scope_complete),
+            "inventorySource": "legacy-json" if legacy_scope_complete else "gateway-sdk-read-only",
         },
         "staleEntries": stale_entries[:50],
         "problemCount": len(problems),
