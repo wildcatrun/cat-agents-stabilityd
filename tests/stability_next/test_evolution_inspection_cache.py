@@ -43,4 +43,18 @@ class ConfigWorkerCacheTests(unittest.TestCase):
             result=d.cached_inspection('plugins',lambda:{'available':False},300,force=True)
             self.assertFalse(result['available']);self.assertNotIn('plugins',d._inspection_cache)
 
+    def test_collection_registry_is_scoped_and_cleared_before_actuators(self):
+        before=d._component_registry_observation
+        try:
+            d._component_registry_observation=None
+            def inner(conn,**kwargs):
+                a=d.workflow_runtime_registry_records();a['records'].append({'agent_id':'injected'})
+                self.assertEqual(d.workflow_runtime_registry_records()['records'],[])
+                raise RuntimeError('fixture-stop')
+            with mock.patch.object(d,'_collect_snapshot',side_effect=inner):
+                with self.assertRaisesRegex(RuntimeError,'fixture-stop'):
+                    d.collect_snapshot(None,component_probe_runner=object())
+            self.assertIsNone(d._component_registry_observation)
+        finally:d._component_registry_observation=before
+
 if __name__=='__main__':unittest.main()

@@ -105,6 +105,16 @@ class EventDaemonV2Tests(unittest.TestCase):
         self.assertEqual(result["eventPipeline"]["coverage"], "receipt-clear")
         self.assertEqual(m.db_get(self.conn, "event:first"), 1000)
 
+    def test_unchanged_condition_is_coalesced_and_reappearance_is_new_evidence(self):
+        self.conn = m.init_db()
+        for _ in range(3):self._run_patched_loop()
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM event_v2_rows").fetchone()[0],2)
+        empty=({"checkedAt":"2026-10-11T00:00:01+00:00","checkedAtEpoch":1001},[],{"mode":"fixture"})
+        with mock.patch.object(self,'_synthetic_loop',return_value=empty):self._run_patched_loop()
+        self._run_patched_loop()
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM event_v2_rows").fetchone()[0],4)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM actions").fetchone()[0],5)
+
     def test_actual_run_once_export_failure_keeps_action_record_and_reports_unknown(self):
         from stability_core.event_stream_v2 import EventStreamError
         self.conn = m.init_db()

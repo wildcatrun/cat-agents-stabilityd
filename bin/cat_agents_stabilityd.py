@@ -1725,7 +1725,12 @@ def workflow_runtime_registry_snapshot_records(reason: str = "") -> Dict[str, An
     return payload
 
 
+_component_registry_observation = None  # Fixed read-only child entry only; never actuator authority.
+
+
 def workflow_runtime_registry_records() -> Dict[str, Any]:
+    if _component_registry_observation is not None:
+        return copy.deepcopy(_component_registry_observation)
     payload: Dict[str, Any] = {
         "source": "db",
         "dbFile": str(WORKFLOW_DB),
@@ -2555,6 +2560,9 @@ def child_process_summary(root_pid: int) -> Dict[str, Any]:
         },
         "ownerCandidates": owner_candidates,
         "classification": "argv executable plus first Codex subcommand; shell and search argument text are excluded",
+        "observationScope": "gateway-descendants; counts are not orphan or idle proof",
+        "processCountsAuthorizeReap": False,
+        "reapEligibility": "requires existing registry, identity, activity and protection gates",
         "sample": public_children[:20],
     }
 
@@ -9751,7 +9759,7 @@ def _encode_component_probe_result(
 
 def _component_probe_worker(argv: List[str]) -> int:
     """Fresh-interpreter entry point. Only fixed read-only collectors are selectable."""
-    global _inspection_cache_enabled
+    global _inspection_cache_enabled, _component_registry_observation
     if len(argv) != 2 or argv[0] not in _COMPONENT_PROBE_NAMES:
         return 2
     name, raw_profiles = argv
@@ -9762,6 +9770,15 @@ def _component_probe_worker(argv: List[str]) -> int:
             return 2
         if not install_component_probe_parent_death_guard(expected_parent_pid):
             return 2
+        raw_registry = os.environ.get("CAT_AGENTS_STABILITY_COMPONENT_REGISTRY")
+        if raw_registry is not None:
+            if len(raw_registry.encode('utf-8')) > 65536:
+                return 2
+            registry = json.loads(raw_registry)
+            if (not isinstance(registry, dict) or not isinstance(registry.get('records'), list)
+                    or len(registry['records']) > 512 or not registry.get('collectionId')):
+                return 2
+            _component_registry_observation = registry
         raw_inspection = os.environ.get(_INSPECTION_WORKER_ENV)
         if raw_inspection is not None:
             if name not in {"gateway", "cron", "config"} or len(raw_inspection.encode("utf-8")) > _INSPECTION_STATE_MAX_BYTES:
@@ -9797,6 +9814,7 @@ def _component_probe_worker(argv: List[str]) -> int:
             sys.stdout.buffer.flush()
             return 0
         finally:
+            _component_registry_observation = None
             if conn is not None:
                 conn.close()
     except Exception:
@@ -9805,6 +9823,21 @@ def _component_probe_worker(argv: List[str]) -> int:
 
 
 def collect_snapshot(
+    conn: sqlite3.Connection, *, component_probe_runner: Any = None, round_budget: Any = None, critical_observer: Any = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
+    """One registry observation per collection; restored before any actuator."""
+    global _component_registry_observation
+    previous = _component_registry_observation
+    registry = workflow_runtime_registry_records() if component_probe_runner is None else {"source": "fixture", "records": [], "writeEligible": False}
+    _component_registry_observation = copy.deepcopy(registry)
+    try:
+        return _collect_snapshot(conn, component_probe_runner=component_probe_runner,
+                                 round_budget=round_budget, critical_observer=critical_observer)
+    finally:
+        _component_registry_observation = previous
+
+
+def _collect_snapshot(
     conn: sqlite3.Connection, *, component_probe_runner: Any = None, round_budget: Any = None, critical_observer: Any = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
     if round_budget is None:
@@ -9845,6 +9878,18 @@ def collect_snapshot(
 
     runner = component_probe_runner or run_component_probe_hard
     worker_env = collector_worker_environment() if component_probe_runner is None else {}
+    registry = workflow_runtime_registry_records() if component_probe_runner is None else {"source": "fixture", "records": [], "writeEligible": False}
+    registry = {**registry, "collectionId": uuid.uuid4().hex, "collectedAtEpoch": snapshot['checkedAtEpoch'],
+                "observationOnly": True, "requiresFreshActuatorPrecheck": True}
+    encoded_registry = json.dumps(registry, allow_nan=False, separators=(',', ':'))
+    if len(encoded_registry.encode('utf-8')) > 65536 or len(registry.get('records', [])) > 512:
+        registry = {"source": "collection-budget-exceeded", "records": [], "writeEligible": False,
+                    "collectionId": registry['collectionId'], "observationOnly": True}
+        encoded_registry = json.dumps(registry)
+    if component_probe_runner is None:
+        worker_env['CAT_AGENTS_STABILITY_COMPONENT_REGISTRY'] = encoded_registry
+    snapshot['registryObservation'] = {k: registry.get(k) for k in
+        ('source', 'collectionId', 'collectedAtEpoch', 'observationOnly', 'requiresFreshActuatorPrecheck', 'writeEligible')}
 
     def _collect_component(name: str, fallback: Dict[str, Any], hermers_profiles: Optional[Iterable[str]] = None, *, budget_ms: int) -> Dict[str, Any]:
         global _inspection_gateway_context, _cron_rpc_retry_after
@@ -10062,7 +10107,6 @@ def collect_snapshot(
     snapshot["authMaintenance"] = build_auth_maintenance_plan(snapshot.get("auth") if isinstance(snapshot.get("auth"), dict) else {}, findings)
     from stability_core.evolution_readiness import environment_report, delivery_metadata
     from stability_core.dependency_health import collect_dependency_health
-    registry = workflow_runtime_registry_records() if component_probe_runner is None else {"source": "fixture", "records": [], "writeEligible": False}
     snapshot["nodeId"] = os.environ.get("CAT_AGENTS_STABILITY_NODE_ID", platform.node())
     snapshot["evolution"] = environment_report(snapshot, registry, now=epoch(), node_id=snapshot["nodeId"],
         python_version=platform.python_version(), dependencies_observed=collect_dependency_health() if component_probe_runner is None else {})
